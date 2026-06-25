@@ -276,12 +276,14 @@ async function evaluateSymbol(symbol) {
     getTicker(symbol)
   ]);
 
+ 
   const tf5 = tfTrend(k5);
-  const tf1h = tfTrend(k1h);
-  const tf4h = tfTrend(k4h);
-  const daily = dailyTrend(kd);
-  if (!(tf5 === 'up' && tf1h === 'up' && tf4h === 'up')) return null;
-  if (daily === 'down') return null;
+const tf1h = tfTrend(k1h);
+const tf4h = tfTrend(k4h);
+const daily = dailyTrend(kd);
+
+if (!(tf1h === 'up' && tf4h === 'up' && (tf5 === 'up' || tf5 === 'flat'))) return null;
+if (daily === 'down') return null;
 
   const oi = analyzeOI(oi1h);
   if (!oi.growing || oi.acceleration < cfg.OI_ACCEL_THRESHOLD) return null;
