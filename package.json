@@ -1,0 +1,13 @@
+{
+  "name": "bybit-smart-money-auto-v29",
+  "version": "29.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "crypto-js": "^4.2.0"
+  }
+}
