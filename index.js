@@ -2,38 +2,357 @@ const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const cfg = require('./config');
 const { loadState, saveState } = require('./state');
-const bybit = require('./bybit');
+const { setTradingStop, placeOrder, getPosition, cancelAll } = require('./bybit');
 
 const state = loadState();
+state.settings = state.settings || { autoTrading: true, liveTrading: false };
+state.settings.autoTrading = state.settings.autoTrading !== false && cfg.AUTO_TRADING;
+state.settings.liveTrading = state.settings.liveTrading || cfg.LIVE_TRADING;
 state.activeTrades = state.activeTrades || [];
 state.closedTrades = state.closedTrades || [];
-state.lastAlerts = state.lastAlerts || {};
-state.seenNews = state.seenNews || [];
 
-const BOT = cfg.BOT_TOKEN ? new TelegramBot(cfg.BOT_TOKEN, { polling: { interval: 1000, autoStart: true, params: { timeout: 10 } } }) : null;
-const PORT = Number(process.env.PORT || 10000);
+const BASE = 'https://api.bybit.com';
+function log(m) { console.log(`[${new Date().toISOString()}] ${m}`); }
+function num(v) { const x = Number(v); return Number.isFinite(x) ? x : null; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function roundQty(q) { return Math.max(Number(q.toFixed(3)), 0.001); }
+
 const server = http.createServer((_, res) => { res.writeHead(200); res.end('OK'); });
-server.listen(PORT, '0.0.0.0');
+const PORT = Number(process.env.PORT || 10000);
+server.listen(PORT, '0.0.0.0', () => {
+  log('http up');
+  const selfUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(() => {
+    fetch(selfUrl).catch(() => {});
+    log('self-ping');
+  }, 4 * 60 * 1000);
+});
 
-function log(m){ console.log(`[${new Date().toISOString()}] ${m}`); }
-function num(v){ const x = Number(v); return Number.isFinite(x) ? x : null; }
-function mean(a){ return a.length ? a.reduce((s,x)=>s+x,0)/a.length : 0; }
-function std(a){ const m = mean(a); return a.length ? Math.sqrt(mean(a.map(x => (x-m)*(x-m)))) : 0; }
-function ema(vals,p){ if(!vals.length) return []; const k=2/(p+1); let prev=vals[0]; const out=[prev]; for(let i=1;i<vals.length;i++){ prev = vals[i]*k + prev*(1-k); out.push(prev); } return out; }
-function atr(candles,p=14){ const trs=[]; for(let i=1;i<candles.length;i++){ const c=candles[i], pr=candles[i-1]; trs.push(Math.max(c.high-c.low, Math.abs(c.high-pr.close), Math.abs(c.low-pr.close))); } return ema(trs,p); }
-function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
-function roundQty(q){ return Math.max(Number(q.toFixed(3)), 0.001); }
-function parseCandles(list){ return list.map(x => ({ start:+x[0], open:+x[1], high:+x[2], low:+x[3], close:+x[4], volume:+x[5] })); }
-function tradeKey(t){ return `${t.symbol}:${t.side}:${t.entry}`; }
-function botSend(text){ if(!BOT || !cfg.CHAT_ID) return Promise.resolve(false); return BOT.sendMessage(cfg.CHAT_ID, text, { disable_web_page_preview: true }).catch(()=>false); }
-function statusText(){ return [`v29 AUTO`, `LIVE: ${cfg.LIVE_TRADING ? 'ON' : 'OFF'}`, `open trades: ${state.activeTrades.length}`, `closed trades: ${state.closedTrades.length}`, `min score: ${cfg.MIN_SCORE}`, `order: ${cfg.ORDER_USDT} USDT`, `lev: ${cfg.LEVERAGE}x`].join('\n'); }
+if (!cfg.BOT_TOKEN) { log('BOT_TOKEN missing'); process.exit(1); }
+const bot = new TelegramBot(cfg.BOT_TOKEN, {
+  polling: { interval: 1000, autoStart: true, params: { timeout: 10 } }
+});
+bot.on('polling_error', e => log(`telegram: ${e.message}`));
 
-async function getUniverse(){ const rows = await bybit.getSymbols(); return rows.filter(r => (num(r.turnover24h)||0) >= cfg.MIN_TURNOVER_24H); }
-async function scoreSymbol(symbol){ const [k15raw, k60raw, oi, fund, tick] = await Promise.all([bybit.getKlines(symbol,'15',120), bybit.getKlines(symbol,'60',120), bybit.getOI(symbol,'60',20), bybit.getFunding(symbol), bybit.getTicker(symbol)]); const k15=parseCandles(k15raw), k60=parseCandles(k60raw); if(k15.length<60||k60.length<60) return null; const c15=k15.map(x=>x.close), c60=k60.map(x=>x.close), v15=k15.map(x=>x.volume); const e20=ema(c15,20), e50=ema(c15,50), e60=ema(c60,50), e200=ema(c60,200); const a15=atr(k15,14); const volAvg=mean(v15.slice(-20))||1; const volStd=std(v15.slice(-20))||1; const volSpike=(v15[v15.length-1]-volAvg)/volStd; const last=k15[k15.length-1], prev=k15[k15.length-2]; const bullish1h = c60[c60.length-1] > e60[e60.length-1] && e60[e60.length-1] > e200[e200.length-1]; const bullish15 = e20[e20.length-1] > e50[e50.length-1] || e20[e20.length-2] <= e50[e50.length-2]; const breakout = last.close > Math.max(...k15.slice(-10,-1).map(c=>c.high)); const retest = prev.close <= Math.max(...k15.slice(-10,-1).map(c=>c.high)) && last.close > e20[e20.length-1]; const price = tick ? num(tick.lastPrice) : last.close; const change24h = tick ? num(tick.price24hPcnt)*100 : 0; const turnover = tick ? num(tick.turnover24h) : 0; const oiVals = oi.map(x => num(x.openInterest)).filter(Boolean); const oiChg = oiVals.length>2 ? ((oiVals[0]-oiVals[oiVals.length-1])/oiVals[oiVals.length-1])*100 : 0; const oiAccel = oiVals.length>3 ? (((oiVals[0]-oiVals[Math.floor(oiVals.length/2)])/oiVals[Math.floor(oiVals.length/2)]) - ((oiVals[Math.floor(oiVals.length/2)]-oiVals[oiVals.length-1])/oiVals[oiVals.length-1]))*100 : 0; const funding = fund?.[0] ? num(fund[0].fundingRate) : 0; const ageScore = 10; const volumeScore = clamp(turnover / 300000, 0, 20); const momentumScore = clamp(change24h * 1.3, 0, 20); const inPlay = clamp((volSpike * 4) + ((a15[a15.length-1] / mean(a15.slice(-30) || [1])) - 1) * 8, 0, 20); const trend = bullish1h ? 15 : 0; const trigger = bullish15 && (breakout || retest) ? 20 : 0; const oiScore = clamp(oiChg * 0.8 + oiAccel * 0.4, -10, 20); const fundingScore = funding < 0 ? 8 : 0; const score = Math.round(ageScore + volumeScore + momentumScore + inPlay + trend + trigger + oiScore + fundingScore); const status = score >= cfg.MIN_SCORE && bullish1h && bullish15 && (breakout || retest) ? 'LONG' : 'WAIT'; const entry = price; const stop = Math.min(...k15.slice(-10).map(c=>c.low), entry - (a15[a15.length-1] || entry*0.01)); const risk = Math.max(entry - stop, 1e-8); const tp1 = entry + risk * 1.5; const tp2 = entry + risk * 3.5; return { symbol, status, score, entry, stop, tp1, tp2, bullish1h, bullish15, breakout, retest, turnover, change24h, oiChg, oiAccel, funding, price, atr: a15[a15.length-1] || 0 }; }
-async function openTrade(sig){ if(!cfg.LIVE_TRADING) return; if(state.activeTrades.length >= cfg.MAX_OPEN_TRADES) return; const pos = await bybit.getPosition(sig.symbol).catch(()=>null); if(pos && Math.abs(num(pos.size)||0) > 0) return; const qty = roundQty((cfg.ORDER_USDT * cfg.LEVERAGE) / sig.entry); const side = 'Buy'; const order = await bybit.placeOrder({ symbol: sig.symbol, side, qty, orderType:'Market' }); await bybit.setTradingStop({ symbol: sig.symbol, takeProfit: sig.tp1, stopLoss: sig.stop, trailingStop: sig.entry * 0.012, activePrice: sig.entry }); state.activeTrades.push({ symbol: sig.symbol, side, qty, entry: sig.entry, stop: sig.stop, tp1: sig.tp1, tp2: sig.tp2, openedAt: Date.now(), orderId: order?.result?.orderId || null, key: tradeKey({symbol:sig.symbol,side,entry:sig.entry}) }); saveState(state); await botSend(`OPEN ${sig.symbol}\nscore ${sig.score}\nentry ${sig.entry}\nSL ${sig.stop}\nTP1 ${sig.tp1}\nTP2 ${sig.tp2}`); log(`opened ${sig.symbol}`); }
-async function closeTrade(t, reason='manual'){ if(!cfg.LIVE_TRADING) return; try{ await bybit.cancelAll(t.symbol); const pos = await bybit.getPosition(t.symbol); const size = Math.abs(num(pos?.size)||t.qty); if(size>0){ const side = (pos?.side||t.side) === 'Buy' ? 'Sell' : 'Buy'; await bybit.placeOrder({ symbol: t.symbol, side, qty: roundQty(size), orderType:'Market', reduceOnly:true }); } } finally { state.activeTrades = state.activeTrades.filter(x => x.symbol !== t.symbol); state.closedTrades.unshift({...t, closedAt: Date.now(), reason}); state.closedTrades = state.closedTrades.slice(0,200); saveState(state); await botSend(`CLOSE ${t.symbol}\nreason ${reason}`); log(`closed ${t.symbol} ${reason}`); } }
-async function manageTrades(){ const keep=[]; for(const t of state.activeTrades){ const pos = await bybit.getPosition(t.symbol).catch(()=>null); if(!pos || Math.abs(num(pos.size)||0) === 0){ state.closedTrades.unshift({...t, closedAt: Date.now(), reason:'closed-by-exchange'}); continue; } const last = num(pos.markPrice) || num(pos.avgPrice) || t.entry; if(last >= t.tp2) { await closeTrade(t,'tp2'); continue; } if(last <= t.stop) { await closeTrade(t,'stop'); continue; } keep.push(t); } state.activeTrades = keep; saveState(state); }
-async function scan(){ const uni = await getUniverse(); const results = []; for(const row of uni.slice(0,25)){ const sig = await scoreSymbol(row.symbol).catch(e => { log(`score err ${row.symbol} ${e.message}`); return null; }); if(!sig) continue; results.push(sig); if(sig.status === 'LONG'){ const fp = `${sig.symbol}:${sig.entry.toFixed(8)}:${sig.score}`; if(state.lastAlerts[sig.symbol] !== fp){ state.lastAlerts[sig.symbol] = fp; saveState(state); await botSend(`SIGNAL ${sig.symbol}\nscore ${sig.score}\nentry ${sig.entry}\nSL ${sig.stop}\nTP1 ${sig.tp1}\nTP2 ${sig.tp2}`); await openTrade(sig); } } } results.sort((a,b)=>b.score-a.score); state.lastResults = results.slice(0,20); saveState(state); if(results[0]) log(`top ${results[0].symbol} score=${results[0].score} status=${results[0].status}`); else log('no candidates'); }
-async function loop(){ while(true){ try{ await scan(); await manageTrades(); } catch(e){ log(`loop err ${e.message}`); } await new Promise(r => setTimeout(r, cfg.REST_REFRESH_MS)); } }
-if(BOT){ BOT.on('polling_error', e => log(`telegram ${e.message}`)); BOT.on('message', m => { if(!m.text) return; const t=m.text.trim().toLowerCase(); if(t==='status' || t==='/status') return BOT.sendMessage(m.chat.id, statusText()); if(t==='trades' || t==='/trades') return BOT.sendMessage(m.chat.id, state.activeTrades.length ? JSON.stringify(state.activeTrades,null,2) : 'no active trades'); }); }
-(async()=>{ log('boot'); await botSend('v29 started\n' + statusText()); setInterval(()=>saveState(state),10000); setInterval(()=>log(`heartbeat open:${state.activeTrades.length}`),120000); await loop(); })().catch(e => { log(`fatal ${e.message}`); process.exit(1); });
+function mainKb() {
+  return {
+    reply_markup: {
+      keyboard: [
+        ['Статус', 'Помощь'],
+        ['Мои сделки', 'Я вышел'],
+        ['Подключить авто-торговлю', 'Отключить авто-торговлю'],
+        ['Включить live trading', 'Выключить live trading'],
+        ['Сброс']
+      ],
+      resize_keyboard: true
+    }
+  };
+}
+
+function statusText() {
+  return [
+    `🤖 Smart Money Bot v29 proper`,
+    `Авто-торговля: ${state.settings.autoTrading ? 'ON' : 'OFF'}`,
+    `Live trading: ${state.settings.liveTrading ? 'ON' : 'OFF'}`,
+    `API key: ${cfg.BYBIT_API_KEY ? '✅ SET' : '❌ MISSING'}`,
+    `Сделок: ${state.activeTrades.length}`,
+    `Min score: ${cfg.MIN_SCORE} | Min R/R: ${cfg.MIN_RR}`,
+    `Min ликвидность: $${cfg.MIN_TURNOVER_24H / 1e6}M`,
+    `Интервал: ${cfg.ALERT_INTERVAL_MS / 60000} мин`
+  ].join('
+');
+}
+
+async function bybitGet(path, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(BASE + path, { signal: AbortSignal.timeout(6000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    } catch (e) {
+      if (attempt === retries) throw e;
+      await sleep(2000 * (attempt + 1));
+    }
+  }
+}
+async function getAllSymbols() {
+  const j = await bybitGet('/v5/market/tickers?category=linear');
+  return (j?.result?.list || []).filter(x => /USDT$/.test(x.symbol) && (num(x.turnover24h) || 0) >= cfg.MIN_TURNOVER_24H);
+}
+async function getTicker(symbol) {
+  const j = await bybitGet(`/v5/market/tickers?category=linear&symbol=${symbol}`);
+  return j?.result?.list?.[0] || null;
+}
+async function getOI(symbol, interval, limit) {
+  const j = await bybitGet(`/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=${interval}&limit=${limit}`);
+  return j?.result?.list || [];
+}
+async function getKlines(symbol, interval, limit) {
+  const j = await bybitGet(`/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`);
+  return j?.result?.list || [];
+}
+async function getFunding(symbol) {
+  const j = await bybitGet(`/v5/market/funding/history?category=linear&symbol=${symbol}&limit=3`);
+  return j?.result?.list || [];
+}
+
+function calcATR(klines, period = 14) {
+  if (!klines || klines.length < period + 1) return null;
+  const trs = [];
+  for (let i = 0; i < period; i++) {
+    const hi = num(klines[i][2]), lo = num(klines[i][3]), pc = num(klines[i + 1][4]);
+    if (hi == null || lo == null || pc == null) return null;
+    trs.push(Math.max(hi - lo, Math.abs(hi - pc), Math.abs(lo - pc)));
+  }
+  return trs.reduce((a, b) => a + b, 0) / trs.length;
+}
+function analyzeOI(oiList) {
+  if (!oiList || oiList.length < 3) return { growing: false, changePct: 0, acceleration: 0 };
+  const vals = oiList.map(x => num(x?.openInterest)).filter(v => v != null);
+  if (vals.length < 3) return { growing: false, changePct: 0, acceleration: 0 };
+  const latest = vals[0], oldest = vals[vals.length - 1], mid = vals[Math.floor(vals.length / 2)];
+  const changePct = (latest - oldest) / oldest * 100;
+  const firstHalfChg = (mid - oldest) / oldest * 100;
+  const secondHalfChg = (latest - mid) / mid * 100;
+  const acceleration = secondHalfChg - firstHalfChg;
+  return { growing: changePct > 0.5, changePct, acceleration, latest, oldest };
+}
+function oiPriceDivergence(oiAnalysis, priceChangePct) {
+  if (!oiAnalysis.growing) return { type: 'none', strength: 0 };
+  const oiChg = Math.abs(oiAnalysis.changePct), prChg = Math.abs(priceChangePct);
+  if (oiChg >= 1.5 && prChg < 0.3) return { type: 'accumulation', strength: 3 };
+  if (oiChg >= 0.8 && prChg < 0.5) return { type: 'accumulation', strength: 2 };
+  if (oiChg >= 1.0 && prChg >= 0.5) return { type: 'confirmation', strength: 2 };
+  if (oiChg >= 0.5 && prChg >= 0.3) return { type: 'confirmation', strength: 1 };
+  return { type: 'weak', strength: 0 };
+}
+function tfTrend(klines) {
+  if (!klines || klines.length < 8) return 'flat';
+  const c = klines.slice(0, 8).map(k => num(k[4])).filter(v => v != null).reverse();
+  if (c.length < 8) return 'flat';
+  const k = 2 / 9;
+  let ema = c[0], emaPrev = c[0];
+  for (let i = 1; i < c.length; i++) ema = c[i] * k + ema * (1 - k);
+  for (let i = 1; i < c.length - 1; i++) emaPrev = c[i] * k + emaPrev * (1 - k);
+  const slope = ema - emaPrev;
+  const mid = (Math.max(...c) + Math.min(...c)) / 2;
+  const lastClose = c[c.length - 1];
+  const upStrict = c[c.length-1] > c[c.length-2] && c[c.length-2] > c[c.length-3];
+  const downStrict = c[c.length-1] < c[c.length-2] && c[c.length-2] < c[c.length-3];
+  if ((slope > 0 && lastClose > mid) || upStrict) return 'up';
+  if ((slope < 0 && lastClose < mid) || downStrict) return 'down';
+  return 'flat';
+}
+function dailyTrend(klines) {
+  if (!klines || klines.length < 5) return 'flat';
+  const c = klines.slice(0, 5).map(k => num(k[4])).filter(v => v != null).reverse();
+  if (c.length < 5) return 'flat';
+  const rising = c[4] > c[0] && c[4] > c[2];
+  const falling = c[4] < c[0] && c[4] < c[2];
+  return rising ? 'up' : falling ? 'down' : 'flat';
+}
+function rrOk(entry, sl, tp1) {
+  const risk = Math.abs(entry - sl), reward = Math.abs(tp1 - entry);
+  if (risk <= 0) return false;
+  return reward / risk >= cfg.MIN_RR;
+}
+function tradeCard(t) {
+  return [`${t.symbol} | ${t.side || 'LONG'}`, `entry: ${t.entry}`, `sl: ${t.sl}`, `tp1: ${t.tp1}`, `tp2: ${t.tp2}`, `qty: ${t.qty || '-'}`].join('
+');
+}
+async function sendSignal(sig, kind='SIGNAL') {
+  return bot.sendMessage(cfg.CHAT_ID, [
+    `${kind} ${sig.symbol}`,
+    `score: ${sig.score}`,
+    `entry: ${sig.entry}`,
+    `sl: ${sig.sl}`,
+    `tp1: ${sig.tp1}`,
+    `tp2: ${sig.tp2}`,
+    `trend: ${sig.tf5}/${sig.tf1h}/${sig.tf4h} daily:${sig.daily}`,
+    `oi: ${sig.oi.changePct.toFixed(2)}% accel:${sig.oi.acceleration.toFixed(2)}`
+  ].join('
+'), mainKb()).catch(e => log(`sendSignal: ${e.message}`));
+}
+async function openTrade(sig) {
+  if (!state.settings.autoTrading) return false;
+  if (!state.settings.liveTrading) return false;
+  if (!cfg.BYBIT_API_KEY || !cfg.BYBIT_API_SECRET) return false;
+  if (state.activeTrades.length >= cfg.MAX_OPEN_TRADES) return false;
+  if (state.activeTrades.find(t => t.symbol === sig.symbol)) return false;
+  try {
+    const posRes = await getPosition(sig.symbol);
+    const posList = posRes?.result?.list || [];
+    if (posList.some(p => (num(p.size) || 0) > 0)) return false;
+    const qty = roundQty((cfg.ORDER_USDT * cfg.LEVERAGE) / sig.entry);
+    const r = await placeOrder({ symbol: sig.symbol, side: 'Buy', qty, orderType: 'Market' });
+    await setTradingStop({
+      symbol: sig.symbol,
+      takeProfit: sig.tp2,
+      stopLoss: sig.sl,
+      trailingStop: sig.entry * (cfg.TRAILING_STOP_PCT / 100),
+      activePrice: sig.tp1
+    });
+    const trade = { symbol: sig.symbol, side: 'LONG', entry: sig.entry, sl: sig.sl, tp1: sig.tp1, tp2: sig.tp2, qty, openedAt: Date.now(), orderId: r?.result?.orderId || null };
+    state.activeTrades.push(trade);
+    saveState(state);
+    await sendSignal(trade, 'OPENED');
+    return true;
+  } catch (e) {
+    log(`openTrade ${sig.symbol}: ${e.message}`);
+    return false;
+  }
+}
+async function closeTrade(t, reason='manual') {
+  try {
+    await cancelAll(t.symbol).catch(()=>{});
+    const posRes = await getPosition(t.symbol).catch(()=>null);
+    const pos = posRes?.result?.list?.[0] || null;
+    const size = Math.abs(num(pos?.size) || num(t.qty) || 0);
+    if (size > 0 && state.settings.liveTrading) {
+      await placeOrder({ symbol: t.symbol, side: 'Sell', qty: roundQty(size), reduceOnly: true, orderType: 'Market' });
+    }
+  } catch (e) {
+    log(`closeTrade ${t.symbol}: ${e.message}`);
+  }
+  state.activeTrades = state.activeTrades.filter(x => x.symbol !== t.symbol);
+  state.closedTrades.unshift({ ...t, closedAt: Date.now(), reason });
+  state.closedTrades = state.closedTrades.slice(0, 200);
+  saveState(state);
+  await sendSignal({ ...t, score: '-', oi: { changePct: 0, acceleration: 0 }, tf5: '-', tf1h: '-', tf4h: '-', daily: '-' }, `CLOSED ${reason}`);
+}
+
+let scanRunning = false;
+let scanStartTime = 0;
+async function evaluateSymbol(symbol) {
+  const [k5, k1h, k4h, kd, oi1h, funding, ticker] = await Promise.all([
+    getKlines(symbol, '5', 120), getKlines(symbol, '60', 120), getKlines(symbol, '240', 120), getKlines(symbol, 'D', 10),
+    getOI(symbol, '60', 12), getFunding(symbol), getTicker(symbol)
+  ]);
+  const tf5 = tfTrend(k5), tf1h = tfTrend(k1h), tf4h = tfTrend(k4h), daily = dailyTrend(kd);
+  if (!(tf5 === 'up' && tf1h === 'up' && tf4h === 'up')) return null;
+  if (daily === 'down') return null;
+  const oi = analyzeOI(oi1h);
+  if (!oi.growing || oi.acceleration < cfg.OI_ACCEL_THRESHOLD) return null;
+  const price = num(ticker?.lastPrice);
+  const price24h = num(ticker?.price24hPcnt) ? num(ticker.price24hPcnt) * 100 : 0;
+  const div = oiPriceDivergence(oi, price24h);
+  const atr = calcATR(k1h, 14);
+  if (!price || !atr) return null;
+  const entry = price;
+  const sl = +(entry - atr * 1.5).toFixed(6);
+  const tp1 = +(entry + (entry - sl) * 1.5).toFixed(6);
+  const tp2 = +(entry + (entry - sl) * 3.5).toFixed(6);
+  if (!rrOk(entry, sl, tp1)) return null;
+  const fr = num(funding?.[0]?.fundingRate) || 0;
+  const fundingOk = fr <= cfg.FUNDING_THRESHOLD;
+  if (!fundingOk) return null;
+  let score = 0;
+  score += 40;
+  score += Math.min(40, Math.max(0, oi.changePct * 10));
+  score += Math.min(30, Math.max(0, oi.acceleration * 20));
+  score += div.strength * 10;
+  score += fundingOk ? 10 : 0;
+  const sig = { symbol, entry, sl, tp1, tp2, score: Math.round(score), tf5, tf1h, tf4h, daily, oi };
+  return sig.score >= cfg.MIN_SCORE ? sig : null;
+}
+async function scan() {
+  if (scanRunning) return;
+  scanRunning = true;
+  scanStartTime = Date.now();
+  log('scan start');
+  try {
+    const symbols = await getAllSymbols();
+    for (const s of symbols.slice(0, 60)) {
+      try {
+        const sig = await evaluateSymbol(s.symbol);
+        if (!sig) continue;
+        const fp = `${sig.symbol}:${sig.entry}:${sig.score}`;
+        if (!state.lastSignals.includes(fp)) {
+          state.lastSignals.push(fp);
+          state.lastSignals = state.lastSignals.slice(-200);
+          saveState(state);
+          await sendSignal(sig);
+          await openTrade(sig);
+        }
+      } catch (e) {
+        log(`symbol ${s.symbol}: ${e.message}`);
+      }
+    }
+  } finally {
+    scanRunning = false;
+    log('scan done');
+  }
+}
+async function updateTrades() {
+  for (const t of [...state.activeTrades]) {
+    try {
+      const ticker = await getTicker(t.symbol);
+      const last = num(ticker?.lastPrice);
+      if (!last) continue;
+      if (last <= t.sl) await closeTrade(t, 'SL');
+      else if (last >= t.tp2) await closeTrade(t, 'TP2');
+    } catch (e) {
+      log(`updateTrades ${t.symbol}: ${e.message}`);
+    }
+  }
+}
+
+bot.onText(/\/start/, m => bot.sendMessage(m.chat.id, `🤖 Smart Money Bot v29 proper запущен.
+${statusText()}
+
+/test — проверка
+/scan — сканировать сейчас`, mainKb()));
+bot.onText(/\/status/, m => bot.sendMessage(m.chat.id, statusText(), mainKb()));
+bot.onText(/\/test/, m => bot.sendMessage(m.chat.id, 'Бот на связи ✅', mainKb()));
+bot.onText(/\/scan/, async m => { await bot.sendMessage(m.chat.id, 'Сканирую...', mainKb()); await scan(); });
+bot.onText(/\/trades/, m => bot.sendMessage(m.chat.id, state.activeTrades.length ? state.activeTrades.map(tradeCard).join('
+
+') : 'Сделок нет.', mainKb()));
+bot.onText(/\/reset/, m => { state.lastSignals = []; state.activeTrades = []; saveState(state); bot.sendMessage(m.chat.id, 'Сброс.', mainKb()); });
+
+bot.on('message', m => {
+  if (!m.text || m.text.startsWith('/')) return;
+  const t = m.text.trim().toLowerCase();
+  if (t === 'статус') return bot.sendMessage(m.chat.id, statusText(), mainKb());
+  if (t === 'помощь') return bot.sendMessage(m.chat.id, '/start /status /test /scan /reset /trades', mainKb());
+  if (t === 'мои сделки') return bot.sendMessage(m.chat.id, state.activeTrades.length ? state.activeTrades.map(tradeCard).join('
+
+') : 'Сделок нет.', mainKb());
+  if (t === 'я вышел' || t === 'пропустить') { state.activeTrades = []; saveState(state); return bot.sendMessage(m.chat.id, 'Остановлено.', mainKb()); }
+  if (t === 'сброс') { state.lastSignals = []; state.activeTrades = []; saveState(state); return bot.sendMessage(m.chat.id, 'Сброс.', mainKb()); }
+  if (t === 'подключить авто-торговлю') { state.settings.autoTrading = true; saveState(state); return bot.sendMessage(m.chat.id, 'Авто ON.', mainKb()); }
+  if (t === 'отключить авто-торговлю') { state.settings.autoTrading = false; saveState(state); return bot.sendMessage(m.chat.id, 'Авто OFF.', mainKb()); }
+  if (t === 'включить live trading') { state.settings.liveTrading = true; saveState(state); return bot.sendMessage(m.chat.id, 'Live ON.', mainKb()); }
+  if (t === 'выключить live trading') { state.settings.liveTrading = false; saveState(state); return bot.sendMessage(m.chat.id, 'Live OFF.', mainKb()); }
+});
+
+if (cfg.CHAT_ID) {
+  bot.sendMessage(cfg.CHAT_ID, `🤖 Smart Money Bot v29 proper запущен.
+${statusText()}
+
+/test — проверка
+/scan — сканировать сейчас`, mainKb()).catch(e => log(`boot: ${e.message}`));
+}
+async function continuousScan() {
+  while (true) {
+    try { await scan(); } catch (e) {
+      const msg = e instanceof AggregateError ? `AggregateError: ${e.errors?.map(x => x.message).join(', ')}` : e.message;
+      log(`continuousScan error: ${msg}`);
+    }
+    await sleep(30000);
+  }
+}
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof AggregateError ? `AggregateError: ${reason.errors?.map(x => x.message).join(', ')}` : String(reason?.message || reason);
+  log(`unhandledRejection: ${msg}`);
+});
+continuousScan();
+setInterval(updateTrades, 15000);
+setInterval(() => saveState(state), 10000);
+setInterval(() => log(`heartbeat | scanRunning:${scanRunning} | trades:${state.activeTrades.length}`), 120000);
+setInterval(() => {
+  if (scanRunning && Date.now() - scanStartTime > 300000) {
+    log('WATCHDOG: scan stuck 5min, forcing reset');
+    scanRunning = false;
+  }
+}, 60000);

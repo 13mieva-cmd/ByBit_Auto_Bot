@@ -1,24 +1,23 @@
-# Bybit Smart Money Auto v29
+# Smart Money Bot v29 proper
 
-Полностью автономный бот: сканер + авто-вход + авто-выход + SL/TP + trailing stop.
+Основа: старый v28 с сохранёнными кнопками, меню, статусом и логикой Telegram.
+Добавлено: авто-открытие, авто-закрытие, SL/TP/Trailing через Bybit API.
 
-## Env
-- BOT_TOKEN
-- CHAT_ID
-- BYBIT_API_KEY
-- BYBIT_API_SECRET
-- LIVE_TRADING=true
-- ORDER_USDT=25
-- LEVERAGE=5
-- RISK_PERCENT=1
-- MIN_SCORE=70
-- MIN_TURNOVER_24H=5000000
-- MAX_OPEN_TRADES=1
-- REST_REFRESH_MS=30000
+## Render env
+BOT_TOKEN=
+CHAT_ID=
+BYBIT_API_KEY=
+BYBIT_API_SECRET=
+LIVE_TRADING=false
+AUTO_TRADING=true
+ORDER_USDT=25
+LEVERAGE=5
+MAX_OPEN_TRADES=1
+MIN_SCORE=70
+MIN_TURNOVER_24H=5000000
+MIN_RR=1.5
+OI_ACCEL_THRESHOLD=0.3
+TRAILING_STOP_PCT=1.2
 
-## Start
-- npm start
-
-## Notes
-- При LIVE_TRADING=false бот только сканирует и шлёт сигналы.
-- Для реальных сделок нужно сначала проверить на demo/testnet.
+## Telegram
+Сохранены кнопки и команды старого бота: /start /status /test /scan /trades /reset
