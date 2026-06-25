@@ -1,6 +1,8 @@
 const CryptoJS = require('crypto-js');
 const { BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_BASE } = require('./config');
-function clean(obj){ return Object.fromEntries(Object.entries(obj).filter(([,v]) => v !== undefined && v !== null && v !== '')); }
+function clean(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null && v !== ''));
+}
 function signGet(params, ts) {
   const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
   return CryptoJS.HmacSHA256(`${ts}${BYBIT_API_KEY}5000${sorted}`, BYBIT_API_SECRET).toString();
@@ -11,7 +13,8 @@ function signPost(body, ts) {
 async function request(path, method = 'GET', params = {}) {
   const ts = Date.now().toString();
   const payload = clean(params);
-  const url = `${BYBIT_BASE}${path}${method === 'GET' && Object.keys(payload).length ? `?${new URLSearchParams(payload)}` : ''}`;
+  const query = method === 'GET' && Object.keys(payload).length ? `?${new URLSearchParams(payload)}` : '';
+  const url = `${BYBIT_BASE}${path}${query}`;
   const headers = {
     'X-BAPI-API-KEY': BYBIT_API_KEY,
     'X-BAPI-TIMESTAMP': ts,

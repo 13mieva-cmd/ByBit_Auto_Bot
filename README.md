@@ -1,4 +1,4 @@
-# Smart Money Bot v29 proper
+# Smart Money Bot v29 proper fixed
 
 Основа: старый v28 с сохранёнными кнопками, меню, статусом и логикой Telegram.
 Добавлено: авто-открытие, авто-закрытие, SL/TP/Trailing через Bybit API.

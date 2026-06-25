@@ -28,7 +28,11 @@ server.listen(PORT, '0.0.0.0', () => {
   }, 4 * 60 * 1000);
 });
 
-if (!cfg.BOT_TOKEN) { log('BOT_TOKEN missing'); process.exit(1); }
+if (!cfg.BOT_TOKEN) {
+  log('BOT_TOKEN missing');
+  process.exit(1);
+}
+
 const bot = new TelegramBot(cfg.BOT_TOKEN, {
   polling: { interval: 1000, autoStart: true, params: { timeout: 10 } }
 });
@@ -51,7 +55,7 @@ function mainKb() {
 
 function statusText() {
   return [
-    `🤖 Smart Money Bot v29 proper`,
+    '🤖 Smart Money Bot v29 proper fixed',
     `Авто-торговля: ${state.settings.autoTrading ? 'ON' : 'OFF'}`,
     `Live trading: ${state.settings.liveTrading ? 'ON' : 'OFF'}`,
     `API key: ${cfg.BYBIT_API_KEY ? '✅ SET' : '❌ MISSING'}`,
@@ -59,8 +63,7 @@ function statusText() {
     `Min score: ${cfg.MIN_SCORE} | Min R/R: ${cfg.MIN_RR}`,
     `Min ликвидность: $${cfg.MIN_TURNOVER_24H / 1e6}M`,
     `Интервал: ${cfg.ALERT_INTERVAL_MS / 60000} мин`
-  ].join('
-');
+  ].join('\n');
 }
 
 async function bybitGet(path, retries = 2) {
@@ -75,6 +78,7 @@ async function bybitGet(path, retries = 2) {
     }
   }
 }
+
 async function getAllSymbols() {
   const j = await bybitGet('/v5/market/tickers?category=linear');
   return (j?.result?.list || []).filter(x => /USDT$/.test(x.symbol) && (num(x.turnover24h) || 0) >= cfg.MIN_TURNOVER_24H);
@@ -100,49 +104,59 @@ function calcATR(klines, period = 14) {
   if (!klines || klines.length < period + 1) return null;
   const trs = [];
   for (let i = 0; i < period; i++) {
-    const hi = num(klines[i][2]), lo = num(klines[i][3]), pc = num(klines[i + 1][4]);
+    const hi = num(klines[i][2]);
+    const lo = num(klines[i][3]);
+    const pc = num(klines[i + 1][4]);
     if (hi == null || lo == null || pc == null) return null;
     trs.push(Math.max(hi - lo, Math.abs(hi - pc), Math.abs(lo - pc)));
   }
   return trs.reduce((a, b) => a + b, 0) / trs.length;
 }
+
 function analyzeOI(oiList) {
   if (!oiList || oiList.length < 3) return { growing: false, changePct: 0, acceleration: 0 };
   const vals = oiList.map(x => num(x?.openInterest)).filter(v => v != null);
   if (vals.length < 3) return { growing: false, changePct: 0, acceleration: 0 };
-  const latest = vals[0], oldest = vals[vals.length - 1], mid = vals[Math.floor(vals.length / 2)];
+  const latest = vals[0];
+  const oldest = vals[vals.length - 1];
+  const mid = vals[Math.floor(vals.length / 2)];
   const changePct = (latest - oldest) / oldest * 100;
   const firstHalfChg = (mid - oldest) / oldest * 100;
   const secondHalfChg = (latest - mid) / mid * 100;
   const acceleration = secondHalfChg - firstHalfChg;
   return { growing: changePct > 0.5, changePct, acceleration, latest, oldest };
 }
+
 function oiPriceDivergence(oiAnalysis, priceChangePct) {
   if (!oiAnalysis.growing) return { type: 'none', strength: 0 };
-  const oiChg = Math.abs(oiAnalysis.changePct), prChg = Math.abs(priceChangePct);
+  const oiChg = Math.abs(oiAnalysis.changePct);
+  const prChg = Math.abs(priceChangePct);
   if (oiChg >= 1.5 && prChg < 0.3) return { type: 'accumulation', strength: 3 };
   if (oiChg >= 0.8 && prChg < 0.5) return { type: 'accumulation', strength: 2 };
   if (oiChg >= 1.0 && prChg >= 0.5) return { type: 'confirmation', strength: 2 };
   if (oiChg >= 0.5 && prChg >= 0.3) return { type: 'confirmation', strength: 1 };
   return { type: 'weak', strength: 0 };
 }
+
 function tfTrend(klines) {
   if (!klines || klines.length < 8) return 'flat';
   const c = klines.slice(0, 8).map(k => num(k[4])).filter(v => v != null).reverse();
   if (c.length < 8) return 'flat';
   const k = 2 / 9;
-  let ema = c[0], emaPrev = c[0];
+  let ema = c[0];
+  let emaPrev = c[0];
   for (let i = 1; i < c.length; i++) ema = c[i] * k + ema * (1 - k);
   for (let i = 1; i < c.length - 1; i++) emaPrev = c[i] * k + emaPrev * (1 - k);
   const slope = ema - emaPrev;
   const mid = (Math.max(...c) + Math.min(...c)) / 2;
   const lastClose = c[c.length - 1];
-  const upStrict = c[c.length-1] > c[c.length-2] && c[c.length-2] > c[c.length-3];
-  const downStrict = c[c.length-1] < c[c.length-2] && c[c.length-2] < c[c.length-3];
+  const upStrict = c[c.length - 1] > c[c.length - 2] && c[c.length - 2] > c[c.length - 3];
+  const downStrict = c[c.length - 1] < c[c.length - 2] && c[c.length - 2] < c[c.length - 3];
   if ((slope > 0 && lastClose > mid) || upStrict) return 'up';
   if ((slope < 0 && lastClose < mid) || downStrict) return 'down';
   return 'flat';
 }
+
 function dailyTrend(klines) {
   if (!klines || klines.length < 5) return 'flat';
   const c = klines.slice(0, 5).map(k => num(k[4])).filter(v => v != null).reverse();
@@ -151,16 +165,26 @@ function dailyTrend(klines) {
   const falling = c[4] < c[0] && c[4] < c[2];
   return rising ? 'up' : falling ? 'down' : 'flat';
 }
+
 function rrOk(entry, sl, tp1) {
-  const risk = Math.abs(entry - sl), reward = Math.abs(tp1 - entry);
+  const risk = Math.abs(entry - sl);
+  const reward = Math.abs(tp1 - entry);
   if (risk <= 0) return false;
   return reward / risk >= cfg.MIN_RR;
 }
+
 function tradeCard(t) {
-  return [`${t.symbol} | ${t.side || 'LONG'}`, `entry: ${t.entry}`, `sl: ${t.sl}`, `tp1: ${t.tp1}`, `tp2: ${t.tp2}`, `qty: ${t.qty || '-'}`].join('
-');
+  return [
+    `${t.symbol} | ${t.side || 'LONG'}`,
+    `entry: ${t.entry}`,
+    `sl: ${t.sl}`,
+    `tp1: ${t.tp1}`,
+    `tp2: ${t.tp2}`,
+    `qty: ${t.qty || '-'}`
+  ].join('\n');
 }
-async function sendSignal(sig, kind='SIGNAL') {
+
+async function sendSignal(sig, kind = 'SIGNAL') {
   return bot.sendMessage(cfg.CHAT_ID, [
     `${kind} ${sig.symbol}`,
     `score: ${sig.score}`,
@@ -169,10 +193,10 @@ async function sendSignal(sig, kind='SIGNAL') {
     `tp1: ${sig.tp1}`,
     `tp2: ${sig.tp2}`,
     `trend: ${sig.tf5}/${sig.tf1h}/${sig.tf4h} daily:${sig.daily}`,
-    `oi: ${sig.oi.changePct.toFixed(2)}% accel:${sig.oi.acceleration.toFixed(2)}`
-  ].join('
-'), mainKb()).catch(e => log(`sendSignal: ${e.message}`));
+    `oi: ${Number(sig.oi.changePct || 0).toFixed(2)}% accel:${Number(sig.oi.acceleration || 0).toFixed(2)}`
+  ].join('\n'), mainKb()).catch(e => log(`sendSignal: ${e.message}`));
 }
+
 async function openTrade(sig) {
   if (!state.settings.autoTrading) return false;
   if (!state.settings.liveTrading) return false;
@@ -192,7 +216,23 @@ async function openTrade(sig) {
       trailingStop: sig.entry * (cfg.TRAILING_STOP_PCT / 100),
       activePrice: sig.tp1
     });
-    const trade = { symbol: sig.symbol, side: 'LONG', entry: sig.entry, sl: sig.sl, tp1: sig.tp1, tp2: sig.tp2, qty, openedAt: Date.now(), orderId: r?.result?.orderId || null };
+    const trade = {
+      symbol: sig.symbol,
+      side: 'LONG',
+      entry: sig.entry,
+      sl: sig.sl,
+      tp1: sig.tp1,
+      tp2: sig.tp2,
+      qty,
+      openedAt: Date.now(),
+      orderId: r?.result?.orderId || null,
+      score: sig.score,
+      oi: sig.oi,
+      tf5: sig.tf5,
+      tf1h: sig.tf1h,
+      tf4h: sig.tf4h,
+      daily: sig.daily
+    };
     state.activeTrades.push(trade);
     saveState(state);
     await sendSignal(trade, 'OPENED');
@@ -202,10 +242,11 @@ async function openTrade(sig) {
     return false;
   }
 }
-async function closeTrade(t, reason='manual') {
+
+async function closeTrade(t, reason = 'manual') {
   try {
-    await cancelAll(t.symbol).catch(()=>{});
-    const posRes = await getPosition(t.symbol).catch(()=>null);
+    await cancelAll(t.symbol).catch(() => {});
+    const posRes = await getPosition(t.symbol).catch(() => null);
     const pos = posRes?.result?.list?.[0] || null;
     const size = Math.abs(num(pos?.size) || num(t.qty) || 0);
     if (size > 0 && state.settings.liveTrading) {
@@ -218,43 +259,60 @@ async function closeTrade(t, reason='manual') {
   state.closedTrades.unshift({ ...t, closedAt: Date.now(), reason });
   state.closedTrades = state.closedTrades.slice(0, 200);
   saveState(state);
-  await sendSignal({ ...t, score: '-', oi: { changePct: 0, acceleration: 0 }, tf5: '-', tf1h: '-', tf4h: '-', daily: '-' }, `CLOSED ${reason}`);
+  await sendSignal({ ...t }, `CLOSED ${reason}`);
 }
 
 let scanRunning = false;
 let scanStartTime = 0;
+
 async function evaluateSymbol(symbol) {
   const [k5, k1h, k4h, kd, oi1h, funding, ticker] = await Promise.all([
-    getKlines(symbol, '5', 120), getKlines(symbol, '60', 120), getKlines(symbol, '240', 120), getKlines(symbol, 'D', 10),
-    getOI(symbol, '60', 12), getFunding(symbol), getTicker(symbol)
+    getKlines(symbol, '5', 120),
+    getKlines(symbol, '60', 120),
+    getKlines(symbol, '240', 120),
+    getKlines(symbol, 'D', 10),
+    getOI(symbol, '60', 12),
+    getFunding(symbol),
+    getTicker(symbol)
   ]);
-  const tf5 = tfTrend(k5), tf1h = tfTrend(k1h), tf4h = tfTrend(k4h), daily = dailyTrend(kd);
+
+  const tf5 = tfTrend(k5);
+  const tf1h = tfTrend(k1h);
+  const tf4h = tfTrend(k4h);
+  const daily = dailyTrend(kd);
   if (!(tf5 === 'up' && tf1h === 'up' && tf4h === 'up')) return null;
   if (daily === 'down') return null;
+
   const oi = analyzeOI(oi1h);
   if (!oi.growing || oi.acceleration < cfg.OI_ACCEL_THRESHOLD) return null;
+
   const price = num(ticker?.lastPrice);
   const price24h = num(ticker?.price24hPcnt) ? num(ticker.price24hPcnt) * 100 : 0;
   const div = oiPriceDivergence(oi, price24h);
   const atr = calcATR(k1h, 14);
   if (!price || !atr) return null;
+
   const entry = price;
   const sl = +(entry - atr * 1.5).toFixed(6);
   const tp1 = +(entry + (entry - sl) * 1.5).toFixed(6);
   const tp2 = +(entry + (entry - sl) * 3.5).toFixed(6);
   if (!rrOk(entry, sl, tp1)) return null;
+
   const fr = num(funding?.[0]?.fundingRate) || 0;
   const fundingOk = fr <= cfg.FUNDING_THRESHOLD;
   if (!fundingOk) return null;
+
   let score = 0;
   score += 40;
   score += Math.min(40, Math.max(0, oi.changePct * 10));
   score += Math.min(30, Math.max(0, oi.acceleration * 20));
   score += div.strength * 10;
   score += fundingOk ? 10 : 0;
+
   const sig = { symbol, entry, sl, tp1, tp2, score: Math.round(score), tf5, tf1h, tf4h, daily, oi };
   return sig.score >= cfg.MIN_SCORE ? sig : null;
 }
+
 async function scan() {
   if (scanRunning) return;
   scanRunning = true;
@@ -283,6 +341,7 @@ async function scan() {
     log('scan done');
   }
 }
+
 async function updateTrades() {
   for (const t of [...state.activeTrades]) {
     try {
@@ -297,55 +356,81 @@ async function updateTrades() {
   }
 }
 
-bot.onText(/\/start/, m => bot.sendMessage(m.chat.id, `🤖 Smart Money Bot v29 proper запущен.
-${statusText()}
-
-/test — проверка
-/scan — сканировать сейчас`, mainKb()));
+bot.onText(/\/start/, m => bot.sendMessage(m.chat.id, `🤖 Smart Money Bot v29 proper fixed запущен.\n${statusText()}\n\n/test — проверка\n/scan — сканировать сейчас`, mainKb()));
 bot.onText(/\/status/, m => bot.sendMessage(m.chat.id, statusText(), mainKb()));
 bot.onText(/\/test/, m => bot.sendMessage(m.chat.id, 'Бот на связи ✅', mainKb()));
-bot.onText(/\/scan/, async m => { await bot.sendMessage(m.chat.id, 'Сканирую...', mainKb()); await scan(); });
-bot.onText(/\/trades/, m => bot.sendMessage(m.chat.id, state.activeTrades.length ? state.activeTrades.map(tradeCard).join('
-
-') : 'Сделок нет.', mainKb()));
-bot.onText(/\/reset/, m => { state.lastSignals = []; state.activeTrades = []; saveState(state); bot.sendMessage(m.chat.id, 'Сброс.', mainKb()); });
+bot.onText(/\/scan/, async m => {
+  await bot.sendMessage(m.chat.id, 'Сканирую...', mainKb());
+  await scan();
+});
+bot.onText(/\/trades/, m => bot.sendMessage(m.chat.id, state.activeTrades.length ? state.activeTrades.map(tradeCard).join('\n\n') : 'Сделок нет.', mainKb()));
+bot.onText(/\/reset/, m => {
+  state.lastSignals = [];
+  state.activeTrades = [];
+  saveState(state);
+  bot.sendMessage(m.chat.id, 'Сброс.', mainKb());
+});
 
 bot.on('message', m => {
   if (!m.text || m.text.startsWith('/')) return;
   const t = m.text.trim().toLowerCase();
   if (t === 'статус') return bot.sendMessage(m.chat.id, statusText(), mainKb());
   if (t === 'помощь') return bot.sendMessage(m.chat.id, '/start /status /test /scan /reset /trades', mainKb());
-  if (t === 'мои сделки') return bot.sendMessage(m.chat.id, state.activeTrades.length ? state.activeTrades.map(tradeCard).join('
-
-') : 'Сделок нет.', mainKb());
-  if (t === 'я вышел' || t === 'пропустить') { state.activeTrades = []; saveState(state); return bot.sendMessage(m.chat.id, 'Остановлено.', mainKb()); }
-  if (t === 'сброс') { state.lastSignals = []; state.activeTrades = []; saveState(state); return bot.sendMessage(m.chat.id, 'Сброс.', mainKb()); }
-  if (t === 'подключить авто-торговлю') { state.settings.autoTrading = true; saveState(state); return bot.sendMessage(m.chat.id, 'Авто ON.', mainKb()); }
-  if (t === 'отключить авто-торговлю') { state.settings.autoTrading = false; saveState(state); return bot.sendMessage(m.chat.id, 'Авто OFF.', mainKb()); }
-  if (t === 'включить live trading') { state.settings.liveTrading = true; saveState(state); return bot.sendMessage(m.chat.id, 'Live ON.', mainKb()); }
-  if (t === 'выключить live trading') { state.settings.liveTrading = false; saveState(state); return bot.sendMessage(m.chat.id, 'Live OFF.', mainKb()); }
+  if (t === 'мои сделки') return bot.sendMessage(m.chat.id, state.activeTrades.length ? state.activeTrades.map(tradeCard).join('\n\n') : 'Сделок нет.', mainKb());
+  if (t === 'я вышел' || t === 'пропустить') {
+    state.activeTrades = [];
+    saveState(state);
+    return bot.sendMessage(m.chat.id, 'Остановлено.', mainKb());
+  }
+  if (t === 'сброс') {
+    state.lastSignals = [];
+    state.activeTrades = [];
+    saveState(state);
+    return bot.sendMessage(m.chat.id, 'Сброс.', mainKb());
+  }
+  if (t === 'подключить авто-торговлю') {
+    state.settings.autoTrading = true;
+    saveState(state);
+    return bot.sendMessage(m.chat.id, 'Авто ON.', mainKb());
+  }
+  if (t === 'отключить авто-торговлю') {
+    state.settings.autoTrading = false;
+    saveState(state);
+    return bot.sendMessage(m.chat.id, 'Авто OFF.', mainKb());
+  }
+  if (t === 'включить live trading') {
+    state.settings.liveTrading = true;
+    saveState(state);
+    return bot.sendMessage(m.chat.id, 'Live ON.', mainKb());
+  }
+  if (t === 'выключить live trading') {
+    state.settings.liveTrading = false;
+    saveState(state);
+    return bot.sendMessage(m.chat.id, 'Live OFF.', mainKb());
+  }
 });
 
 if (cfg.CHAT_ID) {
-  bot.sendMessage(cfg.CHAT_ID, `🤖 Smart Money Bot v29 proper запущен.
-${statusText()}
-
-/test — проверка
-/scan — сканировать сейчас`, mainKb()).catch(e => log(`boot: ${e.message}`));
+  bot.sendMessage(cfg.CHAT_ID, `🤖 Smart Money Bot v29 proper fixed запущен.\n${statusText()}\n\n/test — проверка\n/scan — сканировать сейчас`, mainKb()).catch(e => log(`boot: ${e.message}`));
 }
+
 async function continuousScan() {
   while (true) {
-    try { await scan(); } catch (e) {
+    try {
+      await scan();
+    } catch (e) {
       const msg = e instanceof AggregateError ? `AggregateError: ${e.errors?.map(x => x.message).join(', ')}` : e.message;
       log(`continuousScan error: ${msg}`);
     }
     await sleep(30000);
   }
 }
-process.on('unhandledRejection', (reason) => {
+
+process.on('unhandledRejection', reason => {
   const msg = reason instanceof AggregateError ? `AggregateError: ${reason.errors?.map(x => x.message).join(', ')}` : String(reason?.message || reason);
   log(`unhandledRejection: ${msg}`);
 });
+
 continuousScan();
 setInterval(updateTrades, 15000);
 setInterval(() => saveState(state), 10000);
