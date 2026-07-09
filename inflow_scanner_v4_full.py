@@ -410,25 +410,39 @@ def liq_zones(price, funding=0.0):
 
 
 # ---------- TRIANGLE v2: классический восходящий треугольник ----------
+# ---------- TRIANGLE v2: классический восходящий треугольник (строгая проверка структуры) ----------
 def detect_ascending_triangle(highs, lows, closes, vols, price,
                                window=60, swing_win=3,
                                level_tol_pct=0.006,
-                               min_touches=2,
+                               resistance_min_touches=3,
+                               support_min_touches=2,
                                retest_tol_pct=0.006,
                                trend_lookback=40,
-                               vol_breakout_mult=1.5):
+                               vol_breakout_mult=1.5,
+                               min_span_frac=0.55):
     """
-    Классический восходящий треугольник:
-    - сопротивление: горизонталь, >=2 касания в допуске level_tol_pct
-    - поддержка: последовательные минимумы, каждый строго выше предыдущего
+    Классический восходящий треугольник — строгая версия.
+    Требования к структуре (иначе паттерн НЕ засчитывается):
+    1) сопротивление: горизонтальная линия, >= resistance_min_touches касаний
+       (по умолчанию 3 — раньше было 2, из-за чего сигналы шли без реальной фигуры);
+    2) касания сопротивления должны быть РАЗНЕСЕНЫ по времени — первое и последнее
+       должны лежать на расстоянии не меньше min_span_frac от длины окна, иначе это
+       просто два соседних пика, а не полноценная линия;
+    3) до последнего касания цена НЕ должна закрываться выше сопротивления + допуск —
+       иначе треугольник уже был пробит раньше и текущий сигнал не является
+       "первым" пробоем реальной фигуры;
+    4) поддержка: последовательные минимумы, каждый строго выше предыдущего
+       (>= support_min_touches точек) — линия должна расти, а не быть плоской;
+    5) линии должны СХОДИТЬСЯ: ширина треугольника в начале формирования должна
+       быть заметно больше ширины у последней точки (иначе это не треугольник,
+       а канал или плоский диапазон).
     - вход: агрессивный (пробой) и консервативный (ретест)
-    - стоп: чуть ниже последнего значимого минимума
+    - стоп: чуть ниже последнего значимого минимума (минус ATR)
     - тейк: measured move = высота треугольника от точки пробоя
     - prior_trend_up: был ли выраженный аптренд ДО начала треугольника
-      (восходящий треугольник сильнее как continuation, а не сам по себе)
     - volume_breakout_confirmed: объём на последней свече >= vol_breakout_mult
-      от среднего за 5 предыдущих баров (подтверждение силы пробоя)
-    Возвращает dict с полной структурой или None, если паттерн не подтверждён.
+      от среднего за 5 предыдущих баров
+    Возвращает dict с полной структурой или None, если фигура не подтверждена.
     """
     n = len(closes)
     if n < window + 5:
@@ -440,38 +454,54 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
 
     hi_pts = _swing_points(H, True, swing_win)
     lo_pts = _swing_points(L, False, swing_win)
-    if len(hi_pts) < min_touches or len(lo_pts) < min_touches:
+    if len(hi_pts) < resistance_min_touches or len(lo_pts) < support_min_touches:
         return None
 
     tol = price * level_tol_pct
     hi_pts_sorted = sorted(hi_pts, key=lambda p: p[0])
-    base_level = hi_pts_sorted[-1][1]
-    cluster = [p for p in hi_pts_sorted if abs(p[1] - base_level) <= tol]
-    if len(cluster) < min_touches:
-        found = False
-        for cand in hi_pts_sorted:
-            cl = [p for p in hi_pts_sorted if abs(p[1] - cand[1]) <= tol]
-            if len(cl) >= min_touches:
-                cluster = cl
-                base_level = cand[1]
-                found = True
-                break
-        if not found:
-            return None
+
+    # --- ищем кластер касаний сопротивления с >= resistance_min_touches точками ---
+    best_cluster = None
+    for cand in hi_pts_sorted:
+        cl = [p for p in hi_pts_sorted if abs(p[1] - cand[1]) <= tol]
+        if len(cl) >= resistance_min_touches:
+            if best_cluster is None or len(cl) > len(best_cluster):
+                best_cluster = cl
+    if not best_cluster:
+        return None
+    cluster = sorted(best_cluster, key=lambda p: p[0])
     resistance = float(np.mean([p[1] for p in cluster]))
+
+    # --- касания должны быть разнесены по времени, а не сгруппированы в одном месте ---
+    span = cluster[-1][0] - cluster[0][0]
+    if span < window * min_span_frac:
+        return None
+
+    # --- до последнего касания цена не должна была закрываться выше уровня + допуск ---
+    # (иначе фигура уже была пробита раньше, а сейчас мы видим не первый пробой)
+    last_touch_idx = cluster[-1][0]
+    pre_break_closes = closes[-window:][:last_touch_idx]
+    if any(c > resistance + tol for c in pre_break_closes):
+        return None
 
     lo_pts_sorted = sorted(lo_pts, key=lambda p: p[0])
     rising = [lo_pts_sorted[0]]
     for pt in lo_pts_sorted[1:]:
         if pt[1] > rising[-1][1]:
             rising.append(pt)
-    if len(rising) < min_touches:
+    if len(rising) < support_min_touches:
         return None
 
     lowest_support = rising[0][1]
     last_support = rising[-1][1]
     height = resistance - lowest_support
     if height <= 0:
+        return None
+
+    # --- линии должны СХОДИТЬСЯ: ширина в начале формирования > ширины у последней точки ---
+    width_start = resistance - lowest_support
+    width_end = resistance - last_support
+    if not (width_end < width_start * 0.85):
         return None
 
     vol_declining = False
@@ -481,7 +511,6 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
         vol_declining = second_half < first_half
 
     # --- prior_trend_up: был ли аптренд ДО начала формирования треугольника ---
-    # Точка начала треугольника — индекс первого свинга (мин из hi_pts[0], lo_pts[0])
     tri_start_idx = min(hi_pts_sorted[0][0], lo_pts_sorted[0][0])
     prior_trend_up = False
     prior_trend_pct = 0.0
@@ -508,7 +537,7 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
     else:
         stop_level = last_support * 0.995
 
-    # --- предупреждение "не гонись за ценой": далеко ли текущая цена от точки пробоя ---
+    # --- предупреждение "не гонись за ценой" ---
     chase_warning = False
     dist_from_breakout_pct = 0.0
     if price > resistance:
@@ -541,6 +570,9 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
         vol_declining=vol_declining,
         touches_resistance=len(cluster),
         touches_support=len(rising),
+        span_bars=span,
+        width_start=width_start,
+        width_end=width_end,
         prior_trend_up=prior_trend_up,
         prior_trend_pct=prior_trend_pct,
         volume_breakout_confirmed=volume_breakout_confirmed,
