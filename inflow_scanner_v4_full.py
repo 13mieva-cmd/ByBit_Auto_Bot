@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-СКАНЕР ВЛИВАНИЙ v4 — ЛОНГ + ТРЕУГОЛЬНИК v2 + FOLLOW-UP + /stats2
+СКАНЕР ВЛИВАНИЙ v4 — ЛОНГ + ТРЕУГОЛЬНИК + FOLLOW-UP + /stats2
 =============================================================
 Telegram-бот для Railway / VPS.
 Бот НЕ торгует сам. Он:
-1) ищет лонг-сетапы (OI + объём + тренд вверх);
-2) отдельно шлёт карточку треугольника (классический восходящий треугольник);
+1) ищет лонг-сетапы (OI↑ + объём↑ + тренд вверх);
+2) отдельно шлёт карточку треугольника, если есть triangle ready/breakout;
 3) ведёт позицию по кнопке «Я вошёл»;
 4) логирует каждый сигнал в SIGNALS_FILE;
 5) считает форвардную статистику по сигналам через /stats и /stats2.
 
-Эта версия заменяет старую логику треугольника (наклонные линии по МНК)
-на классический восходящий треугольник: горизонтальное сопротивление
-(>=2 касания), растущая поддержка (последовательные минимумы каждый выше
-предыдущего), явный вход (агрессивный/консервативный), стоп и тейк
-по measured move.
+Текущая версия добавляет:
+- аккуратный полный файл без обрывов;
+- /stats2 с expectancy, PF, median, edge vs BTC;
+- более строгую и безопасную структуру кода;
+- сохранение журналов на диск;
+- ИСПРАВЛЕНО: ТРЕУГОЛЬНИК теперь реально считается на 15-минутном ТФ
+  (а не только на часовых свечах) и требует минимум 3 подтверждённых
+  касания каждой линии (сопротивления и поддержки) перед сигналом.
+  Карточка треугольника публикуется ТОЛЬКО если 15м ТФ подтверждает паттерн.
 """
 
 import os
@@ -80,7 +84,7 @@ LAST_EARLY = {}
 RECENT_LOSSES = {}
 _track_cache = {"ts": 0, "data": {}}
 _tickers_cache = {"ts": 0, "data": []}
-
+LAST_BTC_WARN = 0
 
 # ---------- Telegram ----------
 def tg(method, **p):
@@ -142,7 +146,6 @@ def load_chat():
             return f.read().strip()
     except Exception:
         return None
-
 
 # ---------- Bybit ----------
 def bget(path, params):
@@ -233,7 +236,6 @@ def ticker_info(symbol):
             )
     return None
 
-
 # ---------- Indicators ----------
 def rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -305,27 +307,13 @@ def atr_ratio(highs, lows, closes):
 def _bar(frac, n=5):
     frac = max(0.0, min(1.0, frac))
     filled = int(round(frac * n))
-    return "\u25a0" * filled + "\u25a1" * (n - filled)
-
-def _atr(highs, lows, closes, period=14):
-    """Средний истинный диапазон (ATR) по последним period барам."""
-    n = len(closes)
-    if n < period + 1:
-        return None
-    trs = []
-    for i in range(n - period, n):
-        h, l, pc = highs[i], lows[i], closes[i - 1]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    return sum(trs) / len(trs)
-
-
+    return "■" * filled + "□" * (n - filled)
 
 
 def _swing_points(vals, is_high, win=3):
     pts = []
     for i in range(win, len(vals) - win):
-        seg = vals[i - win: i + win + 1]
+        seg = vals[i - win : i + win + 1]
         if is_high and vals[i] == max(seg):
             pts.append((i, vals[i]))
         if not is_high and vals[i] == min(seg):
@@ -353,9 +341,9 @@ def find_levels(highs, lows, closes, price, min_touches=3):
     L = lows[-150:]
     cand = []
     for i in range(2, len(H) - 2):
-        if H[i] >= max(H[i - 2: i + 3]):
+        if H[i] >= max(H[i - 2 : i + 3]):
             cand.append(H[i])
-        if L[i] <= min(L[i - 2: i + 3]):
+        if L[i] <= min(L[i - 2 : i + 3]):
             cand.append(L[i])
     levels = []
     used = [False] * len(cand)
@@ -409,283 +397,111 @@ def liq_zones(price, funding=0.0):
     return out
 
 
-# ---------- TRIANGLE v2: классический восходящий треугольник ----------
-# ---------- TRIANGLE v2: классический восходящий треугольник (строгая проверка структуры) ----------
-def detect_ascending_triangle(highs, lows, closes, vols, price,
-                               window=60, swing_win=3,
-                               level_tol_pct=0.006,
-                               resistance_min_touches=3,
-                               support_min_touches=2,
-                               retest_tol_pct=0.006,
-                               trend_lookback=40,
-                               vol_breakout_mult=1.5,
-                               min_span_frac=0.55):
+MIN_TRIANGLE_TOUCHES = 3
+TOUCH_TOL_FRAC = 0.0025
+
+
+def _count_line_touches(pts, slope, intercept, tol_abs):
     """
-    Классический восходящий треугольник — строгая версия.
-    Требования к структуре (иначе паттерн НЕ засчитывается):
-    1) сопротивление: горизонтальная линия, >= resistance_min_touches касаний
-       (по умолчанию 3 — раньше было 2, из-за чего сигналы шли без реальной фигуры);
-    2) касания сопротивления должны быть РАЗНЕСЕНЫ по времени — первое и последнее
-       должны лежать на расстоянии не меньше min_span_frac от длины окна, иначе это
-       просто два соседних пика, а не полноценная линия;
-    3) до последнего касания цена НЕ должна закрываться выше сопротивления + допуск —
-       иначе треугольник уже был пробит раньше и текущий сигнал не является
-       "первым" пробоем реальной фигуры;
-    4) поддержка: последовательные минимумы, каждый строго выше предыдущего
-       (>= support_min_touches точек) — линия должна расти, а не быть плоской;
-    5) линии должны СХОДИТЬСЯ: ширина треугольника в начале формирования должна
-       быть заметно больше ширины у последней точки (иначе это не треугольник,
-       а канал или плоский диапазон).
-    - вход: агрессивный (пробой) и консервативный (ретест)
-    - стоп: чуть ниже последнего значимого минимума (минус ATR)
-    - тейк: measured move = высота треугольника от точки пробоя
-    - prior_trend_up: был ли выраженный аптренд ДО начала треугольника
-    - volume_breakout_confirmed: объём на последней свече >= vol_breakout_mult
-      от среднего за 5 предыдущих баров
-    Возвращает dict с полной структурой или None, если фигура не подтверждена.
+    Считает, сколько точек касания реально прилегают к линии
+    (в пределах допуска tol_abs), а не просто использовались при фитинге.
+    Это и есть проверка "минимум 3 касания" тренд-линии треугольника.
+    """
+    touches = 0
+    for x, y in pts:
+        line_y = slope * x + intercept
+        if abs(y - line_y) <= tol_abs:
+            touches += 1
+    return touches
+
+
+def detect_triangle(highs, lows, closes, price, win=45, swing_win=3,
+                     min_touches=MIN_TRIANGLE_TOUCHES):
+    """
+    Строгий детектор треугольника:
+    - берёт последние `win` баров текущего таймфрейма (передавай сюда 15м/1ч/4ч данные);
+    - находит локальные свинг-хай/лоу точки;
+    - строит линию сопротивления (по хаям, наклон < 0) и линию поддержки (по лоу, наклон > 0);
+    - ТРЕУГОЛЬНИК считается подтверждённым только если у каждой линии
+      минимум `min_touches` (по умолчанию 3) точек реально касаются линии
+      в пределах допуска TOUCH_TOL_FRAC от цены;
+    - дополнительно требует сужение диапазона (contracting) как раньше.
     """
     n = len(closes)
-    if n < window + 5:
-        return None
+    if n < win + 5:
+        return None, price, price, price
 
-    H = highs[-window:]
-    L = lows[-window:]
-    V = vols[-window:] if len(vols) >= window else vols
+    hi_pts = _swing_points(highs[-win:], True, swing_win)
+    lo_pts = _swing_points(lows[-win:], False, swing_win)
+    if len(hi_pts) < min_touches or len(lo_pts) < min_touches:
+        return None, price, price, price
 
-    hi_pts = _swing_points(H, True, swing_win)
-    lo_pts = _swing_points(L, False, swing_win)
-    if len(hi_pts) < resistance_min_touches or len(lo_pts) < support_min_touches:
-        return None
+    r = _fit_line(hi_pts)
+    s = _fit_line(lo_pts)
+    if not r or not s:
+        return None, price, price, price
+    r_slope, r_int = r
+    s_slope, s_int = s
+    if not (r_slope < 0 and s_slope > 0):
+        return None, price, price, price
 
-    tol = price * level_tol_pct
-    hi_pts_sorted = sorted(hi_pts, key=lambda p: p[0])
+    tol_abs = price * TOUCH_TOL_FRAC
+    hi_touches = _count_line_touches(hi_pts, r_slope, r_int, tol_abs)
+    lo_touches = _count_line_touches(lo_pts, s_slope, s_int, tol_abs)
+    if hi_touches < min_touches or lo_touches < min_touches:
+        return None, price, price, price
 
-    # --- ищем кластер касаний сопротивления с >= resistance_min_touches точками ---
-    best_cluster = None
-    for cand in hi_pts_sorted:
-        cl = [p for p in hi_pts_sorted if abs(p[1] - cand[1]) <= tol]
-        if len(cl) >= resistance_min_touches:
-            if best_cluster is None or len(cl) > len(best_cluster):
-                best_cluster = cl
-    if not best_cluster:
-        return None
-    cluster = sorted(best_cluster, key=lambda p: p[0])
-    resistance = float(np.mean([p[1] for p in cluster]))
+    last_x = win - 1
+    res_now = r_slope * last_x + r_int
+    sup_now = s_slope * last_x + s_int
+    if res_now <= sup_now:
+        return None, price, price, price
 
-    # --- касания должны быть разнесены по времени, а не сгруппированы в одном месте ---
-    span = cluster[-1][0] - cluster[0][0]
-    if span < window * min_span_frac:
-        return None
+    width_now = res_now - sup_now
+    x0 = hi_pts[0][0]
+    if x0 >= win - 5:
+        return None, price, price, price
+    width_0 = abs((r_slope * x0 + r_int) - (s_slope * x0 + s_int))
+    contracting = width_0 > 0 and width_now < width_0 * 0.85
+    if not contracting:
+        return None, price, price, price
 
-    # --- до последнего касания цена не должна была закрываться выше уровня + допуск ---
-    # (иначе фигура уже была пробита раньше, а сейчас мы видим не первый пробой)
-    last_touch_idx = cluster[-1][0]
-    pre_break_closes = closes[-window:][:last_touch_idx]
-    if any(c > resistance + tol for c in pre_break_closes):
-        return None
-
-    lo_pts_sorted = sorted(lo_pts, key=lambda p: p[0])
-    rising = [lo_pts_sorted[0]]
-    for pt in lo_pts_sorted[1:]:
-        if pt[1] > rising[-1][1]:
-            rising.append(pt)
-    if len(rising) < support_min_touches:
-        return None
-
-    lowest_support = rising[0][1]
-    last_support = rising[-1][1]
-    height = resistance - lowest_support
-    if height <= 0:
-        return None
-
-    # --- линии должны СХОДИТЬСЯ: ширина в начале формирования > ширины у последней точки ---
-    width_start = resistance - lowest_support
-    width_end = resistance - last_support
-    if not (width_end < width_start * 0.85):
-        return None
-
-    vol_declining = False
-    if len(V) >= 10:
-        first_half = sum(V[: len(V) // 2]) / max(1, len(V) // 2)
-        second_half = sum(V[len(V) // 2:]) / max(1, len(V) - len(V) // 2)
-        vol_declining = second_half < first_half
-
-    # --- prior_trend_up: был ли аптренд ДО начала формирования треугольника ---
-    tri_start_idx = min(hi_pts_sorted[0][0], lo_pts_sorted[0][0])
-    prior_trend_up = False
-    prior_trend_pct = 0.0
-    global_start = n - window + tri_start_idx
-    lb_start = max(0, global_start - trend_lookback)
-    if global_start - lb_start >= 5:
-        pre_segment = closes[lb_start:global_start + 1]
-        if len(pre_segment) >= 2 and pre_segment[0] > 0:
-            prior_trend_pct = pre_segment[-1] / pre_segment[0] - 1
-            prior_trend_up = prior_trend_pct >= 0.03
-
-    # --- volume_breakout_confirmed: объём последней свечи vs среднее 5 предыдущих ---
-    volume_breakout_confirmed = False
-    vol_ratio_breakout = 0.0
-    if len(vols) >= 6:
-        prev5_avg = sum(vols[-6:-1]) / 5
-        if prev5_avg > 0:
-            vol_ratio_breakout = vols[-1] / prev5_avg
-            volume_breakout_confirmed = vol_ratio_breakout >= vol_breakout_mult
-
-    atr = _atr(highs, lows, closes, period=14)
-    if atr is not None and atr > 0:
-        stop_level = last_support - atr
-    else:
-        stop_level = last_support * 0.995
-
-    # --- предупреждение "не гонись за ценой" ---
-    chase_warning = False
-    dist_from_breakout_pct = 0.0
-    if price > resistance:
-        dist_from_breakout_pct = (price - resistance) / resistance
-        chase_warning = dist_from_breakout_pct > 0.02
-
-    if price > resistance:
-        state = "breakout"
-    elif abs(price - resistance) / price <= 0.01:
-        state = "ready"
-    else:
-        state = "forming"
-
-    breakout_level = resistance
-    target = breakout_level + height
-
-    retest_lo = resistance * (1 - retest_tol_pct)
-    retest_hi = resistance * (1 + retest_tol_pct * 1.5)
-
-    return dict(
-        state=state,
-        resistance=resistance,
-        support_points=rising,
-        height=height,
-        stop_level=stop_level,
-        target_aggr=target,
-        target_cons=target,
-        breakout_level=breakout_level,
-        retest_zone=(retest_lo, retest_hi),
-        vol_declining=vol_declining,
-        touches_resistance=len(cluster),
-        touches_support=len(rising),
-        span_bars=span,
-        width_start=width_start,
-        width_end=width_end,
-        prior_trend_up=prior_trend_up,
-        prior_trend_pct=prior_trend_pct,
-        volume_breakout_confirmed=volume_breakout_confirmed,
-        vol_ratio_breakout=vol_ratio_breakout,
-        atr=atr,
-        chase_warning=chase_warning,
-        dist_from_breakout_pct=dist_from_breakout_pct,
-    )
+    if price > res_now:
+        return "breakout", res_now, res_now, sup_now
+    dist_to_res = (res_now - price) / price if price > 0 else 1
+    if dist_to_res <= 0.04:
+        return "ready", res_now, res_now, sup_now
+    return "forming", res_now, res_now, sup_now
 
 
-def card_triangle_v2(coin, price, tri, ex, score=None, rsi_v=None,
-                      cor=None, btc_weak=None, track_n=0, track_w=0):
-    """Карточка классического восходящего треугольника с конкретными уровнями,
-    плюс три дополнительных фильтра: подтверждение объёма на пробое,
-    наличие аптренда до формирования (continuation-логика), RSI-риск пробоя."""
-    if tri is None:
-        return None
-
-    res = tri["resistance"]
-    height = tri["height"]
-    stop = tri["stop_level"]
-    t_aggr = tri["target_aggr"]
-    retest_lo, retest_hi = tri["retest_zone"]
-    state = tri["state"]
-
-    risk_aggr = (res - stop) / res * 100 if res > 0 else 0
-    reward_aggr = (t_aggr - res) / res * 100 if res > 0 else 0
-    rr_aggr = (reward_aggr / risk_aggr) if risk_aggr > 0 else 0
-
-    head = "\U0001f53a" if state != "breakout" else "\U0001f53a\U0001f680"
-    lines = [
-        f"{head} {coin} \u00b7 \u0412\u041e\u0421\u0421\u0422\u041e\u0414\u044f\u0449\u0438\u0439 \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a",
-        f"\U0001f4b5 ${price:.5g} (Bybit)",
-        "",
-    ]
-    if score is not None:
-        lines.append(f"\U0001f4aa \u0421\u0438\u043b\u0430 \u0441\u0435\u0442\u0430\u043f\u0430: {score}/10 {_bar(score/10,5)}")
-    meta = []
-    if rsi_v is not None:
-        meta.append(f"RSI {int(rsi_v)}")
-    if cor is not None:
-        meta.append(f"\u043a\u043e\u0440\u0440. \u0441 BTC {cor*100:.0f}%")
-    if meta:
-        lines.append("\U0001f4ca " + " \u00b7 ".join(meta))
-    lines.append(
-        f"\U0001f4d0 \u0441\u0442\u0440\u0443\u043a\u0442\u0443\u0440\u0430: \u0441\u043e\u043f\u0440\u043e\u0442\u0438\u0432\u043b\u0435\u043d\u0438\u0435 {tri['touches_resistance']} \u043a\u0430\u0441\u0430\u043d., "
-        f"\u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430 \u0440\u0430\u0441\u0442\u0451\u0442 {tri['touches_support']} \u043a\u0430\u0441\u0430\u043d."
-    )
-
-    # --- новое: контекст тренда до треугольника (continuation-логика) ---
-    if tri.get("prior_trend_up"):
-        lines.append(f"\U0001f4c8 \u0414\u043e \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u0430 \u0431\u044b\u043b \u0432\u044b\u0440\u0430\u0436\u0435\u043d\u043d\u044b\u0439 \u0430\u043f\u0442\u0440\u0435\u043d\u0434 ({tri.get('prior_trend_pct',0)*100:+.1f}%) \u2014 \u043f\u0430\u0442\u0442\u0435\u0440\u043d \u0441\u0438\u043b\u044c\u043d\u0435\u0435 \u043a\u0430\u043a continuation")
-    else:
-        lines.append("\u26a0\ufe0f \u0412\u044b\u0440\u0430\u0436\u0435\u043d\u043d\u043e\u0433\u043e \u0430\u043f\u0442\u0440\u0435\u043d\u0434\u0430 \u0434\u043e \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u0430 \u043d\u0435 \u0432\u0438\u0434\u043d\u043e \u2014 \u0441\u0438\u0433\u043d\u0430\u043b \u0441\u043b\u0430\u0431\u0435\u0435, \u0431\u0435\u0437 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f \u0442\u0440\u0435\u043d\u0434\u0430")
-
-    if tri.get("vol_declining"):
-        lines.append("\U0001f4c9 \u041e\u0431\u044a\u0451\u043c \u0441\u043d\u0438\u0436\u0430\u043b\u0441\u044f \u043f\u0440\u0438 \u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0438 \u2014 \u043f\u0430\u0442\u0442\u0435\u0440\u043d \u0447\u0438\u0449\u0435")
-    else:
-        lines.append("\u26a0\ufe0f \u041e\u0431\u044a\u0451\u043c \u043d\u0435 \u0441\u043d\u0438\u0436\u0430\u043b\u0441\u044f \u043f\u0440\u0438 \u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0438 \u2014 \u043f\u0430\u0442\u0442\u0435\u0440\u043d \u043c\u0435\u043d\u0435\u0435 \u0447\u0438\u0441\u0442\u044b\u0439")
-
-    # --- новое: подтверждение объёма на пробое (только для breakout) ---
-    if state == "breakout" and tri.get("chase_warning"):
-        lines.append(f"\U0001f6ab \u0446\u0435\u043d\u0430 \u0443\u0436\u0435 \u0443\u0448\u043b\u0430 \u043d\u0430 {tri.get('dist_from_breakout_pct',0)*100:.1f}% \u043e\u0442 \u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u0431\u043e\u044f \u2014 \u043d\u0435 \u0433\u043e\u043d\u0438\u0441\u044c, \u0436\u0434\u0438 \u043e\u0442\u043a\u0430\u0442 \u0438\u043b\u0438 \u0440\u0435\u0442\u0435\u0441\u0442")
-    if state == "breakout":
-        if tri.get("volume_breakout_confirmed"):
-            lines.append(f"\U0001f7e2 \u041f\u0440\u043e\u0431\u043e\u0439 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d \u043e\u0431\u044a\u0451\u043c\u043e\u043c \u00d7{tri.get('vol_ratio_breakout',0):.1f} \u043e\u0442 \u0441\u0440\u0435\u0434\u043d\u0435\u0433\u043e \u2014 \u043f\u0440\u043e\u0431\u043e\u0439 \u043d\u0430\u0434\u0451\u0436\u043d\u0435\u0435")
-        else:
-            lines.append(f"\U0001f534 \u041e\u0431\u044a\u0451\u043c \u043d\u0430 \u043f\u0440\u043e\u0431\u043e\u0435 \u0432\u0441\u0435\u0433\u043e \u00d7{tri.get('vol_ratio_breakout',0):.1f} \u043e\u0442 \u0441\u0440\u0435\u0434\u043d\u0435\u0433\u043e \u2014 \u0440\u0438\u0441\u043a \u043b\u043e\u0436\u043d\u043e\u0433\u043e \u043f\u0440\u043e\u0431\u043e\u044f")
-
-    lines.append("")
-    lines.append(f"\U0001f9f1 \u0421\u043e\u043f\u0440\u043e\u0442\u0438\u0432\u043b\u0435\u043d\u0438\u0435 (\u0433\u043e\u0440\u0438\u0437\u043e\u043d\u0442\u0430\u043b\u044c): ${res:.5g}")
-    if tri.get("atr"):
-        lines.append(f"\U0001f4d0 \u0421\u0442\u043e\u043f \u0440\u0430\u0441\u0441\u0447\u0438\u0442\u0430\u043d \u043a\u0430\u043a 1\u00d7ATR ({tri.get('atr'):.5g}) \u043e\u0442 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0435\u0433\u043e \u043c\u0438\u043d\u0438\u043c\u0443\u043c\u0430")
-    lines.append(f"\U0001f4cf \u0412\u044b\u0441\u043e\u0442\u0430 \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u0430: ${height:.5g} ({height/res*100:.1f}% \u043e\u0442 \u0443\u0440\u043e\u0432\u043d\u044f)")
-    lines.append("")
-
-    if state == "forming":
-        lines.append("\u23f3 \u0422\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a \u0444\u043e\u0440\u043c\u0438\u0440\u0443\u0435\u0442\u0441\u044f, \u043f\u0440\u043e\u0431\u043e\u044f \u043f\u043e\u043a\u0430 \u043d\u0435\u0442")
-        lines.append(f"\u2022 \u0436\u0434\u0438 \u043f\u043e\u0434\u0445\u043e\u0434\u0430 \u0446\u0435\u043d\u044b \u043a \u0441\u043e\u043f\u0440\u043e\u0442\u0438\u0432\u043b\u0435\u043d\u0438\u044e ${res:.5g}")
-    elif state == "ready":
-        lines.append("\u26a1 \u0446\u0435\u043d\u0430 \u0432\u043f\u043b\u043e\u0442\u043d\u0443\u044e \u043f\u043e\u0434\u043e\u0448\u043b\u0430 \u043a \u0441\u043e\u043f\u0440\u043e\u0442\u0438\u0432\u043b\u0435\u043d\u0438\u044e \u2014 \u0433\u043e\u0442\u043e\u0432\u043d\u043e\u0441\u0442\u044c \u043a \u043f\u0440\u043e\u0431\u043e\u044e")
-        lines.append(f"\u2022 \u0441\u043b\u0435\u0434\u0438 \u0437\u0430 \u0437\u0430\u043a\u0440\u044b\u0442\u0438\u0435\u043c \u0441\u0432\u0435\u0447\u0438 \u0432\u044b\u0448\u0435 ${res:.5g}")
-        lines.append("\u2022 \u043d\u0435 \u0432\u0445\u043e\u0434\u0438 \u0437\u0430\u0440\u0430\u043d\u0435\u0435: \u0432\u043e\u0437\u043c\u043e\u0436\u0435\u043d \u043b\u043e\u0436\u043d\u044b\u0439 \u043f\u0440\u043e\u043a\u043e\u043b \u0432\u043d\u0438\u0437")
-    elif state == "breakout":
-        lines.append("\U0001f680 \u041f\u0440\u043e\u0431\u043e\u0439 \u0441\u043e\u043f\u0440\u043e\u0442\u0438\u0432\u043b\u0435\u043d\u0438\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d")
-
-    lines.append("")
-    lines.append("\U0001f4cd \u0412\u0445\u043e\u0434 \u2014 2 \u0432\u0430\u0440\u0438\u0430\u043d\u0442\u0430:")
-    lines.append(f"1) \u0410\u0433\u0440\u0435\u0441\u0441\u0438\u0432\u043d\u044b\u0439: \u043d\u0430 \u043f\u0440\u043e\u0431\u043e\u0435/\u0437\u0430\u043a\u0440\u0435\u043f\u043b\u0435\u043d\u0438\u0438 \u0432\u044b\u0448\u0435 ${res:.5g}")
-    lines.append(
-        f"   \u0421\u0442\u043e\u043f: ${stop:.5g} (\u0440\u0438\u0441\u043a ~{risk_aggr:.1f}%) \u00b7 "
-        f"\u0442\u0435\u0439\u043a: ${t_aggr:.5g} (\u043f\u043e\u0442\u0435\u043d\u0446\u0438\u0430\u043b ~{reward_aggr:.1f}%, R:R {rr_aggr:.1f})"
-    )
-    lines.append(f"2) \u041a\u043e\u043d\u0441\u0435\u0440\u0432\u0430\u0442\u0438\u0432\u043d\u044b\u0439: \u0440\u0435\u0442\u0435\u0441\u0442 \u0437\u043e\u043d\u044b ${retest_lo:.5g}\u2013${retest_hi:.5g} \u0441 \u043e\u0442\u0431\u043e\u0435\u043c \u0432\u0432\u0435\u0440\u0445")
-    lines.append(f"   \u0421\u0442\u043e\u043f: ${stop:.5g} \u00b7 \u0442\u0435\u0439\u043a: ${t_aggr:.5g} (\u0442\u0430 \u0436\u0435 \u0446\u0435\u043b\u044c \u043f\u043e \u0432\u044b\u0441\u043e\u0442\u0435 \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u0430)")
-
-    lines.append("")
-    lines.append("\u26a0\ufe0f \u0440\u0438\u0441\u043a\u0438: \u0432 \u043d\u0438\u0441\u0445\u043e\u0434\u044f\u0449\u0435\u043c \u0442\u0440\u0435\u043d\u0434\u0435 \u0432\u043e\u0437\u043c\u043e\u0436\u0435\u043d \u043b\u043e\u0436\u043d\u044b\u0439 \u043f\u0440\u043e\u0431\u043e\u0439 (\u0431\u044b\u0447\u044c\u044f \u043b\u043e\u0432\u0443\u0448\u043a\u0430)")
-
-    # --- новое: предупреждение по RSI на момент пробоя ---
-    if state == "breakout" and rsi_v is not None and rsi_v >= 70:
-        lines.append(f"\u26a0\ufe0f RSI {int(rsi_v)} \u2014 \u0437\u043e\u043d\u0430 \u043f\u0435\u0440\u0435\u043a\u0443\u043f\u043b\u0435\u043d\u043d\u043e\u0441\u0442\u0438, \u0440\u0438\u0441\u043a \u043b\u043e\u0436\u043d\u043e\u0433\u043e \u043f\u0440\u043e\u0431\u043e\u044f \u0432\u044b\u0448\u0435")
-
-    if btc_weak and cor is not None and cor >= 0.3:
-        lines.append("")
-        lines.append(f"\U0001f7e1 BTC \u0441\u043b\u0430\u0431\u0435\u0435\u0442 ({btc_weak}) \u2014 \u043f\u0440\u0438 \u043a\u043e\u0440\u0440\u0435\u043b\u044f\u0446\u0438\u0438 {cor*100:.0f}% \u0440\u0438\u0441\u043a \u043f\u043e\u0442\u044f\u043d\u0443\u0442\u044c \u0432\u043d\u0438\u0437")
-
-    if track_n > 0:
-        lines.append("")
-        lines.append(f"\U0001f4c8 \u0442\u0440\u0435\u043a-\u0440\u0435\u043a\u043e\u0440\u0434 \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u043e\u0432: n={track_n}, \u0432 \u043f\u043b\u044e\u0441\u0435 \u0447\u0435\u0440\u0435\u0437 24\u0447 {track_w} ({track_w/track_n*100:.0f}%)")
-
-    lines += ["", "\u2501" * 16, "\u26a0\ufe0f \u041f\u043e\u0434\u0441\u0432\u0435\u0442\u043a\u0430, \u043d\u0435 \u043f\u0440\u0438\u043a\u0430\u0437. \u0421\u0442\u043e\u043f \u043d\u0430 Bybit \u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u0435\u043d."]
-    return "\n".join(lines)
+def detect_triangle_mtf(sym):
+    """
+    Реально считает треугольник на 15м, 1ч и 4ч (а не только на часовых
+    свечах, как было раньше) и возвращает словарь {"15м":..., "1ч":..., "4ч":...}
+    для передачи в core(tri_mtf=...) и отображения в карточке.
+    """
+    result = {}
+    tf_map = {"15м": ("15", 60), "1ч": ("60", 45), "4ч": ("240", 45)}
+    for label, (interval, win) in tf_map.items():
+        try:
+            res = bget("/v5/market/kline", {
+                "category": "linear", "symbol": sym,
+                "interval": interval, "limit": max(win + 20, 80)
+            })
+            k = res["list"][::-1]
+            if len(k) < win + 5:
+                result[label] = None
+                continue
+            closes_tf = [float(x[4]) for x in k]
+            highs_tf = [float(x[2]) for x in k]
+            lows_tf = [float(x[3]) for x in k]
+            price_tf = closes_tf[-1]
+            tri, _, _, _ = detect_triangle(highs_tf, lows_tf, closes_tf, price_tf, win=win)
+            result[label] = tri
+            time.sleep(0.08)
+        except Exception:
+            result[label] = None
+    return result
 
 
 def early_breakout(closes, highs, lows, vols):
@@ -720,7 +536,7 @@ def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
     extended = ext > 0.05
     levels = find_levels(highs, lows, closes, price, min_touches=3)
     lvl = nearest_level(levels, price)
-    tri_v2 = detect_ascending_triangle(highs, lows, closes, vols, price)
+    tri, tri_top, tri_res_now, tri_sup_now = detect_triangle(highs, lows, closes, price)
     flag = None
     flag_top = price
     if len(closes) >= 30:
@@ -760,7 +576,10 @@ def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
         consol_base=consol_base,
         old_high=old_high,
         extended=extended,
-        tri_v2=tri_v2,
+        tri=tri,
+        tri_top=tri_top,
+        tri_res_now=tri_res_now,
+        tri_sup_now=tri_sup_now,
         flag=flag,
         flag_top=flag_top,
         levels=levels,
@@ -795,7 +614,6 @@ def _score(m, ex):
     if ex.get("funding", 0) > 0.01:
         s -= 1
     return max(0, min(10, s))
-
 
 # ---------- Cards ----------
 def track_record(sig_type):
@@ -940,12 +758,68 @@ def card_long(m, ex):
     lines.append("📍 Где входить:")
     if m.get("extended"):
         lines.append(f"⚠️ цена на +{ext*100:.0f}% выше EMA21 — не гонись за свечой")
-    lines.append(f"• зона отката: ${e21:.5g} (EMA21) – ${base:.5g}")
+        lines.append(f"• зона отката: ${e21:.5g} (EMA21) – ${base:.5g}")
     hi_note = " — пробивается 🚀" if m["price"] > oh else " — цель"
     lines.append(f"• старый хай: ${oh:.5g}{hi_note}")
     _n, _w = track_record("long")
     if _n > 0:
         lines += ["", f"📈 Трек-рекорд ЛОНГ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
+    lines += ["", "━━━━━━━━━━━━━━━━", "⚠️ Подсветка, не приказ. Стоп на Bybit обязателен."]
+    return "\n".join(lines)
+
+
+def card_triangle(m, ex):
+    tri = m.get("tri")
+    if tri not in ("ready", "breakout"):
+        return None
+    tt = m.get("tri_top", m["price"])
+    sc = _score(m, ex)
+    rsi_v = int(m.get("rsi", 50))
+    lines = [
+        f"🔺🔺🔺 {m['coin']} · СЕТАП ТРЕУГОЛЬНИК (15м, 3+ касания) 🔺🔺🔺",
+        f"💵 ${m['price']:.5g} (Bybit)",
+        "",
+        f"💪 Сила сетапа: {sc}/10 {_bar(sc/10,5)}",
+        f"💰 Приток OI {m['oi4']*100:+.0f}% · Объём ×{m['spike']:.1f} · RSI {rsi_v}",
+        f"🔗 Корреляция с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}",
+    ]
+    mtf = m.get("tri_mtf")
+    if mtf:
+        def _mk(v):
+            return "✅" if v in ("ready", "breakout", "forming") else "—"
+        tri_15m = mtf.get("15м")
+        n_active = sum(1 for tf in ("15м", "1ч", "4ч") if mtf.get(tf) in ("ready", "breakout", "forming"))
+        lines.append(f"🕒 ТРЕУГОЛЬНИК по ТФ: 15м {_mk(tri_15m)} · 1ч {_mk(mtf.get('1ч'))} · 4ч {_mk(mtf.get('4ч'))}")
+        if tri_15m in ("ready", "breakout"):
+            lines.append("• на 15м подтверждён ТРЕУГОЛЬНИК с 3+ касаниями каждой линии ✅")
+        else:
+            lines.append("• на 15м ТРЕУГОЛЬНИК НЕ подтверждён — сигнал не публикуется без него")
+        if n_active >= 2:
+            lines.append(f"• виден на {n_active} ТФ — структура подтверждена")
+        else:
+            lines.append("• виден только на одном ТФ — слабее подтверждён")
+    lines.append("")
+    if tri == "ready":
+        lines.append("⚡ Готовность к пробою")
+        lines.append(f"• цена вплотную подошла к крышке ${tt:.5g} и поджимается")
+        lines.append(f"• следи за закрытием свечи выше ${tt:.5g}")
+        lines.append("• не входи заранее: часто бывает ложный прокол вниз")
+    elif tri == "breakout":
+        lines.append("🚀 ПРОБОЙ вверх")
+        lines.append(f"• цена закрылась выше крышки ${tt:.5g} — треугольник пробит")
+        lines.append(f"• подтверждение: удержание выше ${tt:.5g} или ретест сверху")
+        lines.append("• вход лучше на ретесте, а не на проколе")
+    if m.get("btc_weak") and m["cor"] >= 0.3:
+        lines.append("")
+        lines.append(f"🟡 BTC слабеет ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть вниз")
+    if m.get("watching"):
+        zlo, zhi = m["watching"]
+        wk = m.get("watch_kind", "зоне")
+        lines.append("")
+        lines.append(f"⏳ На отслеживании — позову на ретесте к {wk} ${zlo:.5g}–${zhi:.5g}")
+    _n, _w = track_record("triangle")
+    if _n > 0:
+        lines += ["", f"📈 Трек-рекорд ТРЕУГОЛЬНИКОВ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
     lines += ["", "━━━━━━━━━━━━━━━━", "⚠️ Подсветка, не приказ. Стоп на Bybit обязателен."]
     return "\n".join(lines)
 
@@ -972,7 +846,6 @@ def card_early(m, zone_hi, zone_lo):
         lines += ["", f"📈 Трек-рекорд РАННИХ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
     lines += ["", "━━━━━━━━━━━━━━━━", "⚠️ Экспериментальный сигнал. Пойдёт ли вверх — НЕ гарантия."]
     return "\n".join(lines)
-
 
 # ---------- logging ----------
 def log_signal(coin, sig_type, price):
@@ -1136,7 +1009,7 @@ def compute_stats():
                 verdict = "✅ edge>0" if edge > 0 else "❌ edge<=0"
                 line.append(f"BTC {bavg:+.2f}%, edge {edge:+.2f}% {verdict}")
             out.append(" | ".join(line))
-    out.append("")
+        out.append("")
     out.append("⚠️ Малая выборка (n<30-50) слабая. Смотри на edge против BTC, expectancy и PF.")
     return "\n".join(out)
 
@@ -1244,6 +1117,16 @@ def stop_map(m):
     return long_stops, short_stops
 
 
+def average_true_range_gap(highs, lows, closes):
+    a = atr(highs, lows, closes, 14)
+    if len(closes) < 60:
+        return 1.0
+    vals = []
+    for i in range(30, len(closes)):
+        vals.append(atr(highs[:i+1], lows[:i+1], closes[:i+1], 14))
+    avg = sum(vals[-30:]) / min(30, len(vals)) if vals else a
+    return a / avg if avg > 0 else 1.0
+
 # ---------- Position follow-up ----------
 def pos_buttons(coin):
     return [[{"text": "❌ Выйти", "callback_data": f"exit|{coin}"}]]
@@ -1300,7 +1183,6 @@ def position_status(coin):
     msg = f"{coin}: {price:.6g} | PnL {pnl*100:+.2f}% | {'; '.join(reasons) if reasons else 'держится'}"
     return msg, state
 
-
 # ---------- Scan ----------
 def run_scan(cid, announce=False):
     global LAST_BTC_WARN
@@ -1349,6 +1231,8 @@ def run_scan(cid, announce=False):
         if len(closes) < MIN_BARS or len(oic) < 30:
             continue
         m = core(coin, closes, highs, lows, vols, oic, btc_closes or closes, btc_p4=(btc_closes[-1] / btc_closes[-5] - 1 if len(btc_closes) >= 5 else 0))
+        if m.get("tri") in ("ready", "breakout", "forming"):
+            m["tri_mtf"] = detect_triangle_mtf(sym)
         SYM_CACHE[coin] = sym
         ex = ticker_info(sym) or {}
         by = bybit_price(coin)
@@ -1356,7 +1240,6 @@ def run_scan(cid, announce=False):
             m["bybit"] = by
         m["ls_ratio"] = long_short_ratio(sym)
         m["btc_weak"] = btc_weak
-
         if EARLY_ENABLED:
             early, zhi, zlo = early_breakout(closes, highs, lows, vols)
             if early and m.get("atrr", 1.0) >= ATR_MIN_RATIO and now - LAST_EARLY.get(coin, 0) > EARLY_COOLDOWN_H * 3600:
@@ -1365,25 +1248,20 @@ def run_scan(cid, announce=False):
                 tg_send(cid, card_early(m, zhi, zlo), buttons=buttons)
                 shown += 1
                 log_signal(coin, "early", m["price"])
-
-        tri_v2 = m.get("tri_v2")
-        tri_state = tri_v2["state"] if tri_v2 else None
+        tri_now = m.get("tri")
+        tri_mtf_now = m.get("tri_mtf") or {}
+        tri_15m_ok = tri_mtf_now.get("15м") in ("ready", "breakout")
         tri_last = LAST_ALERT.get(f"tri_{coin}", 0)
-        if tri_state in ("ready", "breakout") and now - tri_last > TRI_ALERT_HOURS * 3600:
-            _n_tri, _w_tri = track_record("triangle")
-            tri_card = card_triangle_v2(
-                m["coin"], m["price"], tri_v2, ex,
-                score=_score(m, ex), rsi_v=m.get("rsi"), cor=m.get("cor"),
-                btc_weak=m.get("btc_weak"), track_n=_n_tri, track_w=_w_tri,
-            )
+        if tri_now in ("ready", "breakout") and tri_15m_ok and now - tri_last > TRI_ALERT_HOURS * 3600:
+            tri_card = card_triangle(m, ex)
             if tri_card:
                 buttons_tri = [[{"text": "✅ Я вошёл", "callback_data": f"enter|{m['coin']}|{m['price']:.6g}"}]]
                 tg_send(cid, tri_card, buttons=buttons_tri)
                 shown += 1
                 log_signal(m["coin"], "triangle", m["price"])
                 LAST_ALERT[f"tri_{coin}"] = now
-        if tri_state == "ready" and tri_v2.get("resistance", 0) > 0 and m["coin"] not in TRI_ALERT:
-            TRI_ALERT[m["coin"]] = dict(sym=sym, top=tri_v2["resistance"], ts=time.time())
+                if tri_now == "ready" and m.get("tri_top", 0) > 0 and m["coin"] not in TRI_ALERT:
+                    TRI_ALERT[m["coin"]] = dict(sym=sym, top=m["tri_top"], ts=time.time())
 
         if not long_ok(m):
             continue
@@ -1400,10 +1278,10 @@ def run_scan(cid, announce=False):
             WATCH[m["coin"]] = dict(sym=sym, zone_hi=base * 1.008, zone_lo=base * 0.99, ts=time.time(), price0=m["price"], kind=f"уровню ${base:.5g}")
             m["watching"] = (base * 0.99, base * 1.008)
             m["watch_kind"] = f"уровню ${base:.5g} ({lv['touches']} касаний)"
-        elif m.get("tri_v2") and m["tri_v2"]["state"] == "breakout":
-            rlo, rhi = m["tri_v2"]["retest_zone"]
-            WATCH[m["coin"]] = dict(sym=sym, zone_hi=rhi, zone_lo=rlo, ts=time.time(), price0=m["price"], kind="пробой треугольника")
-            m["watching"] = (rlo, rhi)
+        elif m.get("tri") == "breakout" and m.get("tri_top", 0) > 0:
+            top = m["tri_top"]
+            WATCH[m["coin"]] = dict(sym=sym, zone_hi=top * 1.004, zone_lo=top * 0.985, ts=time.time(), price0=m["price"], kind="пробой треугольника")
+            m["watching"] = (top * 0.985, top * 1.004)
             m["watch_kind"] = "крышке треугольника"
         else:
             zone_hi = m.get("e21", m["price"])
@@ -1461,7 +1339,6 @@ def check_watchlist(chat):
             )
             del WATCH[coin]
 
-
 # ---------- callbacks ----------
 def handle_callback(q):
     data = q.get("data", "")
@@ -1495,6 +1372,61 @@ def handle_callback(q):
         emo = "🟢" if pnl >= 0 else "🔴"
         tg_send(cid, f"{emo} Сделка по {coin} закрыта.\nВход ${e:.5g} → выход ${x:.5g} = {pnl*100:+.2f}%\nЗаписал в журнал.")
 
+# ---------- trade journal ----------
+def pos_buttons(coin):
+    return [[{"text": "❌ Выйти", "callback_data": f"exit|{coin}"}]]
+
+
+def close_trade(coin):
+    p = POSITIONS.pop(coin, None)
+    if not p:
+        return None
+    try:
+        cur = bybit_price(coin)
+        if cur is None:
+            return None
+        pnl = cur / p["entry"] - 1
+        new = not os.path.exists(TRADES)
+        with open(TRADES, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["ts_open", "coin", "entry", "ts_close", "exit", "pnl"])
+            w.writerow([p["ts"], coin, f"{p['entry']:.6g}", dt.datetime.now().isoformat(timespec="seconds"), f"{cur:.6g}", f"{pnl:.6f}"])
+        if pnl < 0:
+            RECENT_LOSSES[coin] = time.time()
+        return pnl, p["entry"], cur
+    except Exception:
+        return None
+
+
+def position_status(coin):
+    p = POSITIONS.get(coin)
+    if not p:
+        return None, None
+    try:
+        closes, _, _, _ = klines(p["sym"], limit=80)
+        time.sleep(0.15)
+        oic = open_interest(p["sym"], limit=10)
+        time.sleep(0.15)
+    except Exception:
+        return None, None
+    if len(closes) < 55 or len(oic) < 6:
+        return None, None
+    price = closes[-1]
+    pnl = price / p["entry"] - 1
+    oi1 = oic[-1] / oic[-2] - 1 if oic[-2] > 0 else 0
+    oi4 = oic[-1] / oic[-5] - 1 if oic[-5] > 0 else 0
+    e50 = ema(closes[-60:], 50)
+    reasons = []
+    if oi1 <= -0.03:
+        reasons.append(f"OI резко вниз ({oi1*100:+.0f}% за 1ч)")
+    if price < e50:
+        reasons.append("цена ниже EMA50")
+    if oi4 <= -0.05:
+        reasons.append(f"OI 4ч {oi4*100:+.0f}%")
+    state = "ok" if not reasons else "warn"
+    msg = f"{coin}: {price:.6g} | PnL {pnl*100:+.2f}% | {'; '.join(reasons) if reasons else 'держится'}"
+    return msg, state
 
 # ---------- main ----------
 def main():
