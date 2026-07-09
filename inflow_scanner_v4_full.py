@@ -419,13 +419,13 @@ def detect_triangle(highs, lows, closes, price, win=45, swing_win=3):
     if x0 >= win - 5:
         return None, price, price, price
     width_0 = abs((r_slope * x0 + r_int) - (s_slope * x0 + s_int))
-    contracting = width_0 > 0 and width_now < width_0 * 0.7
+    contracting = width_0 > 0 and width_now < width_0 * 0.85
     if not contracting:
         return None, price, price, price
     if price > res_now:
         return "breakout", res_now, res_now, sup_now
     dist_to_res = (res_now - price) / price if price > 0 else 1
-    if dist_to_res <= 0.02:
+    if dist_to_res <= 0.04:
         return "ready", res_now, res_now, sup_now
     return "forming", res_now, res_now, sup_now
 
@@ -1152,6 +1152,7 @@ def run_scan(cid, announce=False):
         if len(closes) < MIN_BARS or len(oic) < 30:
             continue
         m = core(coin, closes, highs, lows, vols, oic, btc_closes or closes, btc_p4=(btc_closes[-1] / btc_closes[-5] - 1 if len(btc_closes) >= 5 else 0))
+        SYM_CACHE[coin] = sym
         ex = ticker_info(sym) or {}
         by = bybit_price(coin)
         if by:
@@ -1166,6 +1167,19 @@ def run_scan(cid, announce=False):
                 tg_send(cid, card_early(m, zhi, zlo), buttons=buttons)
                 shown += 1
                 log_signal(coin, "early", m["price"])
+        tri_now = m.get("tri")
+        tri_last = LAST_ALERT.get(f"tri_{coin}", 0)
+        if tri_now in ("ready", "breakout") and now - tri_last > TRI_ALERT_HOURS * 3600:
+            tri_card = card_triangle(m, ex)
+            if tri_card:
+                buttons_tri = [[{"text": "✅ Я вошёл", "callback_data": f"enter|{m['coin']}|{m['price']:.6g}"}]]
+                tg_send(cid, tri_card, buttons=buttons_tri)
+                shown += 1
+                log_signal(m["coin"], "triangle", m["price"])
+                LAST_ALERT[f"tri_{coin}"] = now
+                if tri_now == "ready" and m.get("tri_top", 0) > 0 and m["coin"] not in TRI_ALERT:
+                    TRI_ALERT[m["coin"]] = dict(sym=sym, top=m["tri_top"], ts=time.time())
+
         if not long_ok(m):
             continue
         last = LAST_ALERT.get(coin, 0)
@@ -1197,13 +1211,6 @@ def run_scan(cid, announce=False):
         tg_send(cid, card_long(m, ex), buttons=buttons)
         shown += 1
         log_signal(m["coin"], "long", m["price"])
-        tri_card = card_triangle(m, ex)
-        if tri_card:
-            tg_send(cid, tri_card, buttons=buttons)
-            shown += 1
-            log_signal(m["coin"], "triangle", m["price"])
-            if m.get("tri") == "ready" and m.get("tri_top", 0) > 0 and m["coin"] not in TRI_ALERT:
-                TRI_ALERT[m["coin"]] = dict(sym=sym, top=m["tri_top"], ts=time.time())
         LAST_ALERT[coin] = now
     if shown == 0 and announce:
         tg_send(cid, "Сейчас чистых сетапов не найдено. Бот продолжает сканировать автоматически.")
