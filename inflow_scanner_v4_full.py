@@ -307,6 +307,20 @@ def _bar(frac, n=5):
     filled = int(round(frac * n))
     return "\u25a0" * filled + "\u25a1" * (n - filled)
 
+def _atr(highs, lows, closes, period=14):
+    """Средний истинный диапазон (ATR) по последним period барам."""
+    n = len(closes)
+    if n < period + 1:
+        return None
+    trs = []
+    for i in range(n - period, n):
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    return sum(trs) / len(trs)
+
+
+
 
 def _swing_points(vals, is_high, win=3):
     pts = []
@@ -400,7 +414,9 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
                                window=60, swing_win=3,
                                level_tol_pct=0.006,
                                min_touches=2,
-                               retest_tol_pct=0.006):
+                               retest_tol_pct=0.006,
+                               trend_lookback=40,
+                               vol_breakout_mult=1.5):
     """
     Классический восходящий треугольник:
     - сопротивление: горизонталь, >=2 касания в допуске level_tol_pct
@@ -408,6 +424,10 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
     - вход: агрессивный (пробой) и консервативный (ретест)
     - стоп: чуть ниже последнего значимого минимума
     - тейк: measured move = высота треугольника от точки пробоя
+    - prior_trend_up: был ли выраженный аптренд ДО начала треугольника
+      (восходящий треугольник сильнее как continuation, а не сам по себе)
+    - volume_breakout_confirmed: объём на последней свече >= vol_breakout_mult
+      от среднего за 5 предыдущих баров (подтверждение силы пробоя)
     Возвращает dict с полной структурой или None, если паттерн не подтверждён.
     """
     n = len(closes)
@@ -460,7 +480,40 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
         second_half = sum(V[len(V) // 2:]) / max(1, len(V) - len(V) // 2)
         vol_declining = second_half < first_half
 
-    stop_level = last_support * 0.995
+    # --- prior_trend_up: был ли аптренд ДО начала формирования треугольника ---
+    # Точка начала треугольника — индекс первого свинга (мин из hi_pts[0], lo_pts[0])
+    tri_start_idx = min(hi_pts_sorted[0][0], lo_pts_sorted[0][0])
+    prior_trend_up = False
+    prior_trend_pct = 0.0
+    global_start = n - window + tri_start_idx
+    lb_start = max(0, global_start - trend_lookback)
+    if global_start - lb_start >= 5:
+        pre_segment = closes[lb_start:global_start + 1]
+        if len(pre_segment) >= 2 and pre_segment[0] > 0:
+            prior_trend_pct = pre_segment[-1] / pre_segment[0] - 1
+            prior_trend_up = prior_trend_pct >= 0.03
+
+    # --- volume_breakout_confirmed: объём последней свечи vs среднее 5 предыдущих ---
+    volume_breakout_confirmed = False
+    vol_ratio_breakout = 0.0
+    if len(vols) >= 6:
+        prev5_avg = sum(vols[-6:-1]) / 5
+        if prev5_avg > 0:
+            vol_ratio_breakout = vols[-1] / prev5_avg
+            volume_breakout_confirmed = vol_ratio_breakout >= vol_breakout_mult
+
+    atr = _atr(highs, lows, closes, period=14)
+    if atr is not None and atr > 0:
+        stop_level = last_support - atr
+    else:
+        stop_level = last_support * 0.995
+
+    # --- предупреждение "не гонись за ценой": далеко ли текущая цена от точки пробоя ---
+    chase_warning = False
+    dist_from_breakout_pct = 0.0
+    if price > resistance:
+        dist_from_breakout_pct = (price - resistance) / resistance
+        chase_warning = dist_from_breakout_pct > 0.02
 
     if price > resistance:
         state = "breakout"
@@ -488,12 +541,21 @@ def detect_ascending_triangle(highs, lows, closes, vols, price,
         vol_declining=vol_declining,
         touches_resistance=len(cluster),
         touches_support=len(rising),
+        prior_trend_up=prior_trend_up,
+        prior_trend_pct=prior_trend_pct,
+        volume_breakout_confirmed=volume_breakout_confirmed,
+        vol_ratio_breakout=vol_ratio_breakout,
+        atr=atr,
+        chase_warning=chase_warning,
+        dist_from_breakout_pct=dist_from_breakout_pct,
     )
 
 
 def card_triangle_v2(coin, price, tri, ex, score=None, rsi_v=None,
                       cor=None, btc_weak=None, track_n=0, track_w=0):
-    """Карточка классического восходящего треугольника с конкретными уровнями."""
+    """Карточка классического восходящего треугольника с конкретными уровнями,
+    плюс три дополнительных фильтра: подтверждение объёма на пробое,
+    наличие аптренда до формирования (continuation-логика), RSI-риск пробоя."""
     if tri is None:
         return None
 
@@ -527,13 +589,31 @@ def card_triangle_v2(coin, price, tri, ex, score=None, rsi_v=None,
         f"\U0001f4d0 \u0441\u0442\u0440\u0443\u043a\u0442\u0443\u0440\u0430: \u0441\u043e\u043f\u0440\u043e\u0442\u0438\u0432\u043b\u0435\u043d\u0438\u0435 {tri['touches_resistance']} \u043a\u0430\u0441\u0430\u043d., "
         f"\u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430 \u0440\u0430\u0441\u0442\u0451\u0442 {tri['touches_support']} \u043a\u0430\u0441\u0430\u043d."
     )
+
+    # --- новое: контекст тренда до треугольника (continuation-логика) ---
+    if tri.get("prior_trend_up"):
+        lines.append(f"\U0001f4c8 \u0414\u043e \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u0430 \u0431\u044b\u043b \u0432\u044b\u0440\u0430\u0436\u0435\u043d\u043d\u044b\u0439 \u0430\u043f\u0442\u0440\u0435\u043d\u0434 ({tri.get('prior_trend_pct',0)*100:+.1f}%) \u2014 \u043f\u0430\u0442\u0442\u0435\u0440\u043d \u0441\u0438\u043b\u044c\u043d\u0435\u0435 \u043a\u0430\u043a continuation")
+    else:
+        lines.append("\u26a0\ufe0f \u0412\u044b\u0440\u0430\u0436\u0435\u043d\u043d\u043e\u0433\u043e \u0430\u043f\u0442\u0440\u0435\u043d\u0434\u0430 \u0434\u043e \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u0430 \u043d\u0435 \u0432\u0438\u0434\u043d\u043e \u2014 \u0441\u0438\u0433\u043d\u0430\u043b \u0441\u043b\u0430\u0431\u0435\u0435, \u0431\u0435\u0437 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f \u0442\u0440\u0435\u043d\u0434\u0430")
+
     if tri.get("vol_declining"):
         lines.append("\U0001f4c9 \u041e\u0431\u044a\u0451\u043c \u0441\u043d\u0438\u0436\u0430\u043b\u0441\u044f \u043f\u0440\u0438 \u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0438 \u2014 \u043f\u0430\u0442\u0442\u0435\u0440\u043d \u0447\u0438\u0449\u0435")
     else:
         lines.append("\u26a0\ufe0f \u041e\u0431\u044a\u0451\u043c \u043d\u0435 \u0441\u043d\u0438\u0436\u0430\u043b\u0441\u044f \u043f\u0440\u0438 \u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0438 \u2014 \u043f\u0430\u0442\u0442\u0435\u0440\u043d \u043c\u0435\u043d\u0435\u0435 \u0447\u0438\u0441\u0442\u044b\u0439")
-    lines.append("")
 
+    # --- новое: подтверждение объёма на пробое (только для breakout) ---
+    if state == "breakout" and tri.get("chase_warning"):
+        lines.append(f"\U0001f6ab \u0446\u0435\u043d\u0430 \u0443\u0436\u0435 \u0443\u0448\u043b\u0430 \u043d\u0430 {tri.get('dist_from_breakout_pct',0)*100:.1f}% \u043e\u0442 \u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u0431\u043e\u044f \u2014 \u043d\u0435 \u0433\u043e\u043d\u0438\u0441\u044c, \u0436\u0434\u0438 \u043e\u0442\u043a\u0430\u0442 \u0438\u043b\u0438 \u0440\u0435\u0442\u0435\u0441\u0442")
+    if state == "breakout":
+        if tri.get("volume_breakout_confirmed"):
+            lines.append(f"\U0001f7e2 \u041f\u0440\u043e\u0431\u043e\u0439 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d \u043e\u0431\u044a\u0451\u043c\u043e\u043c \u00d7{tri.get('vol_ratio_breakout',0):.1f} \u043e\u0442 \u0441\u0440\u0435\u0434\u043d\u0435\u0433\u043e \u2014 \u043f\u0440\u043e\u0431\u043e\u0439 \u043d\u0430\u0434\u0451\u0436\u043d\u0435\u0435")
+        else:
+            lines.append(f"\U0001f534 \u041e\u0431\u044a\u0451\u043c \u043d\u0430 \u043f\u0440\u043e\u0431\u043e\u0435 \u0432\u0441\u0435\u0433\u043e \u00d7{tri.get('vol_ratio_breakout',0):.1f} \u043e\u0442 \u0441\u0440\u0435\u0434\u043d\u0435\u0433\u043e \u2014 \u0440\u0438\u0441\u043a \u043b\u043e\u0436\u043d\u043e\u0433\u043e \u043f\u0440\u043e\u0431\u043e\u044f")
+
+    lines.append("")
     lines.append(f"\U0001f9f1 \u0421\u043e\u043f\u0440\u043e\u0442\u0438\u0432\u043b\u0435\u043d\u0438\u0435 (\u0433\u043e\u0440\u0438\u0437\u043e\u043d\u0442\u0430\u043b\u044c): ${res:.5g}")
+    if tri.get("atr"):
+        lines.append(f"\U0001f4d0 \u0421\u0442\u043e\u043f \u0440\u0430\u0441\u0441\u0447\u0438\u0442\u0430\u043d \u043a\u0430\u043a 1\u00d7ATR ({tri.get('atr'):.5g}) \u043e\u0442 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0435\u0433\u043e \u043c\u0438\u043d\u0438\u043c\u0443\u043c\u0430")
     lines.append(f"\U0001f4cf \u0412\u044b\u0441\u043e\u0442\u0430 \u0442\u0440\u0435\u0443\u0433\u043e\u043b\u044c\u043d\u0438\u043a\u0430: ${height:.5g} ({height/res*100:.1f}% \u043e\u0442 \u0443\u0440\u043e\u0432\u043d\u044f)")
     lines.append("")
 
@@ -559,6 +639,10 @@ def card_triangle_v2(coin, price, tri, ex, score=None, rsi_v=None,
 
     lines.append("")
     lines.append("\u26a0\ufe0f \u0440\u0438\u0441\u043a\u0438: \u0432 \u043d\u0438\u0441\u0445\u043e\u0434\u044f\u0449\u0435\u043c \u0442\u0440\u0435\u043d\u0434\u0435 \u0432\u043e\u0437\u043c\u043e\u0436\u0435\u043d \u043b\u043e\u0436\u043d\u044b\u0439 \u043f\u0440\u043e\u0431\u043e\u0439 (\u0431\u044b\u0447\u044c\u044f \u043b\u043e\u0432\u0443\u0448\u043a\u0430)")
+
+    # --- новое: предупреждение по RSI на момент пробоя ---
+    if state == "breakout" and rsi_v is not None and rsi_v >= 70:
+        lines.append(f"\u26a0\ufe0f RSI {int(rsi_v)} \u2014 \u0437\u043e\u043d\u0430 \u043f\u0435\u0440\u0435\u043a\u0443\u043f\u043b\u0435\u043d\u043d\u043e\u0441\u0442\u0438, \u0440\u0438\u0441\u043a \u043b\u043e\u0436\u043d\u043e\u0433\u043e \u043f\u0440\u043e\u0431\u043e\u044f \u0432\u044b\u0448\u0435")
 
     if btc_weak and cor is not None and cor >= 0.3:
         lines.append("")
