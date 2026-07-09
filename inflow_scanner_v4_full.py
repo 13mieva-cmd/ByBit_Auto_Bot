@@ -19,6 +19,12 @@ Telegram-бот для Railway / VPS.
   (а не только на часовых свечах) и требует минимум 3 подтверждённых
   касания каждой линии (сопротивления и поддержки) перед сигналом.
   Карточка треугольника публикуется ТОЛЬКО если 15м ТФ подтверждает паттерн.
+- НОВОЕ v6: добавлен РАННИЙ лонг-сигнал по 1-часовым данным (long_ok_fast).
+  Раньше сигнал ждал полного 4-часового накопления OI+объём+цена (long_ok),
+  из-за чего приходил уже на пике движения. Теперь отдельная более мягкая
+  проверка на 1ч данных (OI за 1ч, всплеск объёма текущей свечи, цена
+  тронулась, но не улетела) шлёт карточку "🟠 РАННИЙ ЛОНГ" заметно раньше.
+  Обычный 🟢 ЛОНГ-сигнал (long_ok) остаётся как подтверждение через 2-4ч.
 """
 
 import os
@@ -54,6 +60,11 @@ BTC_RISK_MIN_HITS = 2
 LAST_BTC_WARN = 0
 PRICE_UP_4H_MIN = 0.005
 RSI_MAX = 78
+OI_1H_FAST_MIN = 0.02
+VOL_SPIKE_1H_MIN = 1.8
+PRICE_UP_1H_MIN = 0.002
+PRICE_UP_1H_MAX = 0.06
+FAST_SIGNAL_COOLDOWN_H = 3
 MIN_BARS = 200
 COOLDOWN_H = 4
 FUNDING_CUTOFF = 0.0005
@@ -520,6 +531,7 @@ def early_breakout(closes, highs, lows, vols):
 
 def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
     price = closes[-1]
+    p1 = closes[-1] / closes[-2] - 1 if len(closes) >= 2 else 0
     p4 = closes[-1] / closes[-5] - 1 if len(closes) >= 5 else 0
     oi1 = oic[-1] / oic[-2] - 1 if len(oic) > 1 and oic[-2] > 0 else 0
     oi4 = oic[-1] / oic[-5] - 1 if len(oic) > 4 and oic[-5] > 0 else 0
@@ -527,6 +539,8 @@ def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
     vr = sum(vols[-4:])
     vb = (sum(vols[-28:-4]) / 24 * 4) if len(vols) >= 28 else vr
     spike = vr / vb if vb > 0 else 0
+    vb_fast = sum(vols[-25:-1]) / max(1, len(vols[-25:-1])) if len(vols) >= 25 else (sum(vols[:-1]) / max(1, len(vols) - 1) if len(vols) > 1 else 0)
+    spike_1h = vols[-1] / vb_fast if vb_fast > 0 else 0
     e21 = ema(closes[-60:], 21)
     e50 = ema(closes[-60:], 50)
     uptrend = price > e50 and e21 > e50
@@ -558,11 +572,13 @@ def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
     return dict(
         coin=coin,
         price=price,
+        p1=p1,
         p4=p4,
         oi1=oi1,
         oi4=oi4,
         oi24=oi24,
         spike=spike,
+        spike_1h=spike_1h,
         uptrend=uptrend,
         dd=dd,
         turn=turn,
@@ -597,6 +613,34 @@ def long_ok(m):
         and m["dd"] > KNIFE_DD
         and m["turn"] >= THIN_TURN
         and m["p4"] >= PRICE_UP_4H_MIN
+        and m["rsi"] <= RSI_MAX
+        and m.get("atrr", 1.0) >= ATR_MIN_RATIO
+    )
+
+
+def long_ok_fast(m):
+    """
+    РАННИЙ триггер лонга по 1-часовым данным.
+    Не ждёт полного 4-часового накопления OI/объёма/цены как long_ok() —
+    ловит начало движения на первом часе, чтобы сигнал приходил
+    ДО того как цена сильно улетит, а не после.
+
+    Условия мягче и смотрят на 1ч окно:
+    - OI за 1ч уже начал расти (oi1 >= OI_1H_FAST_MIN)
+    - объём этой свечи уже выше нормы (spike_1h >= VOL_SPIKE_1H_MIN)
+    - цена уже тронулась вверх, но НЕ ушла далеко
+      (PRICE_UP_1H_MIN <= p1 <= PRICE_UP_1H_MAX — верхняя граница
+      специально отсекает случаи, когда движение уже "улетело")
+    - тренд общий вверх (как в long_ok)
+    - не нож падения, не тонкая ликвидность, RSI не перекуплен
+    """
+    return (
+        m["oi1"] >= OI_1H_FAST_MIN
+        and m.get("spike_1h", 0) >= VOL_SPIKE_1H_MIN
+        and PRICE_UP_1H_MIN <= m.get("p1", 0) <= PRICE_UP_1H_MAX
+        and m["uptrend"]
+        and m["dd"] > KNIFE_DD
+        and m["turn"] >= THIN_TURN
         and m["rsi"] <= RSI_MAX
         and m.get("atrr", 1.0) >= ATR_MIN_RATIO
     )
@@ -642,6 +686,37 @@ def track_record(sig_type):
     _track_cache["data"][sig_type] = (n, win)
     _track_cache["ts"] = _t.time()
     return n, win
+
+
+def card_long_fast(m, ex):
+    """
+    Карточка РАННЕГО лонг-сигнала по 1-часовым данным (long_ok_fast).
+    Публикуется раньше обычной 🟢 ЛОНГ-карточки, чтобы поймать движение
+    в начале, а не после того как цена уже сильно ушла.
+    """
+    sc = _score(m, ex)
+    rsi_v = int(m.get("rsi", 50))
+    arrow = "▲" if m.get("p1", 0) >= 0 else "▼"
+    lines = [
+        f"🟠 {m['coin']} · РАННИЙ ЛОНГ (1ч-триггер)",
+        f"💵 ${m['price']:.5g} (Bybit) {arrow} {m.get('p1',0)*100:+.2f}% за 1ч",
+        "",
+        f"💪 Сила сетапа: {sc}/10 {_bar(sc/10,5)}",
+        f"💰 Приток OI за 1ч {m['oi1']*100:+.1f}% · Объём ×{m.get('spike_1h',0):.1f} за последний час · RSI {rsi_v}",
+        f"🔗 Корреляция с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}",
+        "",
+        "⚡ Это РАННИЙ сигнал: движение только начинается, цена ещё НЕ ушла далеко.",
+        "• входить меньшим объёмом, чем на подтверждённый лонг",
+        "• если через 2-3ч придёт обычная 🟢 ЛОНГ-карточка — значит тренд подтвердился на 4ч",
+    ]
+    if m.get("btc_weak") and m["cor"] >= 0.3:
+        lines.append("")
+        lines.append(f"🟡 BTC слабеет ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть вниз")
+    _n, _w = track_record("long_fast")
+    if _n > 0:
+        lines += ["", f"📈 Трек-рекорд РАННИХ ЛОНГ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
+    lines += ["", "━━━━━━━━━━━━━━━━", "⚠️ Ранний сигнал — риск ложного срабатывания выше. Стоп обязателен."]
+    return "\n".join(lines)
 
 
 def card_long(m, ex):
@@ -960,7 +1035,7 @@ def compute_stats():
     btc_now = cur_price("BTC")
     out = ["📊 СТАТИСТИКА ПО СИГНАЛАМ (форвард + бенчмарк BTC)\n"]
     for horizon_h, label in [(4, "4ч"), (24, "24ч")]:
-        for sig_type in ("long", "triangle", "early"):
+        for sig_type in ("long", "long_fast", "triangle", "early"):
             sig_pcts = []
             btc_pcts = []
             for r in rows:
@@ -1050,7 +1125,7 @@ def compute_advanced_stats():
     out = ["📊 РАСШИРЕННАЯ СТАТИСТИКА ПО СИГНАЛАМ\n"]
     for horizon_h, label in ((4, "4ч"), (24, "24ч")):
         out.append(f"=== Горизонт {label} ===")
-        for sig_type in ("long", "triangle", "early"):
+        for sig_type in ("long", "long_fast", "triangle", "early"):
             sig = []
             btc = []
             for r in rows:
@@ -1262,6 +1337,14 @@ def run_scan(cid, announce=False):
                 LAST_ALERT[f"tri_{coin}"] = now
                 if tri_now == "ready" and m.get("tri_top", 0) > 0 and m["coin"] not in TRI_ALERT:
                     TRI_ALERT[m["coin"]] = dict(sym=sym, top=m["tri_top"], ts=time.time())
+
+        last_fast = LAST_ALERT.get(f"fast_{coin}", 0)
+        if long_ok_fast(m) and not long_ok(m) and now - last_fast > FAST_SIGNAL_COOLDOWN_H * 3600:
+            LAST_ALERT[f"fast_{coin}"] = now
+            buttons_fast = [[{"text": "✅ Я вошёл", "callback_data": f"enter|{m['coin']}|{m['price']:.6g}"}]]
+            tg_send(cid, card_long_fast(m, ex), buttons=buttons_fast)
+            shown += 1
+            log_signal(m["coin"], "long_fast", m["price"])
 
         if not long_ok(m):
             continue
