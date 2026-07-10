@@ -25,6 +25,15 @@ Telegram-бот для Railway / VPS.
   проверка на 1ч данных (OI за 1ч, всплеск объёма текущей свечи, цена
   тронулась, но не улетела) шлёт карточку "🟠 РАННИЙ ЛОНГ" заметно раньше.
   Обычный 🟢 ЛОНГ-сигнал (long_ok) остаётся как подтверждение через 2-4ч.
+- НОВОЕ v7: три доп. фильтра качества монет и подтверждения сигнала:
+  1) Оборот 24ч должен быть >= MIN_TURNOVER_24H (30 млн $) — отсекает
+     низколиквидные монеты ещё на этапе universe().
+  2) Возраст листинга на Bybit должен быть >= MIN_LISTING_AGE_DAYS (182
+     дня, ~полгода) — считается через дату самой старой дневной свечи
+     (listing_age_days). Молодые монеты пропускаются.
+  3) На 30-минутном ТФ должны закрыться подряд 3 ЗЕЛЁНЫЕ свечи
+     (three_green_30m) — доп. подтверждение перед отправкой long и
+     long_fast сигналов. Включается флагом REQUIRE_3_GREEN_30M.
 """
 
 import os
@@ -65,6 +74,9 @@ VOL_SPIKE_1H_MIN = 1.8
 PRICE_UP_1H_MIN = 0.002
 PRICE_UP_1H_MAX = 0.06
 FAST_SIGNAL_COOLDOWN_H = 3
+MIN_TURNOVER_24H = 30_000_000
+MIN_LISTING_AGE_DAYS = 182
+REQUIRE_3_GREEN_30M = True
 MIN_BARS = 200
 COOLDOWN_H = 4
 FUNDING_CUTOFF = 0.0005
@@ -196,6 +208,7 @@ def all_tickers():
 
 def universe():
     rows = [x for x in all_tickers() if x["symbol"].endswith("USDT")]
+    rows = [x for x in rows if float(x.get("turnover24h", 0) or 0) >= MIN_TURNOVER_24H]
     rows.sort(key=lambda x: float(x.get("turnover24h", 0) or 0), reverse=True)
     seen, out = set(), []
     for x in rows:
@@ -220,6 +233,53 @@ def open_interest(symbol, limit=50):
     res = bget("/v5/market/open-interest", {"category": "linear", "symbol": symbol, "intervalTime": "1h", "limit": limit})
     oi = res["list"][::-1]
     return [float(x["openInterest"]) for x in oi]
+
+
+_listing_age_cache = {}
+
+
+def listing_age_days(symbol):
+    """
+    Оценивает возраст листинга монеты на Bybit через дневные свечи:
+    запрашивает максимум дневных баров и смотрит на дату самой старой.
+    Кэшируется на процесс, т.к. дата листинга не меняется.
+    Используется для фильтра "монете должно быть больше полгода".
+    """
+    if symbol in _listing_age_cache:
+        return _listing_age_cache[symbol]
+    try:
+        res = bget("/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": "D", "limit": 1000})
+        k = res["list"]
+        if not k:
+            _listing_age_cache[symbol] = None
+            return None
+        oldest_ts = min(int(x[0]) for x in k)
+        age_days = (time.time() * 1000 - oldest_ts) / 86400000
+        _listing_age_cache[symbol] = age_days
+        return age_days
+    except Exception:
+        _listing_age_cache[symbol] = None
+        return None
+
+
+def three_green_30m(symbol):
+    """
+    Проверяет, что на 30-минутном таймфрейме ЗАКРЫЛИСЬ подряд
+    3 зелёные свечи (close > open) прямо перед текущим моментом.
+    Используется как доп. фильтр подтверждения перед сигналом.
+    """
+    try:
+        res = bget("/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": "30", "limit": 6})
+        k = res["list"][::-1]
+        if len(k) < 4:
+            return False
+        closed = k[:-1]
+        last3 = closed[-3:]
+        if len(last3) < 3:
+            return False
+        return all(float(x[4]) > float(x[1]) for x in last3)
+    except Exception:
+        return False
 
 
 def long_short_ratio(symbol):
@@ -1305,6 +1365,9 @@ def run_scan(cid, announce=False):
             continue
         if len(closes) < MIN_BARS or len(oic) < 30:
             continue
+        age_days = listing_age_days(sym)
+        if age_days is not None and age_days < MIN_LISTING_AGE_DAYS:
+            continue
         m = core(coin, closes, highs, lows, vols, oic, btc_closes or closes, btc_p4=(btc_closes[-1] / btc_closes[-5] - 1 if len(btc_closes) >= 5 else 0))
         if m.get("tri") in ("ready", "breakout", "forming"):
             m["tri_mtf"] = detect_triangle_mtf(sym)
@@ -1338,15 +1401,17 @@ def run_scan(cid, announce=False):
                 if tri_now == "ready" and m.get("tri_top", 0) > 0 and m["coin"] not in TRI_ALERT:
                     TRI_ALERT[m["coin"]] = dict(sym=sym, top=m["tri_top"], ts=time.time())
 
+        green3_ok = (not REQUIRE_3_GREEN_30M) or three_green_30m(sym)
+
         last_fast = LAST_ALERT.get(f"fast_{coin}", 0)
-        if long_ok_fast(m) and not long_ok(m) and now - last_fast > FAST_SIGNAL_COOLDOWN_H * 3600:
+        if long_ok_fast(m) and not long_ok(m) and green3_ok and now - last_fast > FAST_SIGNAL_COOLDOWN_H * 3600:
             LAST_ALERT[f"fast_{coin}"] = now
             buttons_fast = [[{"text": "✅ Я вошёл", "callback_data": f"enter|{m['coin']}|{m['price']:.6g}"}]]
             tg_send(cid, card_long_fast(m, ex), buttons=buttons_fast)
             shown += 1
             log_signal(m["coin"], "long_fast", m["price"])
 
-        if not long_ok(m):
+        if not long_ok(m) or not green3_ok:
             continue
         last = LAST_ALERT.get(coin, 0)
         cd = COOLDOWN_H * 3600
