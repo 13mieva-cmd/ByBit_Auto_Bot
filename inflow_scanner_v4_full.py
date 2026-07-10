@@ -14,26 +14,7 @@ Telegram-бот для Railway / VPS.
 - аккуратный полный файл без обрывов;
 - /stats2 с expectancy, PF, median, edge vs BTC;
 - более строгую и безопасную структуру кода;
-- сохранение журналов на диск;
-- ИСПРАВЛЕНО: ТРЕУГОЛЬНИК теперь реально считается на 15-минутном ТФ
-  (а не только на часовых свечах) и требует минимум 3 подтверждённых
-  касания каждой линии (сопротивления и поддержки) перед сигналом.
-  Карточка треугольника публикуется ТОЛЬКО если 15м ТФ подтверждает паттерн.
-- НОВОЕ v6: добавлен РАННИЙ лонг-сигнал по 1-часовым данным (long_ok_fast).
-  Раньше сигнал ждал полного 4-часового накопления OI+объём+цена (long_ok),
-  из-за чего приходил уже на пике движения. Теперь отдельная более мягкая
-  проверка на 1ч данных (OI за 1ч, всплеск объёма текущей свечи, цена
-  тронулась, но не улетела) шлёт карточку "🟠 РАННИЙ ЛОНГ" заметно раньше.
-  Обычный 🟢 ЛОНГ-сигнал (long_ok) остаётся как подтверждение через 2-4ч.
-- НОВОЕ v7: три доп. фильтра качества монет и подтверждения сигнала:
-  1) Оборот 24ч должен быть >= MIN_TURNOVER_24H (30 млн $) — отсекает
-     низколиквидные монеты ещё на этапе universe().
-  2) Возраст листинга на Bybit должен быть >= MIN_LISTING_AGE_DAYS (182
-     дня, ~полгода) — считается через дату самой старой дневной свечи
-     (listing_age_days). Молодые монеты пропускаются.
-  3) На 30-минутном ТФ должны закрыться подряд 3 ЗЕЛЁНЫЕ свечи
-     (three_green_30m) — доп. подтверждение перед отправкой long и
-     long_fast сигналов. Включается флагом REQUIRE_3_GREEN_30M.
+- сохранение журналов на диск.
 """
 
 import os
@@ -69,14 +50,6 @@ BTC_RISK_MIN_HITS = 2
 LAST_BTC_WARN = 0
 PRICE_UP_4H_MIN = 0.005
 RSI_MAX = 78
-OI_1H_FAST_MIN = 0.02
-VOL_SPIKE_1H_MIN = 1.8
-PRICE_UP_1H_MIN = 0.002
-PRICE_UP_1H_MAX = 0.06
-FAST_SIGNAL_COOLDOWN_H = 3
-MIN_TURNOVER_24H = 30_000_000
-MIN_LISTING_AGE_DAYS = 182
-REQUIRE_3_GREEN_30M = True
 MIN_BARS = 200
 COOLDOWN_H = 4
 FUNDING_CUTOFF = 0.0005
@@ -208,7 +181,6 @@ def all_tickers():
 
 def universe():
     rows = [x for x in all_tickers() if x["symbol"].endswith("USDT")]
-    rows = [x for x in rows if float(x.get("turnover24h", 0) or 0) >= MIN_TURNOVER_24H]
     rows.sort(key=lambda x: float(x.get("turnover24h", 0) or 0), reverse=True)
     seen, out = set(), []
     for x in rows:
@@ -233,53 +205,6 @@ def open_interest(symbol, limit=50):
     res = bget("/v5/market/open-interest", {"category": "linear", "symbol": symbol, "intervalTime": "1h", "limit": limit})
     oi = res["list"][::-1]
     return [float(x["openInterest"]) for x in oi]
-
-
-_listing_age_cache = {}
-
-
-def listing_age_days(symbol):
-    """
-    Оценивает возраст листинга монеты на Bybit через дневные свечи:
-    запрашивает максимум дневных баров и смотрит на дату самой старой.
-    Кэшируется на процесс, т.к. дата листинга не меняется.
-    Используется для фильтра "монете должно быть больше полгода".
-    """
-    if symbol in _listing_age_cache:
-        return _listing_age_cache[symbol]
-    try:
-        res = bget("/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": "D", "limit": 1000})
-        k = res["list"]
-        if not k:
-            _listing_age_cache[symbol] = None
-            return None
-        oldest_ts = min(int(x[0]) for x in k)
-        age_days = (time.time() * 1000 - oldest_ts) / 86400000
-        _listing_age_cache[symbol] = age_days
-        return age_days
-    except Exception:
-        _listing_age_cache[symbol] = None
-        return None
-
-
-def three_green_30m(symbol):
-    """
-    Проверяет, что на 30-минутном таймфрейме ЗАКРЫЛИСЬ подряд
-    3 зелёные свечи (close > open) прямо перед текущим моментом.
-    Используется как доп. фильтр подтверждения перед сигналом.
-    """
-    try:
-        res = bget("/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": "30", "limit": 6})
-        k = res["list"][::-1]
-        if len(k) < 4:
-            return False
-        closed = k[:-1]
-        last3 = closed[-3:]
-        if len(last3) < 3:
-            return False
-        return all(float(x[4]) > float(x[1]) for x in last3)
-    except Exception:
-        return False
 
 
 def long_short_ratio(symbol):
@@ -468,45 +393,14 @@ def liq_zones(price, funding=0.0):
     return out
 
 
-MIN_TRIANGLE_TOUCHES = 3
-TOUCH_TOL_FRAC = 0.0025
-
-
-def _count_line_touches(pts, slope, intercept, tol_abs):
-    """
-    Считает, сколько точек касания реально прилегают к линии
-    (в пределах допуска tol_abs), а не просто использовались при фитинге.
-    Это и есть проверка "минимум 3 касания" тренд-линии треугольника.
-    """
-    touches = 0
-    for x, y in pts:
-        line_y = slope * x + intercept
-        if abs(y - line_y) <= tol_abs:
-            touches += 1
-    return touches
-
-
-def detect_triangle(highs, lows, closes, price, win=45, swing_win=3,
-                     min_touches=MIN_TRIANGLE_TOUCHES):
-    """
-    Строгий детектор треугольника:
-    - берёт последние `win` баров текущего таймфрейма (передавай сюда 15м/1ч/4ч данные);
-    - находит локальные свинг-хай/лоу точки;
-    - строит линию сопротивления (по хаям, наклон < 0) и линию поддержки (по лоу, наклон > 0);
-    - ТРЕУГОЛЬНИК считается подтверждённым только если у каждой линии
-      минимум `min_touches` (по умолчанию 3) точек реально касаются линии
-      в пределах допуска TOUCH_TOL_FRAC от цены;
-    - дополнительно требует сужение диапазона (contracting) как раньше.
-    """
+def detect_triangle(highs, lows, closes, price, win=45, swing_win=3):
     n = len(closes)
     if n < win + 5:
         return None, price, price, price
-
     hi_pts = _swing_points(highs[-win:], True, swing_win)
     lo_pts = _swing_points(lows[-win:], False, swing_win)
-    if len(hi_pts) < min_touches or len(lo_pts) < min_touches:
+    if len(hi_pts) < 2 or len(lo_pts) < 2:
         return None, price, price, price
-
     r = _fit_line(hi_pts)
     s = _fit_line(lo_pts)
     if not r or not s:
@@ -515,19 +409,11 @@ def detect_triangle(highs, lows, closes, price, win=45, swing_win=3,
     s_slope, s_int = s
     if not (r_slope < 0 and s_slope > 0):
         return None, price, price, price
-
-    tol_abs = price * TOUCH_TOL_FRAC
-    hi_touches = _count_line_touches(hi_pts, r_slope, r_int, tol_abs)
-    lo_touches = _count_line_touches(lo_pts, s_slope, s_int, tol_abs)
-    if hi_touches < min_touches or lo_touches < min_touches:
-        return None, price, price, price
-
     last_x = win - 1
     res_now = r_slope * last_x + r_int
     sup_now = s_slope * last_x + s_int
     if res_now <= sup_now:
         return None, price, price, price
-
     width_now = res_now - sup_now
     x0 = hi_pts[0][0]
     if x0 >= win - 5:
@@ -536,43 +422,12 @@ def detect_triangle(highs, lows, closes, price, win=45, swing_win=3,
     contracting = width_0 > 0 and width_now < width_0 * 0.85
     if not contracting:
         return None, price, price, price
-
     if price > res_now:
         return "breakout", res_now, res_now, sup_now
     dist_to_res = (res_now - price) / price if price > 0 else 1
     if dist_to_res <= 0.04:
         return "ready", res_now, res_now, sup_now
     return "forming", res_now, res_now, sup_now
-
-
-def detect_triangle_mtf(sym):
-    """
-    Реально считает треугольник на 15м, 1ч и 4ч (а не только на часовых
-    свечах, как было раньше) и возвращает словарь {"15м":..., "1ч":..., "4ч":...}
-    для передачи в core(tri_mtf=...) и отображения в карточке.
-    """
-    result = {}
-    tf_map = {"15м": ("15", 60), "1ч": ("60", 45), "4ч": ("240", 45)}
-    for label, (interval, win) in tf_map.items():
-        try:
-            res = bget("/v5/market/kline", {
-                "category": "linear", "symbol": sym,
-                "interval": interval, "limit": max(win + 20, 80)
-            })
-            k = res["list"][::-1]
-            if len(k) < win + 5:
-                result[label] = None
-                continue
-            closes_tf = [float(x[4]) for x in k]
-            highs_tf = [float(x[2]) for x in k]
-            lows_tf = [float(x[3]) for x in k]
-            price_tf = closes_tf[-1]
-            tri, _, _, _ = detect_triangle(highs_tf, lows_tf, closes_tf, price_tf, win=win)
-            result[label] = tri
-            time.sleep(0.08)
-        except Exception:
-            result[label] = None
-    return result
 
 
 def early_breakout(closes, highs, lows, vols):
@@ -591,7 +446,6 @@ def early_breakout(closes, highs, lows, vols):
 
 def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
     price = closes[-1]
-    p1 = closes[-1] / closes[-2] - 1 if len(closes) >= 2 else 0
     p4 = closes[-1] / closes[-5] - 1 if len(closes) >= 5 else 0
     oi1 = oic[-1] / oic[-2] - 1 if len(oic) > 1 and oic[-2] > 0 else 0
     oi4 = oic[-1] / oic[-5] - 1 if len(oic) > 4 and oic[-5] > 0 else 0
@@ -599,8 +453,6 @@ def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
     vr = sum(vols[-4:])
     vb = (sum(vols[-28:-4]) / 24 * 4) if len(vols) >= 28 else vr
     spike = vr / vb if vb > 0 else 0
-    vb_fast = sum(vols[-25:-1]) / max(1, len(vols[-25:-1])) if len(vols) >= 25 else (sum(vols[:-1]) / max(1, len(vols) - 1) if len(vols) > 1 else 0)
-    spike_1h = vols[-1] / vb_fast if vb_fast > 0 else 0
     e21 = ema(closes[-60:], 21)
     e50 = ema(closes[-60:], 50)
     uptrend = price > e50 and e21 > e50
@@ -632,13 +484,11 @@ def core(coin, closes, highs, lows, vols, oic, btc, btc_p4=0.0, tri_mtf=None):
     return dict(
         coin=coin,
         price=price,
-        p1=p1,
         p4=p4,
         oi1=oi1,
         oi4=oi4,
         oi24=oi24,
         spike=spike,
-        spike_1h=spike_1h,
         uptrend=uptrend,
         dd=dd,
         turn=turn,
@@ -673,34 +523,6 @@ def long_ok(m):
         and m["dd"] > KNIFE_DD
         and m["turn"] >= THIN_TURN
         and m["p4"] >= PRICE_UP_4H_MIN
-        and m["rsi"] <= RSI_MAX
-        and m.get("atrr", 1.0) >= ATR_MIN_RATIO
-    )
-
-
-def long_ok_fast(m):
-    """
-    РАННИЙ триггер лонга по 1-часовым данным.
-    Не ждёт полного 4-часового накопления OI/объёма/цены как long_ok() —
-    ловит начало движения на первом часе, чтобы сигнал приходил
-    ДО того как цена сильно улетит, а не после.
-
-    Условия мягче и смотрят на 1ч окно:
-    - OI за 1ч уже начал расти (oi1 >= OI_1H_FAST_MIN)
-    - объём этой свечи уже выше нормы (spike_1h >= VOL_SPIKE_1H_MIN)
-    - цена уже тронулась вверх, но НЕ ушла далеко
-      (PRICE_UP_1H_MIN <= p1 <= PRICE_UP_1H_MAX — верхняя граница
-      специально отсекает случаи, когда движение уже "улетело")
-    - тренд общий вверх (как в long_ok)
-    - не нож падения, не тонкая ликвидность, RSI не перекуплен
-    """
-    return (
-        m["oi1"] >= OI_1H_FAST_MIN
-        and m.get("spike_1h", 0) >= VOL_SPIKE_1H_MIN
-        and PRICE_UP_1H_MIN <= m.get("p1", 0) <= PRICE_UP_1H_MAX
-        and m["uptrend"]
-        and m["dd"] > KNIFE_DD
-        and m["turn"] >= THIN_TURN
         and m["rsi"] <= RSI_MAX
         and m.get("atrr", 1.0) >= ATR_MIN_RATIO
     )
@@ -746,37 +568,6 @@ def track_record(sig_type):
     _track_cache["data"][sig_type] = (n, win)
     _track_cache["ts"] = _t.time()
     return n, win
-
-
-def card_long_fast(m, ex):
-    """
-    Карточка РАННЕГО лонг-сигнала по 1-часовым данным (long_ok_fast).
-    Публикуется раньше обычной 🟢 ЛОНГ-карточки, чтобы поймать движение
-    в начале, а не после того как цена уже сильно ушла.
-    """
-    sc = _score(m, ex)
-    rsi_v = int(m.get("rsi", 50))
-    arrow = "▲" if m.get("p1", 0) >= 0 else "▼"
-    lines = [
-        f"🟠 {m['coin']} · РАННИЙ ЛОНГ (1ч-триггер)",
-        f"💵 ${m['price']:.5g} (Bybit) {arrow} {m.get('p1',0)*100:+.2f}% за 1ч",
-        "",
-        f"💪 Сила сетапа: {sc}/10 {_bar(sc/10,5)}",
-        f"💰 Приток OI за 1ч {m['oi1']*100:+.1f}% · Объём ×{m.get('spike_1h',0):.1f} за последний час · RSI {rsi_v}",
-        f"🔗 Корреляция с BTC {m['cor']*100:.0f}% {_bar(abs(m['cor']),5)}",
-        "",
-        "⚡ Это РАННИЙ сигнал: движение только начинается, цена ещё НЕ ушла далеко.",
-        "• входить меньшим объёмом, чем на подтверждённый лонг",
-        "• если через 2-3ч придёт обычная 🟢 ЛОНГ-карточка — значит тренд подтвердился на 4ч",
-    ]
-    if m.get("btc_weak") and m["cor"] >= 0.3:
-        lines.append("")
-        lines.append(f"🟡 BTC слабеет ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть вниз")
-    _n, _w = track_record("long_fast")
-    if _n > 0:
-        lines += ["", f"📈 Трек-рекорд РАННИХ ЛОНГ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
-    lines += ["", "━━━━━━━━━━━━━━━━", "⚠️ Ранний сигнал — риск ложного срабатывания выше. Стоп обязателен."]
-    return "\n".join(lines)
 
 
 def card_long(m, ex):
@@ -911,7 +702,7 @@ def card_triangle(m, ex):
     sc = _score(m, ex)
     rsi_v = int(m.get("rsi", 50))
     lines = [
-        f"🔺🔺🔺 {m['coin']} · СЕТАП ТРЕУГОЛЬНИК (15м, 3+ касания) 🔺🔺🔺",
+        f"🔺 {m['coin']} · СЕТАП ТРЕУГОЛЬНИК",
         f"💵 ${m['price']:.5g} (Bybit)",
         "",
         f"💪 Сила сетапа: {sc}/10 {_bar(sc/10,5)}",
@@ -922,13 +713,8 @@ def card_triangle(m, ex):
     if mtf:
         def _mk(v):
             return "✅" if v in ("ready", "breakout", "forming") else "—"
-        tri_15m = mtf.get("15м")
         n_active = sum(1 for tf in ("15м", "1ч", "4ч") if mtf.get(tf) in ("ready", "breakout", "forming"))
-        lines.append(f"🕒 ТРЕУГОЛЬНИК по ТФ: 15м {_mk(tri_15m)} · 1ч {_mk(mtf.get('1ч'))} · 4ч {_mk(mtf.get('4ч'))}")
-        if tri_15m in ("ready", "breakout"):
-            lines.append("• на 15м подтверждён ТРЕУГОЛЬНИК с 3+ касаниями каждой линии ✅")
-        else:
-            lines.append("• на 15м ТРЕУГОЛЬНИК НЕ подтверждён — сигнал не публикуется без него")
+        lines.append(f"🕒 Треугольник по ТФ: 15м {_mk(mtf.get('15м'))} 1ч {_mk(mtf.get('1ч'))} 4ч {_mk(mtf.get('4ч'))}")
         if n_active >= 2:
             lines.append(f"• виден на {n_active} ТФ — структура подтверждена")
         else:
@@ -1095,7 +881,7 @@ def compute_stats():
     btc_now = cur_price("BTC")
     out = ["📊 СТАТИСТИКА ПО СИГНАЛАМ (форвард + бенчмарк BTC)\n"]
     for horizon_h, label in [(4, "4ч"), (24, "24ч")]:
-        for sig_type in ("long", "long_fast", "triangle", "early"):
+        for sig_type in ("long", "triangle", "early"):
             sig_pcts = []
             btc_pcts = []
             for r in rows:
@@ -1185,7 +971,7 @@ def compute_advanced_stats():
     out = ["📊 РАСШИРЕННАЯ СТАТИСТИКА ПО СИГНАЛАМ\n"]
     for horizon_h, label in ((4, "4ч"), (24, "24ч")):
         out.append(f"=== Горизонт {label} ===")
-        for sig_type in ("long", "long_fast", "triangle", "early"):
+        for sig_type in ("long", "triangle", "early"):
             sig = []
             btc = []
             for r in rows:
@@ -1365,12 +1151,7 @@ def run_scan(cid, announce=False):
             continue
         if len(closes) < MIN_BARS or len(oic) < 30:
             continue
-        age_days = listing_age_days(sym)
-        if age_days is not None and age_days < MIN_LISTING_AGE_DAYS:
-            continue
         m = core(coin, closes, highs, lows, vols, oic, btc_closes or closes, btc_p4=(btc_closes[-1] / btc_closes[-5] - 1 if len(btc_closes) >= 5 else 0))
-        if m.get("tri") in ("ready", "breakout", "forming"):
-            m["tri_mtf"] = detect_triangle_mtf(sym)
         SYM_CACHE[coin] = sym
         ex = ticker_info(sym) or {}
         by = bybit_price(coin)
@@ -1387,10 +1168,8 @@ def run_scan(cid, announce=False):
                 shown += 1
                 log_signal(coin, "early", m["price"])
         tri_now = m.get("tri")
-        tri_mtf_now = m.get("tri_mtf") or {}
-        tri_15m_ok = tri_mtf_now.get("15м") in ("ready", "breakout")
         tri_last = LAST_ALERT.get(f"tri_{coin}", 0)
-        if tri_now in ("ready", "breakout") and tri_15m_ok and now - tri_last > TRI_ALERT_HOURS * 3600:
+        if tri_now in ("ready", "breakout") and now - tri_last > TRI_ALERT_HOURS * 3600:
             tri_card = card_triangle(m, ex)
             if tri_card:
                 buttons_tri = [[{"text": "✅ Я вошёл", "callback_data": f"enter|{m['coin']}|{m['price']:.6g}"}]]
@@ -1401,17 +1180,7 @@ def run_scan(cid, announce=False):
                 if tri_now == "ready" and m.get("tri_top", 0) > 0 and m["coin"] not in TRI_ALERT:
                     TRI_ALERT[m["coin"]] = dict(sym=sym, top=m["tri_top"], ts=time.time())
 
-        green3_ok = (not REQUIRE_3_GREEN_30M) or three_green_30m(sym)
-
-        last_fast = LAST_ALERT.get(f"fast_{coin}", 0)
-        if long_ok_fast(m) and not long_ok(m) and green3_ok and now - last_fast > FAST_SIGNAL_COOLDOWN_H * 3600:
-            LAST_ALERT[f"fast_{coin}"] = now
-            buttons_fast = [[{"text": "✅ Я вошёл", "callback_data": f"enter|{m['coin']}|{m['price']:.6g}"}]]
-            tg_send(cid, card_long_fast(m, ex), buttons=buttons_fast)
-            shown += 1
-            log_signal(m["coin"], "long_fast", m["price"])
-
-        if not long_ok(m) or not green3_ok:
+        if not long_ok(m):
             continue
         last = LAST_ALERT.get(coin, 0)
         cd = COOLDOWN_H * 3600
@@ -1519,62 +1288,6 @@ def handle_callback(q):
         pnl, e, x = res
         emo = "🟢" if pnl >= 0 else "🔴"
         tg_send(cid, f"{emo} Сделка по {coin} закрыта.\nВход ${e:.5g} → выход ${x:.5g} = {pnl*100:+.2f}%\nЗаписал в журнал.")
-
-# ---------- trade journal ----------
-def pos_buttons(coin):
-    return [[{"text": "❌ Выйти", "callback_data": f"exit|{coin}"}]]
-
-
-def close_trade(coin):
-    p = POSITIONS.pop(coin, None)
-    if not p:
-        return None
-    try:
-        cur = bybit_price(coin)
-        if cur is None:
-            return None
-        pnl = cur / p["entry"] - 1
-        new = not os.path.exists(TRADES)
-        with open(TRADES, "a", newline="") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["ts_open", "coin", "entry", "ts_close", "exit", "pnl"])
-            w.writerow([p["ts"], coin, f"{p['entry']:.6g}", dt.datetime.now().isoformat(timespec="seconds"), f"{cur:.6g}", f"{pnl:.6f}"])
-        if pnl < 0:
-            RECENT_LOSSES[coin] = time.time()
-        return pnl, p["entry"], cur
-    except Exception:
-        return None
-
-
-def position_status(coin):
-    p = POSITIONS.get(coin)
-    if not p:
-        return None, None
-    try:
-        closes, _, _, _ = klines(p["sym"], limit=80)
-        time.sleep(0.15)
-        oic = open_interest(p["sym"], limit=10)
-        time.sleep(0.15)
-    except Exception:
-        return None, None
-    if len(closes) < 55 or len(oic) < 6:
-        return None, None
-    price = closes[-1]
-    pnl = price / p["entry"] - 1
-    oi1 = oic[-1] / oic[-2] - 1 if oic[-2] > 0 else 0
-    oi4 = oic[-1] / oic[-5] - 1 if oic[-5] > 0 else 0
-    e50 = ema(closes[-60:], 50)
-    reasons = []
-    if oi1 <= -0.03:
-        reasons.append(f"OI резко вниз ({oi1*100:+.0f}% за 1ч)")
-    if price < e50:
-        reasons.append("цена ниже EMA50")
-    if oi4 <= -0.05:
-        reasons.append(f"OI 4ч {oi4*100:+.0f}%")
-    state = "ok" if not reasons else "warn"
-    msg = f"{coin}: {price:.6g} | PnL {pnl*100:+.2f}% | {'; '.join(reasons) if reasons else 'держится'}"
-    return msg, state
 
 # ---------- main ----------
 def main():
