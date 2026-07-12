@@ -38,6 +38,10 @@ BYBIT="https://api.bybit.com"; QUOTE="USDT"
 MAX_COINS=300; SCAN_EVERY_MIN=5; MAX_ALERTS=8
 CHECK_POS_MIN=2; CALM_UPDATE_MIN=30
 OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=30_000_000
+SPREAD_MAX=0.003            # спред >0.3% = тонкий стакан, сигнал понижаем/блокируем
+VOL_PREV_MIN=0.8            # предыдущая свеча тоже >= 0.8x нормы (не однобарный фитиль)
+NIGHT_VOL_MULT=1.3         # в тихие часы UTC порог объёма выше (ночь/выходные шумят)
+OI_PRICE_IMBALANCE=3.0     # OI растёт в 3x быстрее цены = плечо копится, риск каскада
 BTC_DUMP_1H=-0.02; HI_CORR=0.8
 # --- зеркальный ШОРТОВЫЙ набор для BTC (рубильник лонгов по альтам) ---
 BTC_DROP_4H=-0.02      # падение BTC за 4ч больше 2%
@@ -47,6 +51,10 @@ BTC_RSI_OVERSOLD=30    # перепроданность
 BTC_RISK_MIN_HITS=2    # сколько признаков = блок лонгов
 LAST_BTC_WARN=0        # антиспам предупреждения при автоскане
 PRICE_UP_4H_MIN=0.005
+OI_1H_MIN=0.02           # БЫСТРЫЙ триггер: OI +2% за 1 час (приток только начался)
+SPIKE_FAST_MIN=2.0       # объём последних 1-2 свечей >= 2x нормы (свежий всплеск)
+MAX_EXT_ENTRY=0.08       # ПОЗДНО: цена >8% выше EMA21 — движение выдохлось, сигнал НЕ шлём
+MAX_MOVE_4H=0.10         # ПОЗДНО: уже +10% за 4ч — конец движения, не гонимся
 RSI_MAX=78
 MIN_BARS=200
 MIN_AGE_DAYS=180        # монете не меньше полугода (отсекаем свежие листинги)
@@ -61,6 +69,15 @@ EARLY_WATCH={}              # coin -> {sym, ts, v0, lsr0, fund0, price0} — ж�
 EARLY_WATCH_HOURS=6        # сколько следим за развитием после 15м-всплеска
 EARLY_WATCH_CHECK_SEC=60   # как часто проверять развитие
 EARLY15_COOLDOWN_H=2
+# --- РАЗВОРОТНЫЙ сигнал (контр-тренд, экспериментальный, отдельная статистика) ---
+REVERSAL_ENABLED=True
+REVERSAL_COOLDOWN_H=4
+REVERSAL_VOL_MIN=1.8            # объём >= 1.8x нормы
+REVERSAL_OI_MIN=0.02           # рост OI >=2% (отличает от шорт-сквиза)
+REVERSAL_LOOKBACK_DOWN=10
+REVERSAL_NO_LOW_BARS=3
+REVERSAL_NO_LOW_BASE=8
+LAST_REVERSAL={}
 EARLY_COMPRESS_MAX=0.7      # текущий диапазон < 70% медианного = сжатие
 EARLY_RVOL_MIN=3.0          # RVOL: объём >= 3x нормы = начало крупного движения (не мелкий шум)
 EARLY_VOL_MIN=2.5           # объём пробойной свечи >= 2.5x среднего (было 1.2 — ловило шум)
@@ -216,9 +233,12 @@ def long_short_ratio(symbol):
 def ticker_info(symbol):
     for t in all_tickers():
         if t["symbol"]==symbol:
+            bid=float(t.get("bid1Price",0) or 0); ask=float(t.get("ask1Price",0) or 0)
+            spread=(ask-bid)/((ask+bid)/2) if (bid>0 and ask>0) else 0.0
             return dict(price=float(t["lastPrice"]),
                 funding=float(t.get("fundingRate",0) or 0),
-                turnover=float(t.get("turnover24h",0) or 0))
+                turnover=float(t.get("turnover24h",0) or 0),
+                spread=spread)
     return None
 
 def rsi(closes, period=14):
@@ -431,10 +451,11 @@ def detect_early_15m(c15, h15, l15, v15):
     # зелёная = close выше close предыдущей свечи
     three_green = len(c15)>=4 and c15[-1]>c15[-2]>c15[-3]>c15[-4]
     accel, slope = vol_acceleration(v15)   # динамика: разгоняется ли объём
+    rvol_thr=EARLY_RVOL_MIN*night_mult()   # ночью/выходные порог выше
     # старт = (сильный RVOL ИЛИ объём ускоряется) + движение цены + 3 зелёные
-    vol_ok = vspike>=EARLY_RVOL_MIN or accel
+    vol_ok = vspike>=rvol_thr or accel
     started = vol_ok and 0.008<=move<=0.08 and three_green
-    return started, move, max(vspike, slope)
+    return started, move, vspike, slope, three_green
 
 def detect_compression(highs, lows, closes, vols):
     """РАННИЙ детектор: цена сжалась в узкий диапазон, и последняя свеча только что
@@ -476,6 +497,9 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
     oi24=oic[-1]/oic[-25]-1 if oic[-25]>0 else 0
     vr=sum(vols[-4:]); vb=(sum(vols[-28:-4])/24*4) if len(vols)>=28 else vr
     spike=vr/vb if vb>0 else 0
+    # СВЕЖИЙ всплеск: последние 1-2 свечи против нормы (ловит приток, начавшийся ЧАС назад)
+    vb1=vb/4 if vb>0 else 0                      # норма на одну свечу
+    spike_fast=(sum(vols[-2:])/2)/vb1 if vb1>0 else 0
     e21=ema(closes[-60:],21); e50=ema(closes[-60:],50)
     uptrend=price>e50 and e21>e50
     ext=(price-e21)/e21 if e21>0 else 0
@@ -517,7 +541,7 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
     atrr=atr_ratio(highs,lows,closes)   # режим рынка: <1 = сжатие/чоп
     mh=macd_hist(closes)                # MACD-гистограмма (справка-подтверждение)
     rc=roc(closes,12)                   # ROC за 12ч, % (справка)
-    return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,
+    return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,spike_fast=spike_fast,
         uptrend=uptrend,dd=dd,turn=turn,cor=cor,tf=tf,brk=brk,rsi=r,btc_beta=btc_beta,
         e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
         tri=tri,tri_top=tri_top,tri_res_now=tri_res_now,tri_sup_now=tri_sup_now,
@@ -525,11 +549,24 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
         macd_h=mh,roc=rc,daily_rvol=daily_rvol)
 
 def long_ok(m):
-    return (m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN and m["uptrend"]
+    """Лонг-сигнал. ДВА пути входа:
+      1) БЫСТРЫЙ — свежий приток (OI +2% за 1ч + объём последних свечей >=2x): ловим
+         движение через ~1 час после старта, а не через 4.
+      2) ОБЫЧНЫЙ — накопленная 4ч-картина (OI 4ч + объём 4ч).
+    И ВОРОТА 'ПОЗДНО': если движение уже выдохлось (цена далеко от EMA21 или уже +10%
+    за 4ч) — сигнал НЕ шлём, чтобы не звать на конце движения."""
+    # приток: быстрый ИЛИ накопленный
+    fast_inflow = m.get("oi1",0)>=OI_1H_MIN and m.get("spike_fast",0)>=SPIKE_FAST_MIN
+    slow_inflow = m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN
+    inflow = fast_inflow or slow_inflow
+    # ПОЗДНО? движение уже прошло основную часть — не гонимся за свечой
+    too_late = m.get("ext",0)>MAX_EXT_ENTRY or m["p4"]>MAX_MOVE_4H
+    return (inflow and m["uptrend"]
         and m["dd"]>KNIFE_DD and m["turn"]>=THIN_TURN
         and m["p4"]>=PRICE_UP_4H_MIN
         and m["rsi"]<=RSI_MAX
-        and m.get("atrr",1.0)>=ATR_MIN_RATIO)  # рынок не в аномальном сжатии/чопе
+        and m.get("atrr",1.0)>=ATR_MIN_RATIO
+        and not too_late)
 
 def _score(m, ex):
     """Скоринг ТОЛЬКО из полей, которые бот реально вычисляет. Штраф за
@@ -553,6 +590,17 @@ def card_long(m, ex):
     elif m["cor"]>=HI_CORR: cautions.append(f"сильно ходит за биткоином (корреляция {m['cor']*100:.0f}%)")
     if ex.get("funding",0)>0.01: cautions.append(f"повышенный funding ({ex.get('funding',0)*100:.3f}%) — плечо копится")
     if m.get("extended"): cautions.append("вход на пике импульса \u2014 лучше ждать откат")
+    # OI/цена дисбаланс: плечо копится быстрее движения -> риск каскада
+    if m["p4"]>0 and m["oi4"]>m["p4"]*OI_PRICE_IMBALANCE:
+        cautions.append(f"OI растёт быстрее цены (OI +{m['oi4']*100:.0f}% vs цена +{m['p4']*100:.1f}%) \u2014 плечо копится, риск резкого разворота")
+    # спред: тонкий стакан -> цена может лететь через дырки ликвидности
+    sp=ex.get("spread",0)
+    if sp>=SPREAD_MAX:
+        cautions.append(f"широкий спред {sp*100:.2f}% \u2014 тонкий стакан, движение может быть проколом через редкие лимитки")
+    # экстремальный funding в ЛЮБУЮ сторону = перегрев
+    fund=ex.get("funding",0)
+    if fund<=-0.01:
+        cautions.append(f"сильно отрицательный funding ({fund*100:.3f}%) \u2014 перегрев шортами, риск каскада против толпы")
     if m.get("btc_weak") and m["cor"]>=0.3:
         cautions.append(f"\U0001F7E1 BTC слабеет по факту ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть альт вниз (реакция, не прогноз)")
 
@@ -627,6 +675,10 @@ def card_long(m, ex):
         f"\U0001F4AA Сила сетапа: {sc}/10 {_bar(sc/10,5)}", "",
         table,
         f"\U0001F4CA Подтверждение: {tf_txt}",
+        (f"\u26A1 <b>БЫСТРЫЙ триггер</b>: OI +{m.get('oi1',0)*100:.1f}% за 1ч, объём свежих свечей \u00d7{m.get('spike_fast',0):.1f} \u2014 приток только начался"
+         if (m.get('oi1',0)>=OI_1H_MIN and m.get('spike_fast',0)>=SPIKE_FAST_MIN)
+         else f"\U0001F551 Обычный триггер: накопленная 4ч-картина (OI +{m['oi4']*100:.0f}%, объём \u00d7{m['spike']:.1f})"),
+        f"\U0001F4CF Цена выше EMA21 на {m.get('ext',0)*100:.1f}% (ворота 'поздно': >{MAX_EXT_ENTRY*100:.0f}% \u2014 сигнал не шлём)",
     ] + stop_lines
 
     reasons=[]
@@ -690,6 +742,8 @@ def card_long(m, ex):
     lines.append(f"\u2022 старый хай (уровень): ${oh:.5g}{hi_note}")
     lines.append("\u2022 выгоднее лимитка в зоне отката, чем по рынку на пике")
 
+    ch=chain_line(m["coin"],"long")
+    if ch: lines += ["", ch, "<i>по монете уже были сигналы — движение развивается по этапам (подтверждение)</i>"]
     _n,_w=track_record("long")
     if _n>0:
         lines += ["", f"\U0001F4C8 Трек-рекорд ЛОНГ-сигналов: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
@@ -779,6 +833,99 @@ def track_record(sig_type):
     _track_cache["data"][sig_type]=(n,win); _track_cache["ts"]=_t.time()
     return n,win
 
+def reversal_setup(closes, highs, lows, vols, oic):
+    """Даунтренд -> затухание падения (нет новых минимумов) -> всплеск объёма
+    на зелёной свече -> рост OI (фильтр от шорт-сквиза)."""
+    if len(closes)<70 or len(oic)<4: return False,{}
+    e50_past=ema(closes[-70:-10],50)
+    was_downtrend=closes[-10]<e50_past
+    recent_low=min(lows[-REVERSAL_NO_LOW_BARS:])
+    prior_low=min(lows[-REVERSAL_NO_LOW_BASE:-REVERSAL_NO_LOW_BARS])
+    no_new_low=recent_low>=prior_low
+    vol_avg=sum(vols[-10:-1])/9 if len(vols)>=10 else sum(vols[:-1])/max(1,len(vols)-1)
+    thr=REVERSAL_VOL_MIN*night_mult()   # ночью/выходные порог выше
+    # объём УСТОЙЧИВЫЙ: последняя И предыдущая свеча выше нормы (не однобарный фитиль)
+    vol_spike=vol_avg>0 and vols[-1]>=vol_avg*thr and vols[-2]>=vol_avg*VOL_PREV_MIN
+    green=closes[-1]>closes[-2]
+    oi_chg=oic[-1]/oic[-3]-1 if oic[-3]>0 else 0
+    oi_up=oi_chg>=REVERSAL_OI_MIN
+    ok=was_downtrend and no_new_low and vol_spike and green and oi_up
+    return ok, dict(recent_low=recent_low, prior_low=prior_low,
+        vol_ratio=(vols[-1]/vol_avg if vol_avg>0 else 0), oi_chg=oi_chg)
+
+def card_reversal(m, ex, details):
+    sc=_score(m,ex); rsi_v=int(m.get("rsi",50))
+    lines=[
+        f"\U0001F53B\u2192\U0001F680 <b>{m['coin']} · РАЗВОРОТ</b> (объём после сползания)",
+        f"\U0001F4B5 ${m['price']:.5g} (Bybit)",
+        "",
+        f"\U0001F4AA Сила сетапа: {sc}/10 {_bar(sc/10,5)}",
+        f"\U0001F4C9 Объём \u00d7{details.get('vol_ratio',0):.1f} от нормы \u00b7 OI {details.get('oi_chg',0)*100:+.1f}% \u00b7 RSI {rsi_v}",
+        f"\U0001F517 Корреляция с BTC {m['cor']*100:.0f}%",
+        "",
+        "\u26A0\uFE0F <b>Разворот после даунтренда \u2014 контр-тренд, риск шорт-сквиза выше обычного лонга.</b>",
+        "\u2022 рост OI подтверждён \u2014 это НОВЫЕ деньги, а не закрытие шортов",
+        "\u2022 <b>жди закрытия следующей свечи выше текущей</b> \u2014 только тогда вход",
+        f"\u2022 стоп под минимумом разворота: ${details.get('recent_low', m['price']):.5g}",
+    ]
+    ch=chain_line(m["coin"],"reversal")
+    if ch: lines += ["", ch]
+    _n,_w=track_record("reversal")
+    if _n>0:
+        lines += ["", f"\U0001F4C8 Трек-рекорд РАЗВОРОТОВ: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
+    lines += ["", "\u2501"*16,
+        "\u26A0\uFE0F Это ловля разворота (предсказание дна) \u2014 самый рискованный тип. "
+        "Подсветка, не приказ. Стоп на Bybit обязателен, размер пробный."]
+    return "\n".join(lines)
+
+def card_early15(m, ex, mv, rvol, slope, three_green_ok, btc_hits):
+    """Полная карточка раннего 15м-сигнала: все показания + какие фильтры пройдены."""
+    p=m["price"]; coin=m["coin"]
+    fund=ex.get("funding",0); lsr=m.get("ls_ratio")
+    # оценка силы: сколько подтверждающих факторов сошлось
+    strength=sum([rvol>=3, m.get("daily_rvol",1)>=2, (lsr or 0)>1.2,
+                  m["cor"]<0.5, m.get("macd_h",0)>0, m.get("roc",0)>0])
+    bars="\u25A0"*strength+"\u25A1"*(6-strength)
+    L=[
+        f"\U0001F440 <b>{coin} · РАННИЙ 15м-СИГНАЛ</b>",
+        f"\U0001F4B5 ${p:.5g}  \u00b7  \u25B2 +{mv*100:.1f}% на 15м",
+        f"\U0001F4AA Сила раннего сетапа: {strength}/6  {bars}",
+        "",
+        "\U0001F4CA <b>ПОКАЗАНИЯ:</b>",
+        f"\U0001F525 Всплеск объёма (15м): RVOL \u00d7{rvol:.1f}  {'\u2705 сильный' if rvol>=3 else '\u2014 по динамике'}",
+        f"\U0001F4C8 Объём сегодня: \u00d7{m.get('daily_rvol',1):.1f} от обычного",
+        f"\u26A1 Ускорение объёма: \u00d7{slope:.1f} (свежие свечи vs прошлые)",
+        f"\U0001F7E2 3 зелёные 15м подряд: {'\u2705 да' if three_green_ok else '\u2014'}",
+        f"\U0001F321 RSI: {m.get('rsi',0):.0f}  (порог раннего \u2264{EARLY_RSI_MAX})",
+        f"\U0001F517 Корреляция с BTC: {m['cor']*100:.0f}%  {'\u26A0\uFE0F ходит за BTC' if m['cor']>=0.5 else '\u2705 свой импульс'}",
+        f"\U0001F4A7 Ликвидность: ${m['turn']/1e6:.0f}M/сутки  (порог \u2265${THIN_TURN//1_000_000}M)",
+    ]
+    if lsr: L.append(f"\u2696\uFE0F Лонг/Шорт: {lsr:.1f}  {'(перекос в лонг)' if lsr>1.2 else '(баланс/шорт)'}")
+    L.append(f"\U0001F4B0 Funding: {fund*100:.3f}%  {'\u26A0\uFE0F повышен' if fund>0.01 else '\u2705 норма'}")
+    # момент MACD/ROC (справка)
+    L.append(f"\U0001F4C9 Момент: MACD {'бычий \u2713' if m.get('macd_h',0)>0 else 'медвежий \u2717'} \u00b7 ROC(12ч) {m.get('roc',0):+.1f}%")
+    L += [
+        "",
+        "\U0001F6E1 <b>ПРОЙДЕННЫЕ ФИЛЬТРЫ (почему сигнал прошёл):</b>",
+        f"\u2705 не падающий нож (просадка {m['dd']*100:.0f}% > {int(KNIFE_DD*100)}%)",
+        f"\u2705 не в чопе (волатильность {m.get('atrr',1)*100:.0f}% нормы \u2265{int(ATR_MIN_RATIO*100)}%)",
+        f"\u2705 BTC не валится ({btc_hits}/6 медвежьих признаков < {BTC_RISK_MIN_HITS})",
+        f"\u2705 монета зрелая (\u2265{MIN_AGE_DAYS} дней) и ликвидная (\u2265${THIN_TURN//1_000_000}M)",
+        "",
+        "\u23F3 <b>ЧТО ДАЛЬШЕ:</b> взял на живое отслеживание (объём/лонгисты/funding). "
+        "Если через 1-2ч придёт полный \U0001F7E2 ЛОНГ-сигнал \u2014 движение подтвердилось деньгами (OI+объём за 4ч).",
+    ]
+    ch=chain_line(m["coin"],"early15")
+    if ch: L += ["", ch]
+    _n,_w=track_record("early15")
+    if _n>0:
+        L += ["", f"\U0001F4C8 Трек-рекорд РАННИХ 15м: измерено {_n}, в плюсе через 24ч {_w} ({_w/_n*100:.0f}%)"]
+    L += ["", "\u2501"*16,
+        "\u26A0\uFE0F <b>Это РАДАР, не команда входа.</b> Ранний сигнал ловит начало движения "
+        "ДО подтверждения деньгами \u2014 выше шанс ложного. Вход \u2014 на часовом подтверждении/ретесте. "
+        "Размер пробный, стоп обязателен."]
+    return "\n".join(L)
+
 def card_early(m, zone_hi, zone_lo):
     """Ранний сигнал: пробой сжатия ДО подтверждения деньгами. Честно помечен."""
     p=m["price"]; stop=zone_lo
@@ -806,6 +953,40 @@ def card_early(m, zone_hi, zone_lo):
         "\u26A0\uFE0F Экспериментальный сигнал на проверке. Пойдёт ли вверх \u2014 НЕ гарантия. "
         "Стоп обязателен, размер пробный."]
     return "\n".join(lines)
+
+SIGNAL_CHAIN_HOURS=12   # окно, в котором сигналы считаются одной цепочкой развития
+
+def signal_chain(coin, exclude_type):
+    """Ищет недавние сигналы ДРУГИХ типов по этой монете за SIGNAL_CHAIN_HOURS.
+    Возвращает список (тип, часов_назад) — цепочку развития движения.
+    Идея: reversal -> early15 -> long по одной монете = разворот перешёл в тренд,
+    сильное подтверждение."""
+    if not os.path.exists(SIGNALS_FILE): return []
+    now=dt.datetime.now(); out=[]
+    try:
+        with open(SIGNALS_FILE) as f:
+            for r in csv.DictReader(f):
+                if r.get("coin")!=coin: continue
+                if r.get("type")==exclude_type: continue
+                ts=dt.datetime.fromisoformat(r["ts"])
+                hrs=(now-ts).total_seconds()/3600
+                if 0<=hrs<=SIGNAL_CHAIN_HOURS:
+                    out.append((r["type"], hrs))
+    except Exception: return []
+    # последние по каждому типу
+    seen={}
+    for t,h in sorted(out, key=lambda x:x[1]):
+        if t not in seen: seen[t]=h
+    return [(t,h) for t,h in seen.items()]
+
+def chain_line(coin, exclude_type):
+    """Строка-подсказка о цепочке сигналов для карточки (или пусто)."""
+    ch=signal_chain(coin, exclude_type)
+    if not ch: return None
+    names={"long":"🟢 лонг","triangle":"🔺 треугольник","early":"🔵 ранний",
+           "early15":"👀 ранний-15м","reversal":"🔻→🚀 разворот"}
+    parts=[f"{names.get(t,t)} ({h:.0f}ч назад)" for t,h in ch]
+    return "\U0001F517 <b>Цепочка по монете:</b> " + " → ".join(parts) + " → <b>сейчас</b>"
 
 def log_signal(coin, sig_type, price):
     """Каждый отправленный сигнал (long / triangle) фиксируется с ценой и
@@ -909,7 +1090,7 @@ def compute_stats():
     btc_now=cur_price("BTC")
     out=["\U0001F4CA СТАТИСТИКА ПО СИГНАЛАМ (форвард + бенчмарк BTC)\n"]
     for horizon_h, label in [(4,"4ч"),(24,"24ч")]:
-        for sig_type in ("long","triangle","early","early15"):
+        for sig_type in ("long","triangle","early","early15","reversal"):
             sig_pcts=[]; btc_pcts=[]
             for r in rows:
                 if r["type"]!=sig_type: continue
@@ -996,11 +1177,21 @@ def enrich(sym):
     out={}
     try:
         t=ticker_info(sym)
-        if t: out["funding"]=t["funding"]
+        if t:
+            out["funding"]=t["funding"]
+            out["spread"]=t.get("spread",0.0)
     except Exception: pass
     return out
 
 # ---------- скан ----------
+def night_mult():
+    """Множитель порога объёма в тихие часы UTC (ночь 0-6 UTC + выходные) —
+    тогда база объёма ниже, RVOL завышен, поэтому требуем выше порог."""
+    import datetime as _dt
+    u=_dt.datetime.now(_dt.timezone.utc)   # timezone-aware (utcnow() устарел в 3.12+)
+    quiet = u.hour<6 or u.weekday()>=5   # ночь UTC или сб/вс
+    return NIGHT_VOL_MULT if quiet else 1.0
+
 def btc_short_risk():
     """Зеркальный шортовый набор по самому BTC. Возвращает (hits, reasons, price, cor_note).
     Если hits>=BTC_RISK_MIN_HITS — риск серьёзной коррекции подтверждён."""
@@ -1105,9 +1296,9 @@ def run_scan(cid, announce=False):
         # === СТАДИЯ 1: РАННЕЕ ОБНАРУЖЕНИЕ НА 15м (движение началось, час подтвердит позже) ===
         if EARLY15_ENABLED and c15 and v15:
             try:
-                started, mv, rvol = detect_early_15m(c15,h15,l15,v15)
+                started, mv, rvol, e_slope, e_3green = detect_early_15m(c15,h15,l15,v15)
             except Exception:
-                started, mv, rvol = False,0,0
+                started, mv, rvol, e_slope, e_3green = False,0,0,0,False
             if (started and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
                     and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS
                     and abs(ex.get("funding",0))<FUNDING_CUTOFF
@@ -1119,13 +1310,26 @@ def run_scan(cid, announce=False):
                     v0=sum(v15[-4:])/4
                     EARLY_WATCH[coin]=dict(sym=sym, ts=now, v0=v0,
                         lsr0=m.get("ls_ratio"), fund0=ex.get("funding",0), price0=m["price"])
-                    tg_send(cid,
-                        f"\U0001F440 <b>{coin}: РАННЕЕ (15м)</b> — движение началось (+{mv*100:.1f}% на 15м, RVOL \u00d7{rvol:.1f})\n"
-                        f"\U0001F4B5 ${m['price']:.5g}  \u00b7  корр. с BTC {m['cor']*100:.0f}%\n"
-                        f"\u23F3 <i>Взял на живое отслеживание — буду сигналить о развитии (объём, лонгисты, funding). "
-                        f"Если через 1-2ч придёт полный \U0001F7E2 ЛОНГ-сигнал — движение подтвердилось деньгами.</i>")
+                    tg_send(cid, card_early15(m, ex, mv, rvol, e_slope, e_3green, btc_hits))
                     shown+=1
                     log_signal(coin, "early15", m["price"])
+
+        # === РАЗВОРОТНЫЙ СИГНАЛ (контр-тренд, эксперим., отдельная статистика) ===
+        if REVERSAL_ENABLED:
+            try:
+                rev_ok, rev_d = reversal_setup(closes,highs,lows,vols,oic)
+            except Exception:
+                rev_ok, rev_d = False,{}
+            # фильтры безопасности: ликвидность, BTC не валится, funding норм, не в чопе
+            if (rev_ok and m["turn"]>=THIN_TURN and btc_hits<BTC_RISK_MIN_HITS
+                    and abs(ex.get("funding",0))<FUNDING_CUTOFF and m.get("atrr",1.0)>=ATR_MIN_RATIO):
+                lr=LAST_REVERSAL.get(coin,0)
+                if now-lr>=REVERSAL_COOLDOWN_H*3600:
+                    LAST_REVERSAL[coin]=now
+                    # НЕ шлём сразу: ждём закрытия следующей свечи выше триггера (защита от ложного спайка)
+                    WATCH[coin]=dict(ts=now, sym=sym, kind="reversal_pending",
+                        trigger_price=m["price"], stop_price=rev_d.get("recent_low", m["price"]),
+                        details=rev_d, m_snapshot=dict(m), ex_snapshot=dict(ex))
 
         # === РАННИЙ СИГНАЛ (эксперим.): пробой сжатия ДО подтверждения деньгами ===
         if EARLY_ENABLED:
@@ -1134,10 +1338,13 @@ def run_scan(cid, announce=False):
             except Exception:
                 broke, zhi, zlo = False,0,0
             # строгие доп. условия: RSI не перегрет, не падающий нож, не в чопе, BTC не валится
+            # ВОРОТА "ПОЗДНО": не зовём, если движение уже выдохлось (как в long_ok)
+            too_late_e = m.get("ext",0)>MAX_EXT_ENTRY or m["p4"]>MAX_MOVE_4H
             if (broke and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
                     and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS
                     and abs(ex.get("funding",0))<FUNDING_CUTOFF
-                    and m["turn"]>=THIN_TURN):
+                    and m["turn"]>=THIN_TURN
+                    and not too_late_e):
                 le=LAST_EARLY.get(coin,0)
                 if now-le>=EARLY_COOLDOWN_H*3600:
                     LAST_EARLY[coin]=now
@@ -1156,6 +1363,9 @@ def run_scan(cid, announce=False):
 
         # FUNDING-CUTOFF: экстремальный funding = перегрев лонгами перед каскадом. Полный отказ.
         if abs(ex.get("funding",0))>=FUNDING_CUTOFF:
+            continue
+        # СПРЕД: очень широкий (>2x порога) = слишком тонкий стакан, блокируем (по нашей логике)
+        if ex.get("spread",0) >= SPREAD_MAX*2:
             continue
 
         lv=m.get("lvl")
@@ -1246,6 +1456,28 @@ def check_watchlist(chat):
     now=time.time()
     for coin in list(WATCH):
         w=WATCH[coin]
+        # --- РАЗВОРОТ: ждём ПОДТВЕРЖДЕНИЯ (закрытие след. свечи выше триггера) ---
+        if w.get("kind")=="reversal_pending":
+            if now-w["ts"]>REVERSAL_COOLDOWN_H*3600:
+                del WATCH[coin]; continue          # не подтвердилось за N часов — сброс
+            try:
+                res=bget("/v5/market/kline", {"category":"linear","symbol":w["sym"],"interval":"60","limit":3})
+                k=res["list"]; time.sleep(0.15)
+            except Exception:
+                continue
+            if len(k)<1: continue
+            last_closed=k[1] if len(k)>1 else k[0]  # k[0]=текущая незакрытая, k[1]=последняя закрытая
+            close_price=float(last_closed[4])
+            if close_price<=w["stop_price"]:
+                del WATCH[coin]; continue            # ушла ниже стопа — разворот не состоялся
+            if close_price>w["trigger_price"]:       # ПОДТВЕРЖДЕНО закрытием выше
+                mm=w["m_snapshot"]; mm["price"]=close_price
+                tg_send(chat, card_reversal(mm, w["ex_snapshot"], w["details"]),
+                    buttons=[[{"text":"\u2705 Я вошёл","callback_data":f"enter|{coin}|{close_price:.6g}"}]])
+                log_signal(coin, "reversal", close_price)
+                del WATCH[coin]
+            continue                                 # reversal_pending обработан, дальше не идём
+        # --- обычная retest-логика (треугольники/уровни) ---
         if now-w["ts"]>WATCH_HOURS*3600:
             del WATCH[coin]; continue
         try:
@@ -1363,7 +1595,12 @@ def main():
                             f"Похоже, регион всё ещё блокируется.")
                 elif text.startswith("/watch"):
                     if WATCH:
-                        rows=[f"\u2022 {c}: жду ретест ${w['zone_lo']:.5g}\u2013${w['zone_hi']:.5g} ({w.get('kind','зона')})" for c,w in WATCH.items()]
+                        rows=[]
+                        for c,w in WATCH.items():
+                            if w.get("kind")=="reversal_pending":
+                                rows.append(f"\u2022 {c}: \U0001F53B\u2192\U0001F680 жду ПОДТВЕРЖДЕНИЯ разворота (закрытие >${w['trigger_price']:.5g})")
+                            else:
+                                rows.append(f"\u2022 {c}: жду ретест ${w['zone_lo']:.5g}\u2013${w['zone_hi']:.5g} ({w.get('kind','зона')})")
                         tg_send(cid,"\u23F3 На отслеживании:\n"+"\n".join(rows))
                     else:
                         tg_send(cid,"Список ожидания пуст \u2014 никого не отслеживаю.")
