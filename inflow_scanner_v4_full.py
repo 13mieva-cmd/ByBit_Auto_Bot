@@ -170,6 +170,37 @@ Edge направления мы измеряли — его нет. Решен�
   заданной готовности потерять $X) — бот не знает размер депозита, поэтому это
   иллюстрация с формулой для масштабирования, а не готовое число под конкретный счёт.
 
+ПОВТОРНЫЙ АУДИТ С НУЛЯ (не по одной правке, а по взаимодействию всех сразу):
+- КРИТИЧНО, САМ ЖЕ И ВНЁС В ПРОШЛОМ ПРОХОДЕ: profit_targets() обращалась к уровням
+  как к словарям (lv["price"]), но find_levels()/m["levels"] — это список КОРТЕЖЕЙ
+  (price, touches), как и везде в остальном коде (см. stop_map(), которая всё
+  делает верно через lv[0]). В изолированном юнит-тесте я сам подсунул неправильно
+  сформированные фейковые данные (список словарей) и поэтому не поймал баг раньше.
+  На реальных данных card_long() падала бы на КАЖДОМ лонг-сигнале, где найден хоть
+  один уровень (то есть почти всегда). Поймано фаззингом 300 случайных сценариев
+  через полный пайплайн core->long_ok->card_long (было 0/300 без ошибок, теперь
+  300/300). Исправлено на lv[0]. Хороший урок: юнит-тест на выдуманных данных не
+  заменяет прогон через реальную форму данных из самого пайплайна.
+- баг: позиция в ощутимом минусе (например -5%), которая формально не пробила
+  EMA50 и не словила резкое падение OI (т.е. не triggерит "reversal"), проваливалась
+  сквозь ВСЕ проверки в position_status() и получала то же самое зелёное "держится...
+  моментум цел", что и позиция в плюсе — ложное спокойствие ровно там, где нужнее
+  всего честность. Добавлено состояние "drawdown": убыток >=1R без формального
+  reversal теперь получает отдельное, честное сообщение, а не бодрое "ok".
+- неточность: константа REVERSAL_LOOKBACK_DOWN была объявлена, но нигде не
+  использовалась — reversal_setup() применял захардкоженную "10" вместо неё
+  (это моя же правка из первого прохода, когда чинил обрезку истории EMA — число
+  осталось тем же, но перестало быть настраиваемым). Восстановлена ссылка на константу.
+- дополнительно: фаззинг position_status() (400 случайных сценариев, включая
+  risk0=None/0/отрицательный) и enter-обработчика (150 сценариев, включая очень
+  короткую историю баров) — 0 падений на обоих; заодно чуть ужесточена защита от
+  некорректного risk0 (raньше отрицательные значения проходили мимо fallback).
+- остальное перепроверено и осталось БЕЗ изменений: порядок аргументов во ВСЕХ
+  вызовах функций (78 функций, включая все добавленные в поздних проходах — ни
+  одного нового расхождения), полнота полей core() против каждого потребителя (37
+  обращений m[...]/m.get(...), 0 отсутствующих ключей), схема HISTORY_FILE между
+  archive_snapshot() и backtest_history() (совпадает 1:1), дубликаты констант (0).
+
 Ключи через Environment: TG_TOKEN. Команды: /start /scan /log /pos /watch /bybit /stats /backtest
 """
 import os, time, json, csv, sqlite3, random
@@ -182,6 +213,7 @@ MAX_COINS=300; SCAN_EVERY_MIN=5; MAX_ALERTS=8
 CHECK_POS_MIN=2; CALM_UPDATE_MIN=30
 RSI_TAKE_PARTIAL=82     # RSI выше этого while в плюсе — намёк подумать о частичной фиксации
 TRAIL_TRIGGER_R=1.0     # прибыль >= 1R от риска на входе — пора подтягивать стоп
+DRAWDOWN_FLAG_R=1.0     # убыток >= 1R, но БЕЗ формального reversal — не давать ложного "всё ок"
 STALL_HOURS=20          # позиция открыта дольше этого без сдвига — тезис не подтверждается
 STALL_BAND=0.015        # "без сдвига" = P&L в пределах ±1.5%
 OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=30_000_000
@@ -384,7 +416,7 @@ def profit_targets(price, risk_abs, levels, old_high):
     только стоп)."""
     if risk_abs<=0: return []
     tp=[("1R", price+risk_abs), ("2R", price+2*risk_abs), ("3R", price+3*risk_abs)]
-    above=[lv["price"] for lv in (levels or []) if lv["price"]>price]
+    above=[lv[0] for lv in (levels or []) if lv[0]>price]   # levels — список (price,touches), не словарей
     if above:
         tp.append(("ближайший уровень выше", min(above)))
     if old_high and old_high>price:
@@ -1056,8 +1088,8 @@ def reversal_setup(closes, highs, lows, vols, oic):
     """Даунтренд -> затухание падения (нет новых минимумов) -> всплеск объёма
     на зелёной свече -> рост OI (фильтр от шорт-сквиза)."""
     if len(closes)<70 or len(oic)<4: return False,{}
-    e50_past=ema(closes[:-10],50)   # вся история ДО последних 10 баров (без заглядывания вперёд, но без обрезки)
-    was_downtrend=closes[-10]<e50_past
+    e50_past=ema(closes[:-REVERSAL_LOOKBACK_DOWN],50)   # вся история ДО последних N баров (без заглядывания вперёд, но без обрезки)
+    was_downtrend=closes[-REVERSAL_LOOKBACK_DOWN]<e50_past
     recent_low=min(lows[-REVERSAL_NO_LOW_BARS:])
     prior_low=min(lows[-REVERSAL_NO_LOW_BASE:-REVERSAL_NO_LOW_BARS])
     no_new_low=recent_low>=prior_low
@@ -1457,7 +1489,8 @@ def position_status(coin):
     oi4=oic[-1]/oic[-5]-1 if oic[-5]>0 else 0
     e50=ema(closes,50)   # вся полученная история (до 80 баров), не только последние 60
     r=rsi(closes,14)
-    risk0=p.get("risk0") or (p["entry"]*0.02)   # ATR-риск на входе, запасной вариант 2% от входа
+    risk0=p.get("risk0")
+    risk0=risk0 if (risk0 and risk0>0) else (p["entry"]*0.02)   # ATR-риск на входе, запасной вариант 2% от входа
     r_mult=(price-p["entry"])/risk0 if risk0>0 else 0
 
     # 1) РАЗВОРОТ — самый срочный сигнал, перекрывает всё остальное
@@ -1470,6 +1503,15 @@ def position_status(coin):
             + "; ".join(reasons)+".\n"
             "Если на бирже стоит стоп — он сработает сам. Решение твоё.")
         return "reversal",msg
+
+    # 1.5) ПРОСЕЛА минимум на 1R, но формально не задела OI/EMA50 — не тот же приоритет, что
+    # "reversal", но и не "держится, моментум цел": без этой проверки убыточная позиция,
+    # которая просто не пробила EMA50, молча получала бы то же зелёное "ok", что и позиция в плюсе.
+    if r_mult<=-DRAWDOWN_FLAG_R:
+        msg=(f"\U0001F7E0 {coin}: минус {abs(pnl)*100:.1f}% (\u2248{r_mult:.1f}R от риска на входе)\n"
+            f"Цена формально ещё выше EMA50 и OI резко не падал — по нашим правилам это не "
+            f"\"разворот\". Но сам по себе такой минус — повод перепроверить тезис, а не просто ждать.")
+        return "drawdown",msg
 
     # 2) ПЕРЕГРЕВ — RSI на грани блоу-оффа, пока цена в плюсе: не разворот, но повод подумать
     if r>=RSI_TAKE_PARTIAL and pnl>0:
@@ -2190,7 +2232,7 @@ def main():
                 p["last_check"]=now
                 state,m=position_status(coin)
                 if not state: continue
-                if state in ("reversal","take_partial","trail_stop","stalled") and p.get("last_state")!=state:
+                if state in ("reversal","drawdown","take_partial","trail_stop","stalled") and p.get("last_state")!=state:
                     tg_send(chat,m,buttons=pos_buttons(coin)); p["last_upd"]=now
                 elif state=="ok" and now-p.get("last_upd",0)>CALM_UPDATE_MIN*60:
                     tg_send(chat,m,buttons=pos_buttons(coin)); p["last_upd"]=now
