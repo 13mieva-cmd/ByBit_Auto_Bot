@@ -2200,7 +2200,7 @@ def main():
                 elif text.startswith("/log"):
                     if os.path.exists(TRADES) and os.path.getsize(TRADES)>0:
                         n=sum(1 for _ in open(TRADES))-1
-                        tg_send_doc(cid,TRADES,f"Журнал сделок: {n}. Сохрани — на сервере файл сбрасывается при передеплое.")
+                        tg_send_doc(cid,TRADES,f"Журнал сделок: {n}.")
                     else: tg_send(cid,"Журнал пуст — ещё не было закрытых сделок.")
 
             if chat and time.time()-last_scan>SCAN_EVERY_MIN*60:
