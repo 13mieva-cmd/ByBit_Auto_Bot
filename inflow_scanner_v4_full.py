@@ -65,9 +65,114 @@ Edge направления мы измеряли — его нет. Решен�
   расхождение было только в комментариях.
 Все находки и правки подробно разобраны в чате, где этот файл был передан.
 
-Ключи через Environment: TG_TOKEN. Команды: /start /scan /log /pos /watch /bybit /stats
+УЛУЧШЕНИЯ уровня инфраструктуры/риска (шаг к тому, чтобы в перспективе можно было
+безопасно добавить автоисполнение — само автоисполнение НЕ добавлено, см. чат):
+- баг-подобная неточность: TRADES/CHAT_FILE/SIGNALS_FILE по умолчанию писались в /tmp
+  (стирается на рестарте/передеплое), хотя BLOCKS_FILE уже верно указывал на /data —
+  явная непоследовательность. Все журналы теперь по умолчанию идут в /data.
+- добавлена sqlite-персистентность (STATE_DB) для POSITIONS/WATCH/EARLY_WATCH/всех
+  кулдаунов — раньше это были ТОЛЬКО переменные в памяти процесса: любой рестарт молча
+  стирал открытые позиции и отслеживания. Теперь состояние переживает передеплой.
+- добавлен ДНЕВНОЙ ЛИМИТ УБЫТКА (DAILY_LOSS_BREAKER, по умолчанию -5% реализованного
+  P&L за день по журналу сделок) — второй, независимый от BTC-рубильника стоп-кран.
+  Единственное место, где новые сигналы реально приостанавливаются (не просто
+  помечаются предупреждением) — существующие позиции продолжают вестись как обычно.
+- добавлена видимость портфельного риска: карточка лонг-сигнала теперь предупреждает,
+  если уже открыто много позиций (MAX_CONCURRENT_POS) или новая монета сильно
+  коррелирует с BTC при том, что уже открытые позиции тоже высоко-бета (скрытая
+  концентрация риска, которая не видна, если смотреть на каждую монету по отдельности).
+  Ничего не блокирует — это только предупреждение, как остальные cautions в карточке.
+- добавлен архив метрик (HISTORY_FILE): каждая отсканированная монета (не только та,
+  что дала сигнал) пишет строку с ключевыми метриками каждый цикл. Публичный REST
+  Bybit хранит историю open interest ограниченное время — этот архив копится с этого
+  момента независимо от того, что отдаёт API, и через несколько месяцев на нём можно
+  будет по-честному бэктестить и калибровать пороги, а не только измерять форвардно.
+- добавлен heartbeat (раз в HEARTBEAT_EVERY_H часов бот сам присылает статус) и
+  Telegram-уведомление при сбое в главном цикле — раньше ошибки только печатались в
+  лог, который никто не читает в реальном времени; теперь тишина или сбой заметны.
+- добавлен startup_selfcheck(): при каждом запуске бот сам пишет+читает+удаляет тестовую
+  запись в STATE_DB и говорит результат в лог и в Telegram, если чат уже известен. Раньше
+  проверить, что /data реально доступен для записи на конкретном деплое, можно было только
+  вручную (SSH в контейнер + отдельный скрипт) — теперь это происходит само на каждом старте.
+
+ИСПРАВЛЕНО в этом проходе (аудит именно ТОЧЕК ВХОДА, а не детекторов сигналов):
+- баг: карточка ЛОНГ-сигнала БЕЗУСЛОВНО пишет "Правило входа: НЕ по рынку сейчас...
+  Бот позовёт", но watch на ретест (тот самый механизм, который и должен "позвать")
+  раньше ставился только при extended=True. Для сигналов, где extended=False (а это
+  большинство), бот обещал перезвонить и НИКОГДА не перезванивал. Watch теперь ставится
+  всегда, когда карточка обещает ретест — обещание больше не бывает пустым.
+- баг: в этой же ветке zone_hi=e21, zone_lo=consol_base брались БЕЗ проверки, что
+  e21>consol_base. Эмпирически (синтетика, реалистичный диапазон extended-сигналов
+  5-8%): зона оказывалась "перевёрнутой" (e21<consol_base) в ~57% случаев — то есть
+  чаще, чем нет. Отображаемая пользователю зона отката не совпадала с тем, что реально
+  проверяет ретест-логика. Исправлено на zone_hi=max(e21,consol_base),
+  zone_lo=min(e21,consol_base); текст карточки тоже переписан, чтобы всегда показывать
+  границы в реальном возрастающем порядке.
+- баг: карточка ТРЕУГОЛЬНИКА в стадии "ready" пишет "Бот сам предупредит отдельным
+  сообщением, когда пробой произойдёт — не нужно сидеть у графика", и под это даже
+  заведён TRI_ALERT с TRI_ALERT_HOURS=6 и подробный комментарий в коде. Но TRI_ALERT
+  только ЗАПОЛНЯЛСЯ — ни одна функция его не читала. Реального пробоя крышки бот НЕ
+  замечал вообще, если по той же монете не прилетал ещё один полный лонг-сигнал с нуля.
+  Добавлена check_tri_alert() — тот самый обещанный механизм, проверяется раз в 15с
+  (WATCH_CHECK_SEC), как и было изначально задумано по комментарию в коде.
+
+ДОБАВЛЕНО: реальный бэктест-движок (по просьбе "протестируй на истории"):
+- archive_snapshot() теперь пишет и btc_price в каждую строку HISTORY_FILE — нужно,
+  чтобы сравнивать forward-результат монеты с тем, что дал бы за то же время BTC.
+  ЧЕСТНО: у меня в этой среде нет доступа в сеть, чтобы скачать реальную историю
+  Bybit самому — бэктест может опираться только на то, что бот накопит сам, начиная
+  с этого момента. Задним числом данных нет и быть не может.
+- добавлена backtest_history() + команда /backtest [часы] [дни] (по умолчанию 24ч
+  за 30 дней): берёт ВЕСЬ отсканированный архив (не только отправленные сигналы,
+  как /stats), сравнивает форвардный результат монет, которые long_ok пропустил бы,
+  против тех, что отсеял бы, и обе группы — против BTC за то же окно. Движок
+  проверен на контролируемых синтетических числах (не на рынке!) — подтверждено,
+  что расчёт даёт ровно то, что должен, при известных входных данных. Реальный
+  результат появится только когда HISTORY_FILE накопит достаточно строк (недели).
+
+ИСПРАВЛЕНО: погоня за резким разовым скачком (разбор конкретного случая — NEARUSDT,
+скрин в чате: бот сигналил у пика V-образного скачка, а не после отката):
+- баг: MAX_EXT_ENTRY (>8% от EMA21) и MAX_MOVE_4H (>10% за 4ч) калиброваны на
+  МЕДЛЕННЫЙ, накопленный отрыв — эмпирически проверено (синтетика, форма движения
+  как на скрине): быстрый V-скачок на 1.5-6% за 1-2 часовые свечи ОБЕ эти проверки
+  проходил чисто (too_late=False) на всём диапазоне, хотя по факту это уже пик
+  разового рывка, а не начало движения. Добавлен spike_guard(): сравнивает диапазон
+  ПОСЛЕДНЕЙ часовой свечи с типичным диапазоном за предыдущие 20ч; при >=2.5x считаем
+  это резким выбросом и приравниваем к "поздно" (too_late) — сигнал в этом случае не
+  шлётся на этой свече, а не гонится за пиком. Проверено: на тех же спайках, которые
+  пропускали ext/p4, spike_guard срабатывает (ratio 2.8-4.4x при амплитуде 2-4%);
+  на 500 прогонах чистого шума и на плавном устойчивом тренде — 0 ложных срабатываний.
+  Применено ТОЛЬКО к основному long-сигналу — не к early15/reversal/early(сжатие),
+  у которых резкая свеча часто и есть суть самого сигнала (там это не баг, а фича).
+
+ПЕРЕСМОТР СО СТОРОНЫ ТРЕЙДЕРА: вход был проработан сильно глубже выхода — это и
+есть главный структурный перекос, который вскрылся при обзоре целиком:
+- баг-неточность: night_mult() (порог объёма выше в тихие часы UTC/выходные —
+  ночью база объёма ниже, относительный всплеск завышен) применялся только к
+  early15/reversal, но НЕ к основному long-сигналу, хотя spike/spike_fast там —
+  та же самая по природе метрика с той же статистической проблемой. Теперь
+  VOL_SPIKE_MIN/SPIKE_FAST_MIN тоже домножаются на night_mult().
+- было: сопровождение позиции — это ДВА состояния (reversal/ok), т.е. бот молчал
+  весь путь сделки и только один раз кричал "разворот". Никакого трейлинга,
+  частичной фиксации, метки "перегрето" или "зависло". Стало: position_status()
+  теперь ладдер из 5 состояний по приоритету — reversal (как было) > take_partial
+  (RSI>=82 при прибыли — намёк зафиксировать часть) > trail_stop (прибыль >=1R от
+  ATR-риска на входе — пора двигать стоп в безубыток) > stalled (открыта >=20ч,
+  P&L в пределах ±1.5% — тезис не подтверждается) > ok. Каждое новое состояние
+  шлётся РАЗОВО при переходе в него (как раньше reversal), не спамит на каждой
+  проверке. Риск на входе (для R) считается через ATR14×1.5 в момент "Я вошёл" и
+  хранится в позиции — раньше стоп для входа был, а точки отсчёта риска не было.
+- было: карточка лонга давала полную карту стопов, но НИ ОДНОЙ цели — куда именно
+  фиксировать прибыль решай сам. Добавлена profit_targets(): лестница 1R/2R/3R от
+  уже посчитанного риска + ближайший уровень/7д-хай НАД ценой, если есть. Не приказ
+  фиксировать именно там — структурные ориентиры вместо "доедет само".
+- добавлен пример сайзинга в карточку (риск в $ на монету до стопа → объём при
+  заданной готовности потерять $X) — бот не знает размер депозита, поэтому это
+  иллюстрация с формулой для масштабирования, а не готовое число под конкретный счёт.
+
+Ключи через Environment: TG_TOKEN. Команды: /start /scan /log /pos /watch /bybit /stats /backtest
 """
-import os, time, json, csv
+import os, time, json, csv, sqlite3, random
 import datetime as dt
 import numpy as np
 import requests
@@ -75,6 +180,10 @@ import requests
 BYBIT="https://api.bybit.com"; QUOTE="USDT"
 MAX_COINS=300; SCAN_EVERY_MIN=5; MAX_ALERTS=8
 CHECK_POS_MIN=2; CALM_UPDATE_MIN=30
+RSI_TAKE_PARTIAL=82     # RSI выше этого while в плюсе — намёк подумать о частичной фиксации
+TRAIL_TRIGGER_R=1.0     # прибыль >= 1R от риска на входе — пора подтягивать стоп
+STALL_HOURS=20          # позиция открыта дольше этого без сдвига — тезис не подтверждается
+STALL_BAND=0.015        # "без сдвига" = P&L в пределах ±1.5%
 OI_4H_MIN=0.05; VOL_SPIKE_MIN=1.5; KNIFE_DD=-0.40; THIN_TURN=30_000_000
 SPREAD_MAX=0.003            # спред >0.3% = тонкий стакан, сигнал понижаем/блокируем
 VOL_PREV_MIN=0.8            # предыдущая свеча тоже >= 0.8x нормы (не однобарный фитиль)
@@ -88,11 +197,15 @@ BTC_VOL_SPIKE=1.5      # растущий объём на падении
 BTC_RSI_OVERSOLD=30    # перепроданность
 BTC_RISK_MIN_HITS=2    # сколько признаков = блок лонгов
 LAST_BTC_WARN=0        # антиспам предупреждения при автоскане
+LAST_BREAKER_WARN=0    # антиспам предупреждения дневного лимита убытка
 PRICE_UP_4H_MIN=0.005
 OI_1H_MIN=0.02           # БЫСТРЫЙ триггер: OI +2% за 1 час (приток только начался)
 SPIKE_FAST_MIN=2.0       # объём последних 1-2 свечей >= 2x нормы (свежий всплеск)
 MAX_EXT_ENTRY=0.08       # ПОЗДНО: цена >8% выше EMA21 — движение выдохлось, сигнал НЕ шлём
 MAX_MOVE_4H=0.10         # ПОЗДНО: уже +10% за 4ч — конец движения, не гонимся
+SPIKE_GUARD_MULT=2.5     # ПОЗДНО (быстрый вариант): диапазон ПОСЛЕДНЕЙ часовой свечи в X раз
+                         # больше типичного за 20ч — ловит резкий V-скачок ДО того, как он успел
+                         # накопить 8%/10% по медленным метрикам выше (см. чат: разбор по NEARUSDT)
 RSI_MAX=78
 MIN_BARS=200
 MIN_AGE_DAYS=180        # монете не меньше полугода (отсекаем свежие листинги)
@@ -131,13 +244,23 @@ TRI_ALERT_HOURS=6 # сколько часов держим монету на а�
 WATCH_HOURS=12
 WATCH_CHECK_SEC=15
 RETEST_NEED_BOUNCE=True
-TRADES=os.environ.get("TRADES_FILE","/tmp/scanner_trades.csv")
-CHAT_FILE=os.environ.get("CHAT_FILE","/tmp/scanner_chat.txt")
-SIGNALS_FILE=os.environ.get("SIGNALS_FILE","/tmp/scanner_signals.csv")
+TRADES=os.environ.get("TRADES_FILE","/data/scanner_trades.csv")
+CHAT_FILE=os.environ.get("CHAT_FILE","/data/scanner_chat.txt")
+SIGNALS_FILE=os.environ.get("SIGNALS_FILE","/data/scanner_signals.csv")
 BLOCKS_FILE=os.environ.get("BLOCKS_FILE","/data/scanner_blocks.csv")
+STATE_DB=os.environ.get("STATE_DB","/data/scanner_state.db")           # позиции/вотчи/кулдауны переживают рестарт
+HISTORY_FILE=os.environ.get("HISTORY_FILE","/data/scanner_history.csv") # свой архив метрик для будущего бэктеста
 TG_TOKEN=""
 SYM_CACHE={}
 POSITIONS={}
+# --- ПОРТФЕЛЬНЫЙ РИСК: только ДЕЛАЕТ РИСК ВИДИМЫМ, новые сигналы молча не прячет,
+#     кроме дневного лимита убытка ниже — это единственный жёсткий стоп-кран ---
+MAX_CONCURRENT_POS=6      # предупреждение в карточке, если открытых позиций уже >= этого числа
+PORTFOLIO_HI_CORR=0.75    # порог "высокая корреляция с BTC" для предупреждения о скрытой концентрации
+DAILY_LOSS_BREAKER=-0.05  # сумма pnl_pct закрытых СЕГОДНЯ (локальное время сервера, как и весь
+                          # остальной файл — см. close_trade/log_signal) сделок <= -5% -> пауза
+HEARTBEAT_EVERY_H=24      # если бот замолчал дольше этого — само отсутствие heartbeat уже сигнал
+STATE_FLUSH_SEC=20        # как часто сбрасывать состояние (позиции/вотчи/кулдауны) в sqlite
 
 # ---------- Telegram ----------
 def tg(method, **p):
@@ -253,6 +376,21 @@ def liq_zones(price, funding=0.0):
     elif funding<=-0.0003: out["heavy"]="short" # шорты перегружены -> магнит вверх
     else: out["heavy"]=None
     return out
+
+def profit_targets(price, risk_abs, levels, old_high):
+    """Лестница тейков от риска на входе (R-множители: 1R/2R/3R) + ближайший уровень
+    и 7д-хай НАД ценой, если они есть. Не команда фиксировать именно тут — структурные
+    ориентиры вместо 'куда-то же должно доехать' (раньше цели в карточке не было вообще,
+    только стоп)."""
+    if risk_abs<=0: return []
+    tp=[("1R", price+risk_abs), ("2R", price+2*risk_abs), ("3R", price+3*risk_abs)]
+    above=[lv["price"] for lv in (levels or []) if lv["price"]>price]
+    if above:
+        tp.append(("ближайший уровень выше", min(above)))
+    if old_high and old_high>price:
+        tp.append(("7д-хай", old_high))
+    tp.sort(key=lambda x: x[1])
+    return tp
 
 def long_short_ratio(symbol):
     """Соотношение лонг/шорт аккаунтов с Bybit (account-ratio). None если недоступно.
@@ -451,6 +589,21 @@ def atr_ratio(highs, lows, closes):
     if avg==0: return 1.0
     return cur/avg
 
+def spike_guard(highs, lows, period=20, mult=SPIKE_GUARD_MULT):
+    """Ловит резкий V-скачок ОДНОЙ последней часовой свечи, который MAX_EXT_ENTRY/
+    MAX_MOVE_4H пропускают: те калиброваны на медленный, накопленный за 4ч/от EMA21
+    отрыв (8%/10%), а быстрый спайк на 2-4% за 1-2 свечи может ещё не добрать до этих
+    порогов, хотя по факту это уже пик разового рывка, а не начало движения. Возвращает
+    (is_spike: bool, ratio) — во сколько раз диапазон последней свечи больше типичного
+    диапазона за предыдущие `period` часов."""
+    if len(highs)<period+2: return False,0.0
+    last_range=highs[-1]-lows[-1]
+    seg_h=highs[-period-1:-1]; seg_l=lows[-period-1:-1]
+    typical=sum(seg_h[i]-seg_l[i] for i in range(period))/period
+    if typical<=0: return False,0.0
+    ratio=last_range/typical
+    return ratio>=mult, ratio
+
 def coin_age_days(symbol):
     """Возраст монеты в днях по числу доступных ДНЕВНЫХ свечей. Свежие листинги
     (< полугода) отсекаем — у них нет истории, паттерны/уровни недостоверны."""
@@ -578,6 +731,7 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
     tf=sum([oi1>0.01, oi4>=OI_4H_MIN, oi24>0.10])
     brk=price>max(highs[-168:-1]) if len(highs)>168 else False
     atrr=atr_ratio(highs,lows,closes)   # режим рынка: <1 = сжатие/чоп
+    spike_now,spike_ratio=spike_guard(highs,lows)  # резкий V-скачок последней свечи (доп. к MAX_EXT_ENTRY/4H)
     mh=macd_hist(closes)                # MACD-гистограмма (справка-подтверждение)
     rc=roc(closes,12)                   # ROC за 12ч, % (справка)
     return dict(coin=coin,price=price,p4=p4,oi1=oi1,oi4=oi4,oi24=oi24,spike=spike,spike_fast=spike_fast,
@@ -585,21 +739,28 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
         e21=e21,ext=ext,consol_base=consol_base,old_high=old_high,extended=extended,
         tri=tri,tri_top=tri_top,tri_res_now=tri_res_now,tri_sup_now=tri_sup_now,
         flag=flag,flag_top=flag_top,levels=levels,lvl=lvl,atrr=atrr,tri_mtf=tri_mtf,
-        macd_h=mh,roc=rc,daily_rvol=daily_rvol)
+        macd_h=mh,roc=rc,daily_rvol=daily_rvol,spike_now=spike_now,spike_ratio=spike_ratio)
 
 def long_ok(m):
     """Лонг-сигнал. ДВА пути входа:
       1) БЫСТРЫЙ — свежий приток (OI +2% за 1ч + объём последних свечей >=2x): ловим
          движение через ~1 час после старта, а не через 4.
       2) ОБЫЧНЫЙ — накопленная 4ч-картина (OI 4ч + объём 4ч).
-    И ВОРОТА 'ПОЗДНО': если движение уже выдохлось (цена далеко от EMA21 или уже +10%
-    за 4ч) — сигнал НЕ шлём, чтобы не звать на конце движения."""
+    И ВОРОТА 'ПОЗДНО': если движение уже выдохлось (цена далеко от EMA21, уже +10%
+    за 4ч, ИЛИ последняя свеча — резкий разовый скачок) — сигнал НЕ шлём, чтобы не
+    звать на пике свечи. Третий случай (spike_now) специально ловит то, что первые
+    два calibровaны на медленный отрыв и пропускают: быстрый V-скачок на 2-4% за
+    1-2 свечи, который набрать 8%/10% ещё не успел, но по факту уже пик рывка.
+    Пороги объёма домножаются на night_mult() — та же логика, что уже была у
+    early15/reversal: ночью/по выходным база объёма ниже, относительный всплеск
+    завышен, и без поправки сигнал легче триггерится на статистическом шуме."""
+    nm=night_mult()
     # приток: быстрый ИЛИ накопленный
-    fast_inflow = m.get("oi1",0)>=OI_1H_MIN and m.get("spike_fast",0)>=SPIKE_FAST_MIN
-    slow_inflow = m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN
+    fast_inflow = m.get("oi1",0)>=OI_1H_MIN and m.get("spike_fast",0)>=SPIKE_FAST_MIN*nm
+    slow_inflow = m["oi4"]>=OI_4H_MIN and m["spike"]>=VOL_SPIKE_MIN*nm
     inflow = fast_inflow or slow_inflow
     # ПОЗДНО? движение уже прошло основную часть — не гонимся за свечой
-    too_late = m.get("ext",0)>MAX_EXT_ENTRY or m["p4"]>MAX_MOVE_4H
+    too_late = m.get("ext",0)>MAX_EXT_ENTRY or m["p4"]>MAX_MOVE_4H or m.get("spike_now",False)
     return (inflow and m["uptrend"]
         and m["dd"]>KNIFE_DD and m["turn"]>=THIN_TURN
         and m["p4"]>=PRICE_UP_4H_MIN
@@ -642,6 +803,7 @@ def card_long(m, ex):
         cautions.append(f"сильно отрицательный funding ({fund*100:.3f}%) \u2014 перегрев шортами, риск каскада против толпы")
     if m.get("btc_weak") and m["cor"]>=0.3:
         cautions.append(f"\U0001F7E1 BTC слабеет по факту ({m['btc_weak']}) — при корреляции {m['cor']*100:.0f}% риск потянуть альт вниз (реакция, не прогноз)")
+    cautions += portfolio_cautions(m)
 
     sc=_score(m,ex)
     head = "\U0001F7E2" if not cautions else "\U0001F7E1"
@@ -688,6 +850,23 @@ def card_long(m, ex):
     stop_lines.append(f"\U0001F6E1 <b>Умный стоп: под ${smart_stop:.5g}</b> (за кластером лонг-ликвидаций ${long_cluster:.5g}, риск ~{risk:.1f}%)")
     stop_lines.append("\u2022 <i>стоп ЗА кластером, а не внутри — чтобы не выбило на стоп-ханте перед разворотом</i>")
     stop_lines.append("<i>точных стопов публичный API не даёт \u2014 это оценка по уровням + типовому плечу (как CoinGlass)</i>")
+
+    # --- ЛЕСТНИЦА ТЕЙКОВ + сайзинг: раньше карточка давала риск, но не цель и не объём ---
+    tps=profit_targets(m["price"], risk_abs=(m["price"]-smart_stop), levels=m.get("levels"), old_high=m.get("old_high",m["price"]))
+    if tps:
+        stop_lines.append("")
+        stop_lines.append("\U0001F3AF <b>Ориентиры для тейков</b> (не команда \u2014 структура, не прогноз):")
+        for label,tp_price in tps:
+            stop_lines.append(f"\u2022 {label}: ${tp_price:.5g}")
+        stop_lines.append("<i>частичная фиксация на 1R снимает риск со стола раньше, чем решит рынок</i>")
+    risk_abs_val=m["price"]-smart_stop
+    if risk_abs_val>0:
+        ex_risk_usd=100
+        ex_size=ex_risk_usd/risk_abs_val
+        stop_lines.append("")
+        stop_lines.append(f"\U0001F9EE <b>Сайзинг (пример):</b> риск ${risk_abs_val:.5g} на монету до стопа \u2192 "
+            f"если готов потерять ${ex_risk_usd} на сделке, объём \u2248 {ex_size:.4g} {m['coin']} "
+            f"(масштабируй под свой депозит и % риска)")
 
     # --- MACD/ROC: вспомогательное подтверждение момента (НЕ сигнал, НЕ ворота) ---
     mh=m.get("macd_h",0); rc=m.get("roc",0)
@@ -776,7 +955,8 @@ def card_long(m, ex):
     lines.append("\U0001F4CD Где входить:")
     if m.get("extended"):
         lines.append(f"\u26A0\uFE0F цена на +{ext*100:.0f}% выше EMA21 \u2014 не гонись за свечой")
-    lines.append(f"\u2022 зона отката (лимитка): ${e21:.5g} (EMA21) \u2013 ${base:.5g} (база наторговки)")
+    _zlo,_zhi=min(e21,base),max(e21,base)
+    lines.append(f"\u2022 зона отката (лимитка): ${_zlo:.5g} \u2013 ${_zhi:.5g} (EMA21 ${e21:.5g}, база наторговки ${base:.5g})")
     hi_note = " \u2014 пробивается \U0001F680" if m["price"]>oh else " \u2014 цель"
     lines.append(f"\u2022 старый хай (уровень): ${oh:.5g}{hi_note}")
     lines.append("\u2022 выгоднее лимитка в зоне отката, чем по рынку на пике")
@@ -1045,6 +1225,27 @@ def log_signal(coin, sig_type, price):
     except Exception as e:
         print("log_signal:",e)
 
+def archive_snapshot(m, ex, passed, btc_price=None):
+    """Пишет одну строку метрик на КАЖДУЮ отсканированную монету (не только те, что
+    дали сигнал) — это собственный архив бота, который не зависит от того, сколько
+    дней/месяцев Bybit хранит историю OI в своём публичном REST. Через несколько
+    месяцев по HISTORY_FILE можно честно бэктестить и калибровать пороги фильтров,
+    а не только смотреть форвардную статистику по уже отправленным сигналам."""
+    try:
+        new=not os.path.exists(HISTORY_FILE)
+        with open(HISTORY_FILE,"a",newline="") as f:
+            w=csv.writer(f)
+            if new: w.writerow(["ts","coin","price","oi1","oi4","oi24","spike","spike_fast",
+                "rsi","atrr","cor","p4","turn","funding","spread","dd","uptrend","long_ok","btc_price"])
+            w.writerow([dt.datetime.now().isoformat(timespec="seconds"), m["coin"], f"{m['price']:.8g}",
+                f"{m.get('oi1',0):.5f}", f"{m['oi4']:.5f}", f"{m.get('oi24',0):.5f}",
+                f"{m['spike']:.3f}", f"{m.get('spike_fast',0):.3f}", f"{m['rsi']:.2f}",
+                f"{m.get('atrr',1):.3f}", f"{m['cor']:.3f}", f"{m['p4']:.5f}", f"{m['turn']:.0f}",
+                f"{ex.get('funding',0):.5f}", f"{ex.get('spread',0):.5f}", f"{m['dd']:.5f}",
+                int(bool(m['uptrend'])), int(bool(passed)), f"{btc_price:.6g}" if btc_price else ""])
+    except Exception as e:
+        print("archive_snapshot:",e)
+
 def btc_block_stats():
     """Форвардная проверка САМОГО рубильника: для каждой блокировки смотрим,
     что BTC сделал через 4ч/24ч после неё. Если после блокировок BTC в среднем
@@ -1164,6 +1365,84 @@ def compute_stats():
         "а не на голый win rate: обгонять 'просто держать биток' \u2014 вот реальная планка.")
     return "\n".join(out)
 
+def backtest_history(horizon_h=24, lookback_days=30, max_rows=400):
+    """Бэктест на СОБСТВЕННОМ архиве (HISTORY_FILE) — в отличие от compute_stats(),
+    которая мерит только уже ОТПРАВЛЕННЫЕ сигналы, здесь берётся ВЕСЬ отсканированный
+    универсум монет за период (long_ok=True И long_ok=False), и сравнивается: монеты,
+    которые фильтр бы пропустил, после этого идут лучше монет, которые он бы отсеял,
+    или нет? Это ближе к настоящему бэктесту, чем /stats — больше точек, меньше выживших.
+    ЧЕСТНО: работает только когда в HISTORY_FILE реально накопилась история (архив
+    пишется с момента добавления этой функции, задним числом данных нет и быть не
+    может). Тянет форвардные цены с Bybit по каждой строке — на больших архивах
+    выборка обрезается до max_rows случайных строк, чтобы не растягивать запрос
+    на часы и не колотить API почём зря."""
+    if not os.path.exists(HISTORY_FILE):
+        return "Архив (HISTORY_FILE) пуст \u2014 бэктестить пока нечего. Копится с момента " \
+               "последнего апдейта бота \u2014 дай ему поработать хотя бы пару недель."
+    now=dt.datetime.now(); cutoff=now-dt.timedelta(days=lookback_days)
+    rows=[]
+    try:
+        with open(HISTORY_FILE) as f:
+            for r in csv.DictReader(f):
+                try: ts=dt.datetime.fromisoformat(r["ts"])
+                except Exception: continue
+                if ts<cutoff: continue
+                if (now-ts).total_seconds()/3600 < horizon_h: continue
+                rows.append(r)
+    except Exception as e:
+        return f"Не удалось прочитать архив: {e}"
+    if not rows:
+        return (f"Пока нет строк архива старше {horizon_h}\u0447 (в пределах последних "
+                f"{lookback_days} дн.) \u2014 рано мерить, попробуй позже.")
+    sampled = random.sample(rows, max_rows) if len(rows)>max_rows else rows
+
+    groups={"1":[], "0":[]}
+    for r in sampled:
+        coin=r["coin"]; sym=coin if coin.endswith("USDT") else coin+"USDT"
+        try:
+            ts=dt.datetime.fromisoformat(r["ts"]); price0=float(r["price"])
+        except Exception: continue
+        target=ts+dt.timedelta(hours=horizon_h)
+        fwd=price_at_cached(sym, target)
+        if fwd is None: continue
+        move=fwd/price0-1
+        btc_edge=None
+        bp0=r.get("btc_price","")
+        if bp0:
+            btc_fwd=price_at_cached("BTCUSDT", target)
+            if btc_fwd:
+                try: btc_edge=move-(btc_fwd/float(bp0)-1)
+                except Exception: pass
+        key = "1" if r.get("long_ok")=="1" else "0"
+        groups[key].append((move,btc_edge))
+
+    def _summ(lst):
+        n=len(lst)
+        if n==0: return None,0
+        moves=[x[0] for x in lst]; edges=[x[1] for x in lst if x[1] is not None]
+        avg=sum(moves)/n; win=sum(1 for x in moves if x>0)
+        s=f"n={n}, средний ход {avg*100:+.2f}%, в плюсе {win}/{n} ({win/n*100:.0f}%)"
+        if edges: s+=f", edge vs BTC (n={len(edges)}): {sum(edges)/len(edges)*100:+.2f}%"
+        return s, avg
+
+    out=[f"\U0001F4CA БЭКТЕСТ на архиве, горизонт {horizon_h}\u0447, последние {lookback_days} дн.",
+         f"Строк в окне: {len(rows)}, взято в выборку: {len(sampled)}", ""]
+    s1,avg1=_summ(groups["1"]); s0,avg0=_summ(groups["0"])
+    out.append("long_ok=True (фильтр бы ПРОПУСТИЛ):"); out.append("  "+(s1 or "нет данных"))
+    out.append("long_ok=False (фильтр бы ОТСЕЯЛ):"); out.append("  "+(s0 or "нет данных"))
+    if s1 and s0:
+        out.append("")
+        verdict = ("\u2705 фильтр реально отбирает монеты, которые после этого идут лучше"
+            if avg1>avg0 else
+            "\u26A0\uFE0F по этой выборке разница НЕ в пользу фильтра \u2014 отсеянные монеты "
+            "в среднем показали не хуже (или лучше) пропущенных")
+        out.append(verdict)
+    if len(sampled)<50:
+        out.append("")
+        out.append("\u26A0\uFE0F n<50 \u2014 это НЕ \"плохой результат\", а просто рано мерить. "
+            "Смотри повторно через 2-4 недели, когда архив наберёт объём.")
+    return "\n".join(out)
+
 # ---------- сопровождение позиции ----------
 def position_status(coin):
     p=POSITIONS.get(coin)
@@ -1177,6 +1456,11 @@ def position_status(coin):
     oi1=oic[-1]/oic[-2]-1 if oic[-2]>0 else 0
     oi4=oic[-1]/oic[-5]-1 if oic[-5]>0 else 0
     e50=ema(closes,50)   # вся полученная история (до 80 баров), не только последние 60
+    r=rsi(closes,14)
+    risk0=p.get("risk0") or (p["entry"]*0.02)   # ATR-риск на входе, запасной вариант 2% от входа
+    r_mult=(price-p["entry"])/risk0 if risk0>0 else 0
+
+    # 1) РАЗВОРОТ — самый срочный сигнал, перекрывает всё остальное
     reasons=[]
     if oi1<=-0.03: reasons.append(f"OI резко вниз ({oi1*100:+.0f}% за 1ч) — деньги выходят")
     if price<e50: reasons.append("цена ушла ниже EMA50")
@@ -1186,6 +1470,31 @@ def position_status(coin):
             + "; ".join(reasons)+".\n"
             "Если на бирже стоит стоп — он сработает сам. Решение твоё.")
         return "reversal",msg
+
+    # 2) ПЕРЕГРЕВ — RSI на грани блоу-оффа, пока цена в плюсе: не разворот, но повод подумать
+    if r>=RSI_TAKE_PARTIAL and pnl>0:
+        msg=(f"\U0001F7E1 {coin}: RSI разогнался до {r:.0f} при прибыли {pnl*100:+.2f}%\n"
+            f"Не сигнал разворота, но классический повод зафиксировать ЧАСТЬ позиции или "
+            f"подтянуть стоп — от такого перегрева резкие откаты обычны.")
+        return "take_partial",msg
+
+    # 3) ТРЕЙЛИНГ — цена ушла в плюс минимум на 1R от риска на входе: есть что защищать
+    if r_mult>=TRAIL_TRIGGER_R:
+        msg=(f"\U0001F4C8 {coin}: в плюсе {pnl*100:+.2f}% (\u2248{r_mult:.1f}R от риска на входе)\n"
+            f"Момент подтянуть стоп хотя бы в безубыток — уже есть что защищать, "
+            f"а не только что терять.")
+        return "trail_stop",msg
+
+    # 4) ЗАСТОЙ — открыта давно, а по сути ничего не происходит
+    opened_h=0.0
+    try: opened_h=(dt.datetime.now()-dt.datetime.fromisoformat(p["ts"])).total_seconds()/3600
+    except Exception: pass
+    if opened_h>=STALL_HOURS and abs(pnl)<STALL_BAND:
+        msg=(f"\U0001F634 {coin}: открыта уже {opened_h:.0f}ч, P&L почти не сдвинулся ({pnl*100:+.2f}%)\n"
+            f"Не авария, но тезис явно не разворачивается быстро — стоит решить осознанно: "
+            f"держишь дальше или закрываешь и освобождаешь депозит под другое.")
+        return "stalled",msg
+
     msg=(f"\U0001F7E2 {coin}: держится\n"
         f"P&L: {pnl*100:+.2f}% (вход ${p['entry']:.5g} → ${price:.5g})\n"
         f"Деньги ещё заходят (OI 4ч {oi4*100:+.0f}%), цена выше EMA50. Моментум цел.")
@@ -1209,6 +1518,51 @@ def close_trade(coin):
         f.write(f"{p['ts']},{coin},{p['entry']:.6g},"
             f"{dt.datetime.now().isoformat(timespec='seconds')},{price:.6g},{pnl*100:.2f}\n")
     return pnl,p["entry"],price
+
+def daily_realized_pnl_pct():
+    """Сумма pnl_pct (в долях, не в %) по сделкам, ЗАКРЫТЫМ сегодня. None, если сделок не было."""
+    if not os.path.exists(TRADES): return None
+    today=dt.datetime.now().date()
+    total=0.0; n=0
+    try:
+        with open(TRADES) as f:
+            for r in csv.DictReader(f):
+                try:
+                    if dt.datetime.fromisoformat(r["exit_ts"]).date()!=today: continue
+                    total+=float(r["pnl_pct"])/100.0; n+=1
+                except Exception: continue
+    except Exception:
+        return None
+    return (total, n) if n else None
+
+def daily_breaker_tripped():
+    """Дневной лимит убытка — ЕДИНСТВЕННОЕ место, где новые сигналы реально приостанавливаются,
+    а не просто помечаются предупреждением. Существующие позиции продолжают вестись как обычно."""
+    res=daily_realized_pnl_pct()
+    if not res: return False, 0.0, 0
+    total, n = res
+    return total<=DAILY_LOSS_BREAKER, total, n
+
+def heartbeat_text():
+    n_pos=len(POSITIONS); n_watch=len(WATCH)+len(EARLY_WATCH)
+    res=daily_realized_pnl_pct()
+    day_txt = f"{res[0]*100:+.1f}% ({res[1]} сделок)" if res else "сделок сегодня не было"
+    return (f"\U0001FA76 Бот жив и сканирует. Открытых позиций: {n_pos}. На отслеживании: {n_watch}. "
+        f"Сегодня по журналу: {day_txt}.")
+
+def portfolio_cautions(m):
+    """Портфельные предупреждения для карточки сигнала. НИЧЕГО не блокирует — только
+    делает концентрацию риска видимой (единственный жёсткий стоп-кран — дневной лимит убытка)."""
+    warns=[]
+    n_open=len(POSITIONS)
+    if n_open>=MAX_CONCURRENT_POS:
+        warns.append(f"уже {n_open} открытых позиций — новая увеличивает общую экспозицию")
+    if m.get("cor",0)>=PORTFOLIO_HI_CORR:
+        hi_beta_open=sum(1 for p in POSITIONS.values() if (p.get("cor") or 0)>=PORTFOLIO_HI_CORR)
+        if hi_beta_open>0:
+            warns.append(f"ещё {hi_beta_open} откр. позиций тоже высоко коррелируют с BTC — "
+                f"реальная диверсификация портфеля ниже, чем кажется по числу монет")
+    return warns
 
 def enrich(sym):
     """Доп.данные с Bybit: funding. Ликвидаций в публичном REST нет — поле
@@ -1293,6 +1647,20 @@ def run_scan(cid, announce=False):
     # 1 признак — мягкое предупреждение в карточки коррелированных монет
     btc_weak = btc_reasons[0] if btc_hits==1 else None
 
+    # ДНЕВНОЙ ЛИМИТ УБЫТКА — второй, независимый рубильник (по факту твоих сделок, не рынка)
+    global LAST_BREAKER_WARN
+    tripped, day_pnl, day_n = daily_breaker_tripped()
+    if tripped:
+        msg=(f"\U0001F6D1 <b>Сигналы приостановлены: дневной лимит убытка достигнут</b>\n\n"
+             f"Сегодня закрыто {day_n} сделок, суммарно {day_pnl*100:+.1f}% "
+             f"(порог {DAILY_LOSS_BREAKER*100:.0f}%).\n\n"
+             f"<i>Открытые позиции по-прежнему отслеживаются как обычно — на паузе только новые "
+             f"сигналы. Возобновится завтра. Это не прогноз рынка — просто пауза после тяжёлого дня, "
+             f"чтобы не тянуть за собой серию через усталость/тильт.</i>")
+        if announce or time.time()-LAST_BREAKER_WARN>30*60:
+            tg_send(cid,msg); LAST_BREAKER_WARN=time.time()
+        return
+
     shown=0
     now=time.time()
     for coin,sym in coins:
@@ -1331,6 +1699,7 @@ def run_scan(cid, announce=False):
         m["ls_ratio"]=long_short_ratio(sym); time.sleep(0.1)
         by=bybit_price(coin)
         if by: m["bybit"]=by
+        archive_snapshot(m, ex, long_ok(m), btc_price=(btc[-1] if btc else None))
 
         # === СТАДИЯ 1: РАННЕЕ ОБНАРУЖЕНИЕ НА 15м (движение началось, час подтвердит позже) ===
         if EARLY15_ENABLED and c15 and v15:
@@ -1421,8 +1790,12 @@ def run_scan(cid, announce=False):
             m["watching"]=(top*0.985, top*1.004)
             m["watch_kind"]="крышке треугольника"
         else:
-            zone_hi=m.get("e21",m["price"]); zone_lo=m.get("consol_base",m["price"])
-            if m.get("extended") and zone_hi>0:
+            base_hi=m.get("e21",m["price"]); base_lo=m.get("consol_base",m["price"])
+            zone_hi=max(base_hi,base_lo); zone_lo=min(base_hi,base_lo)  # e21 и consol_base
+            # не гарантированно упорядочены между собой — без max/min зона иногда выходит
+            # "перевёрнутой" (особенно у extended-сигналов, где EMA21 может лежать ниже
+            # недавнего минимума), и ретест по факту никогда не совпадает с тем, что показано
+            if zone_hi>0 and zone_lo>0 and zone_hi>zone_lo:
                 WATCH[m["coin"]]=dict(sym=sym, zone_hi=zone_hi, zone_lo=zone_lo,
                     ts=time.time(), price0=m["price"], kind="откат к зоне")
                 m["watching"]=(zone_lo,zone_hi)
@@ -1542,14 +1915,129 @@ def check_watchlist(chat):
                 buttons=[[{"text":"\u2705 Я вошёл","callback_data":f"enter|{coin}|{c:.6g}"}]])
             del WATCH[coin]
 
+def check_tri_alert(chat):
+    """Проверяет монеты из TRI_ALERT (треугольник в стадии 'ready') на реальный пробой
+    крышки. Это и есть тот самый "бот сам предупредит отдельным сообщением", который
+    card_triangle обещает пользователю в стадии ready — раньше TRI_ALERT только
+    заполнялся при постановке на ожидание, но НИКОГДА не проверялся: обещание было
+    пустым, и пробой без нового полного лонг-сигнала на той же монете прошёл бы мимо."""
+    if not chat or not TRI_ALERT: return
+    now=time.time()
+    for coin in list(TRI_ALERT):
+        w=TRI_ALERT[coin]
+        if now-w["ts"]>TRI_ALERT_HOURS*3600:
+            del TRI_ALERT[coin]; continue
+        try:
+            res=bget("/v5/market/kline", {"category":"linear","symbol":w["sym"],"interval":"60","limit":2})
+            k=res["list"]; time.sleep(0.15)
+        except Exception:
+            continue
+        if len(k)<1: continue
+        last_closed=k[1] if len(k)>1 else k[0]   # k[0]=текущая незакрытая, k[1]=последняя закрытая
+        close_price=float(last_closed[4])
+        if close_price>w["top"]:
+            del TRI_ALERT[coin]
+            tg_send(chat,
+                f"\U0001F680 {coin}: ПРОБОЙ крышки треугольника ${w['top']:.5g}!\n"
+                f"Часовая свеча закрылась выше на ${close_price:.5g}.\n"
+                f"\u26A0\uFE0F Бывают ложные пробои (снятие стопов) \u2014 подтверждение: удержание "
+                f"выше уровня или ретест крышки сверху. Стоп на Bybit обязателен.",
+                buttons=[[{"text":"\u2705 Я вошёл","callback_data":f"enter|{coin}|{close_price:.6g}"}]])
+
 # ---------- чат ----------
 def ensure_dirs():
     """Создаёт директории для журналов, если их нет (нужно для volume /data)."""
-    for path in (TRADES, SIGNALS_FILE, CHAT_FILE, BLOCKS_FILE):
+    for path in (TRADES, SIGNALS_FILE, CHAT_FILE, BLOCKS_FILE, HISTORY_FILE):
         d=os.path.dirname(path)
         if d and not os.path.exists(d):
             try: os.makedirs(d, exist_ok=True)
             except Exception as e: print("mkdir",d,e)
+
+# ---------- ПЕРСИСТЕНТНОЕ СОСТОЯНИЕ (переживает рестарт/передеплой) ----------
+# POSITIONS/WATCH/EARLY_WATCH/кулдауны раньше жили ТОЛЬКО в памяти процесса — любой
+# рестарт (деплой, падение, апдейт хостинга) молча стирал открытые позиции и все
+# отслеживания, а кулдауны обнулялись (риск задвоенного алерта сразу после рестарта).
+# Для алерт-бота это неприятно; для чего-то похожего на автотрейдера в будущем —
+# недопустимо: забыть о позиции после рестарта значит оставить реальные деньги без
+# присмотра. Ниже — простая sqlite-персистентность без новых зависимостей (sqlite3 —
+# стандартная библиотека Python).
+STATE_BUCKETS = {
+    "positions": POSITIONS, "watch": WATCH, "early_watch": EARLY_WATCH, "tri_alert": TRI_ALERT,
+    "last_alert": LAST_ALERT, "last_early": LAST_EARLY, "last_early15": LAST_EARLY15,
+    "last_reversal": LAST_REVERSAL, "recent_losses": RECENT_LOSSES,
+}
+
+def db_init():
+    d=os.path.dirname(STATE_DB)
+    if d and not os.path.exists(d):
+        try: os.makedirs(d, exist_ok=True)
+        except Exception as e: print("db_init mkdir:",e); return False
+    try:
+        con=sqlite3.connect(STATE_DB)
+        con.execute("CREATE TABLE IF NOT EXISTS state (bucket TEXT, key TEXT, value TEXT, PRIMARY KEY(bucket,key))")
+        con.commit(); con.close()
+        return True
+    except Exception as e:
+        print("db_init:",e); return False
+
+def flush_state():
+    """Полностью перезаписывает sqlite текущим содержимым словарей состояния в памяти.
+    Вызывается периодически из main() и сразу после входа/выхода из позиции."""
+    try:
+        con=sqlite3.connect(STATE_DB)
+        for bucket, d in STATE_BUCKETS.items():
+            con.execute("DELETE FROM state WHERE bucket=?", (bucket,))
+            if d:
+                con.executemany("INSERT INTO state(bucket,key,value) VALUES (?,?,?)",
+                    [(bucket, str(k), json.dumps(v, default=str)) for k,v in d.items()])
+        con.commit(); con.close()
+    except Exception as e:
+        print("flush_state:",e)
+
+def load_state():
+    """Восстанавливает словари состояния из sqlite при старте — вызвать один раз в начале main()."""
+    try:
+        con=sqlite3.connect(STATE_DB)
+        for bucket, d in STATE_BUCKETS.items():
+            rows=con.execute("SELECT key,value FROM state WHERE bucket=?", (bucket,)).fetchall()
+            d.clear()
+            for k,v in rows:
+                try: d[k]=json.loads(v)
+                except Exception: pass
+        con.close()
+        got={k:len(v) for k,v in STATE_BUCKETS.items() if v}
+        if got: print(f"[state] восстановлено из {STATE_DB}: "+", ".join(f"{k}={n}" for k,n in got.items()))
+    except Exception as e:
+        print("load_state:",e)
+
+def startup_selfcheck():
+    """Реальная проверка persistence при каждом старте: пишет метку в sqlite, читает её
+    ОБРАТНО новым соединением, удаляет за собой. Раньше для этого нужно было руками
+    SSH-иться в контейнер и гонять отдельный скрипт — теперь бот проверяет себя сам на
+    каждом деплое и говорит результат в лог + в Telegram (если чат уже известен)."""
+    ok=db_init(); detail=""
+    if ok:
+        try:
+            con=sqlite3.connect(STATE_DB)
+            con.execute("DELETE FROM state WHERE bucket='__selfcheck__'")
+            con.execute("INSERT INTO state(bucket,key,value) VALUES ('__selfcheck__','ping','1')")
+            con.commit(); con.close()
+            con=sqlite3.connect(STATE_DB)
+            row=con.execute("SELECT value FROM state WHERE bucket='__selfcheck__' AND key='ping'").fetchone()
+            con.execute("DELETE FROM state WHERE bucket='__selfcheck__'"); con.commit(); con.close()
+            ok=bool(row and row[0]=="1")
+        except Exception as e:
+            ok=False; detail=str(e)
+    d=os.path.dirname(STATE_DB) or "."
+    if ok:
+        msg=f"\u2705 Персистентность ОК: {d} доступен для записи, состояние переживёт рестарт."
+    else:
+        msg=(f"\u26A0\uFE0F ПЕРСИСТЕНТНОСТЬ НЕ РАБОТАЕТ: {d} недоступен для записи"
+             f"{f' ({detail})' if detail else ''}. Открытые позиции, вотчи и кулдауны "
+             f"НЕ переживут следующий рестарт. Проверь, что volume в Railway реально "
+             f"примонтирован на {d}.")
+    print(f"[selfcheck] {msg}")
+    return ok, msg
 
 def save_chat(c):
     try:
@@ -1569,8 +2057,16 @@ def handle_callback(q):
     if parts[0]=="enter" and len(parts)>=3:
         coin=parts[1]; price=float(parts[2]); sym=SYM_CACHE.get(coin)
         if not sym: tg_send(cid,f"Не могу найти {coin} для ведения. Сделай /scan заново."); return
+        cor_val=None; risk0=None
+        try:
+            c_c,h_c,l_c,_=klines(sym,limit=40); c_b,_,_,_=klines("BTCUSDT",limit=40)
+            cor_val=corr(c_b,c_c)
+            atr_val=atr(h_c,l_c,c_c,period=14)
+            risk0=atr_val*1.5 if atr_val>0 else price*0.02  # запасной вариант: 2% от цены
+        except Exception: pass
         POSITIONS[coin]=dict(entry=price,ts=dt.datetime.now().isoformat(timespec="seconds"),
-            sym=sym,last_upd=0,last_check=0,last_state="ok")
+            sym=sym,last_upd=0,last_check=0,last_state="ok",cor=cor_val,risk0=risk0)
+        flush_state()
         tg_send(cid,f"\u2705 Веду позицию {coin} от ${price:.5g}.\n"
             f"Проверяю каждые {CHECK_POS_MIN} мин. Молчу, пока всё ок — крикну ‼️ при развороте.\n\n"
             f"\u26A0\uFE0F Сразу выстави стоп-ордер на Bybit — это твоя мгновенная защита. "
@@ -1579,6 +2075,7 @@ def handle_callback(q):
     elif parts[0]=="exit" and len(parts)>=2:
         coin=parts[1]; res=close_trade(coin)
         if not res: tg_send(cid,f"Позиции по {coin} нет."); return
+        flush_state()
         pnl,e,x=res
         emo="\U0001F7E2" if pnl>=0 else "\U0001F534"
         tg_send(cid,f"{emo} Сделка по {coin} закрыта.\n"
@@ -1590,10 +2087,15 @@ def main():
     TG_TOKEN=os.environ.get("TG_TOKEN","").strip() or input("Токен бота: ").strip()
     if len(TG_TOKEN)<20: print("Нет валидного TG_TOKEN."); return
     ensure_dirs()
+    db_init(); load_state()
     me=tg("getMe")
     if not me.get("ok"): print("Не подключиться — проверь TG_TOKEN."); return
     print(f"Бот @{me['result']['username']} запущен (server mode).")
     offset=None; last_scan=0; chat=load_chat()
+    _ok,_selfmsg=startup_selfcheck()
+    if chat:
+        try: tg_send(chat, _selfmsg)
+        except Exception as e: print("selfcheck tg_send:",e)
     while True:
         try:
             for u in tg("getUpdates",offset=offset,timeout=30).get("result",[]):
@@ -1606,7 +2108,8 @@ def main():
                     chat=cid; save_chat(cid)
                     tg_send(cid,"\u2705 Сканер на сервере, работает 24/7.\n"
                         "/scan — искать лонг-сетапы\n/pos — мои позиции\n/watch — кого отслеживаю\n"
-                        "/log — журнал сделок\n/stats — статистика по сигналам\n/bybit — проверка доступа к Bybit\n\n"
+                        "/log — журнал сделок\n/stats — статистика по сигналам\n"
+                        "/backtest [ч] [дн] — бэктест на архиве (по умолч. 24ч/30дн)\n/bybit — проверка доступа к Bybit\n\n"
                         "Подсвечу сетап → нажмёшь «Я вошёл» → буду вести позицию и комментировать. Решаешь ты.")
                 elif text.startswith("/scan"): run_scan(cid, announce=True)
                 elif text.startswith("/pos"):
@@ -1616,6 +2119,15 @@ def main():
                     tg_send(cid, btc_block_stats())
                 elif text.startswith("/stats"):
                     tg_send(cid, compute_stats())
+                elif text.startswith("/backtest"):
+                    parts_bt=text.split()
+                    try: h_bt=int(parts_bt[1]) if len(parts_bt)>1 else 24
+                    except Exception: h_bt=24
+                    try: d_bt=int(parts_bt[2]) if len(parts_bt)>2 else 30
+                    except Exception: d_bt=30
+                    tg_send(cid, f"\U0001F50D Считаю бэктест (горизонт {h_bt}ч, {d_bt} дн.) \u2014 "
+                        f"тянет форвардные цены с Bybit, может занять минуту-другую...")
+                    tg_send(cid, backtest_history(horizon_h=h_bt, lookback_days=d_bt))
                 elif text.startswith("/bybit"):
                     try:
                         r=requests.get("https://api.bybit.com/v5/market/tickers",
@@ -1661,6 +2173,16 @@ def main():
                 globals()['_last_watch']=time.time()
                 try: check_watchlist(chat)
                 except Exception as e: print('watch:',e)
+                try: check_tri_alert(chat)
+                except Exception as e: print('tri_alert:',e)
+
+            if time.time()-globals().get('_last_flush',0) > STATE_FLUSH_SEC:
+                globals()['_last_flush']=time.time()
+                flush_state()
+            if chat and time.time()-globals().get('_last_heartbeat',0) > HEARTBEAT_EVERY_H*3600:
+                globals()['_last_heartbeat']=time.time()
+                try: tg_send(chat, heartbeat_text())
+                except Exception as e: print('heartbeat:',e)
 
             for coin in list(POSITIONS):
                 p=POSITIONS[coin]; now=time.time()
@@ -1668,14 +2190,19 @@ def main():
                 p["last_check"]=now
                 state,m=position_status(coin)
                 if not state: continue
-                if state=="reversal" and p.get("last_state")!="reversal":
+                if state in ("reversal","take_partial","trail_stop","stalled") and p.get("last_state")!=state:
                     tg_send(chat,m,buttons=pos_buttons(coin)); p["last_upd"]=now
                 elif state=="ok" and now-p.get("last_upd",0)>CALM_UPDATE_MIN*60:
                     tg_send(chat,m,buttons=pos_buttons(coin)); p["last_upd"]=now
                 p["last_state"]=state
             time.sleep(1)
         except Exception as e:
-            print("loop:",e); time.sleep(10)
+            print("loop:",e)
+            if chat and time.time()-globals().get('_last_crash_warn',0)>600:
+                globals()['_last_crash_warn']=time.time()
+                try: tg_send(chat, f"\u26A0\uFE0F Сбой в главном цикле: {type(e).__name__}: {e}. Продолжаю пытаться, слежу дальше.")
+                except Exception: pass
+            time.sleep(10)
 
 if __name__=="__main__":
     main()
