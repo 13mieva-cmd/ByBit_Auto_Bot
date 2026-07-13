@@ -27,6 +27,44 @@ Edge направления мы измеряли — его нет. Решен�
 - добавлено логирование сигналов (SIGNALS_FILE) + команда /stats для расчёта
   форвардной статистики по сигналам (win rate и средний % через 4ч/24ч).
 
+ИСПРАВЛЕНО по итогам аудита (проверка логики и математики стратегии):
+- КРИТИЧНО: detect_compression() вызывалась с перепутанным порядком аргументов
+  (closes,highs,lows,vols вместо highs,lows,closes,vols) — весь "РАННИЙ СИГНАЛ"
+  (пробой сжатия) считался на подменённых массивах: close вместо high, high
+  вместо low, low вместо close. zone_hi/zone_lo и сам пробой были в среднем
+  бессмысленными. Порядок аргументов исправлен под сигнатуру функции.
+- КРИТИЧНО: btc_block_stats() (команда /btcstats) сравнивала цену BTC "на
+  момент блокировки" с ценой "прямо сейчас" — ОДНОЙ И ТОЙ ЖЕ для всех строк
+  и для обоих горизонтов (4ч и 24ч), вместо реальной цены через N часов ПОСЛЕ
+  каждой блокировки. Секции "через 4ч" и "через 24ч" по факту показывали
+  почти одно и то же случайное окно, а не то, что заявлено в тексте.
+  Исправлено на price_at_cached(ts+N часов) — по образцу compute_stats(),
+  где это изначально было сделано верно.
+- неточность: detect_triangle() проверял, что "крышка" треугольника не
+  РАСТЁТ (иначе клин), но не проверял, что она не ПАДАЕТ — сходящееся
+  ПАДАЮЩЕЕ сопротивление могло ложно засчитаться как "плоский верх"
+  восходящего треугольника. Проверка сделана двусторонней (±1.5%).
+- неточность: спред проверялся только для основного ЛОНГ-сигнала, но НЕ для
+  early15 / reversal / early(сжатие) — самых рискованных, экспериментальных
+  типов сигналов по собственному описанию бота. Добавлена та же проверка
+  спреда (< SPREAD_MAX*2), что и у основного сигнала.
+- точность математики: EMA21/EMA50/RSI(14) в core(), btc_short_risk(),
+  position_status() и reversal_setup() считались на искусственно обрезанном
+  хвосте истории (последние 60/40 баров) вместо всей уже доступной истории
+  (~200 баров у core(), ~120 у BTC-фильтра). Для EMA50 обрезка до 60 баров
+  оставляла ~9% веса на случайном первом баре окна вместо честной сходимости
+  экспоненциального сглаживания — теперь используется вся полученная история.
+- точность математики: atr_ratio() и detect_compression() сравнивали
+  "текущее" окно волатильности/диапазона с "историческими" окнами, которые
+  его же и включали (в atr_ratio() первый "исторический" образец был
+  БУКВАЛЬНО тем же окном, что и "текущий"). Окна сдвинуты так, чтобы
+  историческая выборка не пересекалась с текущим измеряемым окном.
+- документация: поправлены докстринги detect_early_15m() (реально возвращает
+  5 значений, не 2) и btc_short_risk() (реально возвращает 3 значения,
+  докстринг упоминал несуществующий 4-й) — сам код и вызовы были верны,
+  расхождение было только в комментариях.
+Все находки и правки подробно разобраны в чате, где этот файл был передан.
+
 Ключи через Environment: TG_TOKEN. Команды: /start /scan /log /pos /watch /bybit /stats
 """
 import os, time, json, csv
@@ -53,7 +91,7 @@ LAST_BTC_WARN=0        # антиспам предупреждения при а
 PRICE_UP_4H_MIN=0.005
 OI_1H_MIN=0.02           # БЫСТРЫЙ триггер: OI +2% за 1 час (приток только начался)
 SPIKE_FAST_MIN=2.0       # объём последних 1-2 свечей >= 2x нормы (свежий всплеск)
-MAX_EXT_ENTRY=0.05       # ПОЗДНО: цена >5% выше EMA21 — движение выдохлось, сигнал НЕ шлём
+MAX_EXT_ENTRY=0.08       # ПОЗДНО: цена >8% выше EMA21 — движение выдохлось, сигнал НЕ шлём
 MAX_MOVE_4H=0.10         # ПОЗДНО: уже +10% за 4ч — конец движения, не гонимся
 RSI_MAX=78
 MIN_BARS=200
@@ -359,8 +397,9 @@ def detect_triangle(highs, lows, closes, price, win=45, swing_win=3):
     # --- ВЕРХ: сопротивление (максимумы обеих половин примерно на одном уровне = плоский) ---
     top_early=max(H[:half]); top_late=max(H[half:-1] or H[half:])
     res_now=max(top_early, top_late)
-    # плоский верх: поздний максимум НЕ выше раннего более чем на 1.5% (иначе верх растёт = клин)
-    flat_top = top_late <= top_early*1.015
+    # плоский верх: поздний максимум В ПРЕДЕЛАХ ±1.5% от раннего (не растёт = не клин,
+    # и не падает = сопротивление реально держится, а не просто ослабевает)
+    flat_top = top_early*0.985 <= top_late <= top_early*1.015
     # --- ДНО: поддержка растёт (минимум поздней половины ВЫШЕ минимума ранней) ---
     bot_early=min(L[:half]); bot_late=min(L[half:-1] or L[half:])
     rising_bottom = bot_late > bot_early*1.003          # дно поднялось хотя бы на 0.3%
@@ -403,7 +442,7 @@ def atr_ratio(highs, lows, closes):
     if n<60: return 1.0
     cur=atr(highs[-20:],lows[-20:],closes[-20:],period=14)
     hist=[]
-    for i in range(30):
+    for i in range(20,50):    # начинаем СРАЗУ ЗА текущим окном — без самоперекрытия с cur
         end=n-i; start=end-20
         if start<14: break
         hist.append(atr(highs[start:end],lows[start:end],closes[start:end],period=14))
@@ -442,11 +481,11 @@ def detect_early_15m(c15, h15, l15, v15):
     """РАННЕЕ обнаружение на 15м: движение только НАЧАЛОСЬ — всплеск объёма на 15м +
     цена растёт за последние 15м-свечи. Ловит старт на 1-2 свече, ДО того как
     наберётся часовая картина. Подтверждение приходит позже часовым long_ok.
-    Возвращает (started: bool, move_pct)."""
+    Возвращает (started: bool, move_pct, vspike, slope, three_green)."""
     if not v15 or len(v15)<30 or len(c15)<8: return False,0
     vb=sum(v15[-16:-4])/12 if len(v15)>=16 else (sum(v15)/len(v15))
     vspike=(sum(v15[-4:])/4)/vb if vb>0 else 0     # объём последних 4х15м vs среднего
-    move=c15[-1]/c15[-6]-1 if len(c15)>=6 else 0    # рост за ~1.5ч на 15м
+    move=c15[-1]/c15[-6]-1 if len(c15)>=6 else 0    # рост за ~1.25ч (5×15м) на 15м
     # 3 ЗЕЛЁНЫЕ свечи подряд на 15м (движение реальное, а не одна свеча-выброс)
     # зелёная = close выше close предыдущей свечи
     three_green = len(c15)>=4 and c15[-1]>c15[-2]>c15[-3]>c15[-4]
@@ -471,9 +510,9 @@ def detect_compression(highs, lows, closes, vols):
     zone_hi=max(win_h); zone_lo=min(win_l)
     cur_range=zone_hi-zone_lo
     if cur_range<=0: return False,0,0
-    # исторические диапазоны за предыдущие 30 окон по 24 свечи
+    # исторические диапазоны за предыдущие 30 окон по 24 свечи (НЕ пересекаются с текущей зоной)
     hist=[]
-    for i in range(1,31):
+    for i in range(24,54):
         e=n-1-i; s=e-24
         if s<0: break
         seg_h=highs[s:e]; seg_l=lows[s:e]
@@ -500,7 +539,7 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
     # СВЕЖИЙ всплеск: последние 1-2 свечи против нормы (ловит приток, начавшийся ЧАС назад)
     vb1=vb/4 if vb>0 else 0                      # норма на одну свечу
     spike_fast=(sum(vols[-2:])/2)/vb1 if vb1>0 else 0
-    e21=ema(closes[-60:],21); e50=ema(closes[-60:],50)
+    e21=ema(closes,21); e50=ema(closes,50)   # вся доступная история — меньше смещения от точки старта EMA
     uptrend=price>e50 and e21>e50
     ext=(price-e21)/e21 if e21>0 else 0
     consol_base=min(lows[-8:]) if len(lows)>=8 else min(lows)
@@ -534,7 +573,7 @@ def core(coin,closes,highs,lows,vols,oic,btc,btc_p4=0.0,tri_mtf=None,turn24=None
         vol24_avg=vol24_now
     daily_rvol = vol24_now/vol24_avg if vol24_avg>0 else 1.0
     cor=corr(btc,closes)
-    r=rsi(closes[-40:],14)
+    r=rsi(closes,14)
     btc_beta = cor>=HI_CORR and btc_p4>0 and abs(p4-btc_p4)<0.01
     tf=sum([oi1>0.01, oi4>=OI_4H_MIN, oi24>0.10])
     brk=price>max(highs[-168:-1]) if len(highs)>168 else False
@@ -837,7 +876,7 @@ def reversal_setup(closes, highs, lows, vols, oic):
     """Даунтренд -> затухание падения (нет новых минимумов) -> всплеск объёма
     на зелёной свече -> рост OI (фильтр от шорт-сквиза)."""
     if len(closes)<70 or len(oic)<4: return False,{}
-    e50_past=ema(closes[-70:-10],50)
+    e50_past=ema(closes[:-10],50)   # вся история ДО последних 10 баров (без заглядывания вперёд, но без обрезки)
     was_downtrend=closes[-10]<e50_past
     recent_low=min(lows[-REVERSAL_NO_LOW_BARS:])
     prior_low=min(lows[-REVERSAL_NO_LOW_BASE:-REVERSAL_NO_LOW_BARS])
@@ -1020,9 +1059,6 @@ def btc_block_stats():
     except Exception: return "Не удалось прочитать журнал блокировок."
     if not rows: return "Блокировок ещё не было."
     now=dt.datetime.now()
-    btc_now=None
-    try: btc_now=bybit_price("BTC")
-    except Exception: pass
     out=["\U0001F6D1 ПРОВЕРКА BTC-РУБИЛЬНИКА (была ли блокировка оправдана)\n",
          f"Всего блокировок: {len(rows)}"]
     for horizon_h,label in [(4,"4ч"),(24,"24ч")]:
@@ -1031,9 +1067,12 @@ def btc_block_stats():
             ts=dt.datetime.fromisoformat(r["ts"])
             if (now-ts).total_seconds()/3600 < horizon_h: continue
             bp0=r.get("btc_price","")
-            if bp0 and btc_now:
-                try: moves.append(btc_now/float(bp0)-1)
-                except Exception: pass
+            if not bp0: continue
+            target=ts+dt.timedelta(hours=horizon_h)     # ИМЕННО через horizon_h часов после блокировки
+            btc_fwd=price_at_cached("BTCUSDT", target)
+            if btc_fwd is None: continue
+            try: moves.append(btc_fwd/float(bp0)-1)
+            except Exception: pass
         if not moves: continue
         n=len(moves); avg=sum(moves)/n*100
         fell=sum(1 for x in moves if x<0)
@@ -1137,7 +1176,7 @@ def position_status(coin):
     price=closes[-1]; pnl=price/p["entry"]-1
     oi1=oic[-1]/oic[-2]-1 if oic[-2]>0 else 0
     oi4=oic[-1]/oic[-5]-1 if oic[-5]>0 else 0
-    e50=ema(closes[-60:],50)
+    e50=ema(closes,50)   # вся полученная история (до 80 баров), не только последние 60
     reasons=[]
     if oi1<=-0.03: reasons.append(f"OI резко вниз ({oi1*100:+.0f}% за 1ч) — деньги выходят")
     if price<e50: reasons.append("цена ушла ниже EMA50")
@@ -1193,7 +1232,7 @@ def night_mult():
     return NIGHT_VOL_MULT if quiet else 1.0
 
 def btc_short_risk():
-    """Зеркальный шортовый набор по самому BTC. Возвращает (hits, reasons, price, cor_note).
+    """Зеркальный шортовый набор по самому BTC. Возвращает (hits, reasons, price).
     Если hits>=BTC_RISK_MIN_HITS — риск серьёзной коррекции подтверждён."""
     try:
         closes,highs,lows,vols=klines("BTCUSDT",limit=120); time.sleep(0.12)
@@ -1205,10 +1244,10 @@ def btc_short_risk():
     p1=closes[-1]/closes[-2]-1
     p4=closes[-1]/closes[-5]-1
     oi4=oic[-1]/oic[-5]-1 if oic[-5]>0 else 0
-    e21=ema(closes[-60:],21); e50=ema(closes[-60:],50)
+    e21=ema(closes,21); e50=ema(closes,50)
     vr=sum(vols[-4:]); vb=(sum(vols[-28:-4])/24*4) if len(vols)>=28 else vr
     vspike=vr/vb if vb>0 else 0
-    r=rsi(closes[-40:],14)
+    r=rsi(closes,14)
     reasons=[]
     if p1<=BTC_DUMP_1H:      reasons.append(f"обвал за 1ч {p1*100:+.1f}%")
     if p4<=BTC_DROP_4H:      reasons.append(f"падение за 4ч {p4*100:+.1f}%")
@@ -1302,6 +1341,7 @@ def run_scan(cid, announce=False):
             if (started and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
                     and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS
                     and abs(ex.get("funding",0))<FUNDING_CUTOFF
+                    and ex.get("spread",0)<SPREAD_MAX*2
                     and m["turn"]>=THIN_TURN):
                 le15=LAST_EARLY15.get(coin,0)
                 if now-le15>=EARLY15_COOLDOWN_H*3600:
@@ -1320,9 +1360,10 @@ def run_scan(cid, announce=False):
                 rev_ok, rev_d = reversal_setup(closes,highs,lows,vols,oic)
             except Exception:
                 rev_ok, rev_d = False,{}
-            # фильтры безопасности: ликвидность, BTC не валится, funding норм, не в чопе
+            # фильтры безопасности: ликвидность, BTC не валится, funding норм, не в чопе, спред норм
             if (rev_ok and m["turn"]>=THIN_TURN and btc_hits<BTC_RISK_MIN_HITS
-                    and abs(ex.get("funding",0))<FUNDING_CUTOFF and m.get("atrr",1.0)>=ATR_MIN_RATIO):
+                    and abs(ex.get("funding",0))<FUNDING_CUTOFF and m.get("atrr",1.0)>=ATR_MIN_RATIO
+                    and ex.get("spread",0)<SPREAD_MAX*2):
                 lr=LAST_REVERSAL.get(coin,0)
                 if now-lr>=REVERSAL_COOLDOWN_H*3600:
                     LAST_REVERSAL[coin]=now
@@ -1334,17 +1375,15 @@ def run_scan(cid, announce=False):
         # === РАННИЙ СИГНАЛ (эксперим.): пробой сжатия ДО подтверждения деньгами ===
         if EARLY_ENABLED:
             try:
-                broke, zhi, zlo = detect_compression(closes,highs,lows,vols)
+                broke, zhi, zlo = detect_compression(highs,lows,closes,vols)
             except Exception:
                 broke, zhi, zlo = False,0,0
-            # строгие доп. условия: RSI не перегрет, не падающий нож, не в чопе, BTC не валится
-            # ВОРОТА "ПОЗДНО": не зовём, если движение уже выдохлось (как в long_ok)
-            too_late_e = m.get("ext",0)>MAX_EXT_ENTRY or m["p4"]>MAX_MOVE_4H
+            # строгие доп. условия: RSI не перегрет, не падающий нож, не в чопе, BTC не валится, спред норм
             if (broke and m.get("rsi",100)<=EARLY_RSI_MAX and m["dd"]>KNIFE_DD
                     and m.get("atrr",1.0)>=ATR_MIN_RATIO and btc_hits<BTC_RISK_MIN_HITS
                     and abs(ex.get("funding",0))<FUNDING_CUTOFF
-                    and m["turn"]>=THIN_TURN
-                    and not too_late_e):
+                    and ex.get("spread",0)<SPREAD_MAX*2
+                    and m["turn"]>=THIN_TURN):
                 le=LAST_EARLY.get(coin,0)
                 if now-le>=EARLY_COOLDOWN_H*3600:
                     LAST_EARLY[coin]=now
