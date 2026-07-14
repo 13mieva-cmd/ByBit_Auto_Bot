@@ -1,11 +1,14 @@
 """
 inflow_scanner_v4_full.py
 
-EvA Bot - Long-only breakout/retest Telegram trading bot.
+EvA Bot - Long-only breakout/retest Telegram trading bot (MULTI-SYMBOL).
 
 Data: Binance Futures (volume, klines, CVD proxy, OI)
 Execution: Bybit v5 (orders, TP/SL, native trailing stop)
 Interface: Telegram via Aiogram 3
+
+Symbol universe: auto-refreshed list of all Binance USDT-M perpetual futures
+with 24h quote volume > MIN_24H_VOLUME_USD (default 5,000,000 USDT).
 
 Deploy on Railway:
 - Set env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BYBIT_API_KEY, BYBIT_API_SECRET
@@ -37,15 +40,16 @@ TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 BYBIT_API_KEY = os.environ["BYBIT_API_KEY"]
 BYBIT_API_SECRET = os.environ["BYBIT_API_SECRET"]
 
-SYMBOL_BINANCE = os.environ.get("SYMBOL_BINANCE", "BTC/USDT")
-SYMBOL_RAW = SYMBOL_BINANCE.replace("/", "")
-SYMBOL_BYBIT = os.environ.get("SYMBOL_BYBIT", "BTCUSDT")
 TIMEFRAME = os.environ.get("TIMEFRAME", "15m")
 MARGIN_USD = float(os.environ.get("MARGIN_USD", 50))
 LEVERAGE = float(os.environ.get("LEVERAGE", 10))
 MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 2))
 MAX_SIMULTANEOUS_TRADES = int(os.environ.get("MAX_SIMULTANEOUS_TRADES", 1))
 TRAIL_CALLBACK_PCT = float(os.environ.get("TRAIL_CALLBACK_PCT", 0.4))
+MIN_24H_VOLUME_USD = float(os.environ.get("MIN_24H_VOLUME_USD", 5_000_000))
+SYMBOL_REFRESH_MINUTES = int(os.environ.get("SYMBOL_REFRESH_MINUTES", 60))
+MAX_SYMBOLS_PER_SCAN = int(os.environ.get("MAX_SYMBOLS_PER_SCAN", 300))
+REQUEST_DELAY_SEC = float(os.environ.get("REQUEST_DELAY_SEC", 0.15))
 
 VOL_MA_LEN, VOL_MULT = 20, 2.0
 EMA_FAST, EMA_SLOW = 21, 50
@@ -60,9 +64,11 @@ POLL_SECONDS = 60  # check every minute, act only on new closed M15 candle
 class BotState:
     running = True
     trades_today = 0
-    last_reset_date = datetime.datetime.utcnow().date()
-    last_candle_ts = None
-    open_position = None  # dict with entry/sl/tp/trailing info
+    last_reset_date = datetime.datetime.now(datetime.UTC).date()
+    last_candle_ts = {}          # per-symbol last processed candle ts
+    open_position = None         # dict with entry/sl/tp/trailing info
+    symbols = []                 # active universe of symbols (Bybit format, e.g. BTCUSDT)
+    symbols_last_refresh = None
 
 state = BotState()
 
@@ -95,11 +101,20 @@ async def notify(text: str):
 async def cmd_start(message: Message):
     await message.answer(
         "🤖 <b>EvA Bot запущен.</b>\n"
-        f"Пара: {SYMBOL_BYBIT} | TF: {TIMEFRAME}\n"
+        f"Монет в сканере: {len(state.symbols)} (объём 24ч > {MIN_24H_VOLUME_USD:,.0f}$)\n"
+        f"TF: {TIMEFRAME}\n"
         f"Маржа: {MARGIN_USD}$ x{int(LEVERAGE)} = {MARGIN_USD*LEVERAGE}$\n"
         f"Лимит: {MAX_SIMULTANEOUS_TRADES} позиция / {MAX_DAILY_TRADES} сделки в день",
         reply_markup=main_keyboard()
     )
+
+@dp.message(Command("symbols"))
+async def cmd_symbols(message: Message):
+    if not state.symbols:
+        await message.answer("Список монет пока не загружен.")
+        return
+    chunk = ", ".join(state.symbols[:100])
+    await message.answer(f"📋 <b>Сканируется {len(state.symbols)} монет:</b>\n{chunk}...")
 
 @dp.callback_query(F.data == "toggle")
 async def cb_toggle(callback):
@@ -112,9 +127,10 @@ async def cb_toggle(callback):
 async def cb_stats(callback):
     reset_if_new_day()
     pos = state.open_position
-    pos_text = f"{pos['symbol']} @ {pos['entry']:.2f}" if pos else "нет открытой позиции"
+    pos_text = f"{pos['symbol']} @ {pos['entry']:.4f}" if pos else "нет открытой позиции"
     text = (
         f"📊 <b>Статистика</b>\n"
+        f"Монет в сканере: {len(state.symbols)}\n"
         f"Сделок сегодня: {state.trades_today}/{MAX_DAILY_TRADES}\n"
         f"Открытая позиция: {pos_text}\n"
         f"Статус: {'работает' if state.running else 'на паузе'}"
@@ -122,10 +138,46 @@ async def cb_stats(callback):
     await callback.answer()
     await callback.message.answer(text, reply_markup=main_keyboard())
 
+# ---------------- SYMBOL UNIVERSE (Binance 24h volume > threshold) ----------------
+async def refresh_symbol_universe():
+    """Fetch all Binance USDT-M perpetual futures with 24h quote volume > MIN_24H_VOLUME_USD."""
+    try:
+        tickers = binance.fapiPublicGetTicker24hr()
+        df = pd.DataFrame(tickers)
+        df["quoteVolume"] = df["quoteVolume"].astype(float)
+        df = df[df["symbol"].str.endswith("USDT")]
+        df = df[df["quoteVolume"] > MIN_24H_VOLUME_USD]
+        df = df.sort_values("quoteVolume", ascending=False)
+        symbols = df["symbol"].tolist()[:MAX_SYMBOLS_PER_SCAN]
+
+        bybit_markets = bybit.load_markets()
+        bybit_symbols = set(bybit_markets.keys())
+        filtered = []
+        for s in symbols:
+            bybit_ccxt_symbol = f"{s[:-4]}/USDT:USDT"
+            if bybit_ccxt_symbol in bybit_symbols or s in bybit_symbols:
+                filtered.append(s)
+
+        state.symbols = filtered
+        state.symbols_last_refresh = datetime.datetime.now(datetime.UTC)
+        log.info(f"Symbol universe refreshed: {len(filtered)} symbols (volume > {MIN_24H_VOLUME_USD:,.0f}$)")
+        await notify(
+            f"🔄 <b>Список монет обновлён.</b>\n"
+            f"Активно: {len(filtered)} пар с объёмом 24ч > {MIN_24H_VOLUME_USD:,.0f}$"
+        )
+    except Exception as e:
+        log.error(f"Symbol universe refresh failed: {e}")
+
+def symbols_need_refresh():
+    if state.symbols_last_refresh is None:
+        return True
+    elapsed = (datetime.datetime.now(datetime.UTC) - state.symbols_last_refresh).total_seconds() / 60
+    return elapsed >= SYMBOL_REFRESH_MINUTES
+
 # ---------------- DATA FETCH ----------------
-def fetch_klines_with_taker(limit=100):
+def fetch_klines_with_taker(symbol_raw, limit=100):
     resp = binance.fapiPublicGetKlines({
-        "symbol": SYMBOL_RAW, "interval": TIMEFRAME, "limit": limit
+        "symbol": symbol_raw, "interval": TIMEFRAME, "limit": limit
     })
     cols = ["ts","open","high","low","close","volume","close_time","quote_vol",
             "trades","taker_buy_base","taker_buy_quote","ignore"]
@@ -136,16 +188,16 @@ def fetch_klines_with_taker(limit=100):
     df["cvd_delta"] = 2*df["taker_buy_base"] - df["volume"]
     return df
 
-def fetch_oi_recent(limit=5):
+def fetch_oi_recent(symbol_raw, limit=5):
     try:
         resp = binance.fapiDataGetOpenInterestHist({
-            "symbol": SYMBOL_RAW, "period": TIMEFRAME, "limit": limit
+            "symbol": symbol_raw, "period": TIMEFRAME, "limit": limit
         })
         oi = pd.DataFrame(resp)
         oi["sumOpenInterest"] = oi["sumOpenInterest"].astype(float)
         return oi
     except Exception as e:
-        log.warning(f"OI fetch failed: {e}")
+        log.warning(f"OI fetch failed for {symbol_raw}: {e}")
         return None
 
 def add_indicators(df):
@@ -207,7 +259,7 @@ def check_signal(df, oi_df):
 
 # ---------------- RISK / DAILY CONTROL ----------------
 def reset_if_new_day():
-    today = datetime.datetime.utcnow().date()
+    today = datetime.datetime.now(datetime.UTC).date()
     if today > state.last_reset_date:
         state.trades_today = 0
         state.last_reset_date = today
@@ -221,46 +273,46 @@ def trading_allowed():
     return True, "OK"
 
 # ---------------- EXECUTION (Bybit v5) ----------------
-def position_size(entry_price, stop_loss):
+def position_size(entry_price):
     notional = MARGIN_USD * LEVERAGE
     qty = notional / entry_price
     return round(qty, 4), notional
 
-async def place_entry(signal):
-    qty, notional = position_size(signal["entry_price"], signal["stop_loss"])
+async def place_entry(symbol_bybit, signal):
+    qty, notional = position_size(signal["entry_price"])
     try:
         order = bybit.create_order(
-            symbol=SYMBOL_BYBIT, type="limit", side="buy",
+            symbol=symbol_bybit, type="limit", side="buy",
             amount=qty, price=signal["entry_price"],
             params={"timeInForce": "GTC", "positionIdx": 0}
         )
         bybit.private_post_v5_position_trading_stop({
-            "category": "linear", "symbol": SYMBOL_BYBIT,
-            "takeProfit": str(round(signal["tp1"], 2)),
-            "stopLoss": str(round(signal["stop_loss"], 2)),
+            "category": "linear", "symbol": symbol_bybit,
+            "takeProfit": str(round(signal["tp1"], 6)),
+            "stopLoss": str(round(signal["stop_loss"], 6)),
             "tpslMode": "Partial",
             "tpSize": str(round(qty*0.5, 4)),
             "slSize": str(round(qty, 4)),
             "positionIdx": 0
         })
         state.open_position = {
-            "symbol": SYMBOL_BYBIT, "entry": signal["entry_price"],
+            "symbol": symbol_bybit, "entry": signal["entry_price"],
             "sl": signal["stop_loss"], "tp1": signal["tp1"], "qty": qty,
             "trailing_active": False, "order_id": order.get("id")
         }
         state.trades_today += 1
         await notify(
             f"🚀 <b>Найдена аномалия! Лимит на ретест выставлен.</b>\n"
-            f"Пара: {SYMBOL_BYBIT}\n"
-            f"Вход: {signal['entry_price']:.2f}\n"
-            f"Стоп: {signal['stop_loss']:.2f}\n"
-            f"TP1: {signal['tp1']:.2f}\n"
+            f"Пара: {symbol_bybit}\n"
+            f"Вход: {signal['entry_price']:.6f}\n"
+            f"Стоп: {signal['stop_loss']:.6f}\n"
+            f"TP1: {signal['tp1']:.6f}\n"
             f"Объём: {notional:.0f}$ (маржа {MARGIN_USD}$ x{int(LEVERAGE)})\n"
             f"Сделок сегодня: {state.trades_today}/{MAX_DAILY_TRADES}"
         )
     except Exception as e:
-        log.error(f"Order placement failed: {e}")
-        await notify(f"⚠️ <b>Ошибка при выставлении ордера:</b>\n{e}")
+        log.error(f"Order placement failed for {symbol_bybit}: {e}")
+        await notify(f"⚠️ <b>Ошибка при выставлении ордера ({symbol_bybit}):</b>\n{e}")
 
 async def activate_trailing():
     pos = state.open_position
@@ -268,14 +320,14 @@ async def activate_trailing():
         return
     try:
         bybit.private_post_v5_position_trading_stop({
-            "category": "linear", "symbol": SYMBOL_BYBIT,
+            "category": "linear", "symbol": pos["symbol"],
             "trailingStop": str(TRAIL_CALLBACK_PCT),
-            "activePrice": str(round(pos["tp1"], 2)),
+            "activePrice": str(round(pos["tp1"], 6)),
             "positionIdx": 0
         })
         pos["trailing_active"] = True
         await notify(
-            f"✅ <b>TP1 достигнут, позиция частично закрыта.</b>\n"
+            f"✅ <b>TP1 достигнут ({pos['symbol']}), позиция частично закрыта.</b>\n"
             f"Трейлинг-стоп активирован (откат {TRAIL_CALLBACK_PCT}%)."
         )
     except Exception as e:
@@ -283,14 +335,14 @@ async def activate_trailing():
         await notify(f"⚠️ <b>Ошибка активации трейлинга:</b>\n{e}")
 
 async def check_position_status():
-    """Poll Bybit for position/order state changes."""
     if state.open_position is None:
         return
+    symbol = state.open_position["symbol"]
     try:
-        positions = bybit.fetch_positions([SYMBOL_BYBIT])
+        positions = bybit.fetch_positions([symbol])
         active = [p for p in positions if float(p.get("contracts", 0) or 0) > 0]
         if not active:
-            await notify("🏁 <b>Позиция полностью закрыта.</b> Слот свободен.")
+            await notify(f"🏁 <b>Позиция {symbol} полностью закрыта.</b> Слот свободен.")
             state.open_position = None
             return
         pos = active[0]
@@ -301,7 +353,33 @@ async def check_position_status():
     except Exception as e:
         log.error(f"Position check failed: {e}")
 
-# ---------------- MAIN SCAN LOOP ----------------
+# ---------------- MAIN SCAN LOOP (multi-symbol) ----------------
+async def scan_symbol(symbol_raw):
+    """Check one symbol for a signal. symbol_raw e.g. BTCUSDT."""
+    try:
+        df = fetch_klines_with_taker(symbol_raw, 100)
+        if len(df) < 40:
+            return
+        latest_closed_ts = int(df.iloc[-2]["ts"])
+        if state.last_candle_ts.get(symbol_raw) == latest_closed_ts:
+            return
+        state.last_candle_ts[symbol_raw] = latest_closed_ts
+
+        df = add_indicators(df)
+        allowed, reason = trading_allowed()
+        if not allowed:
+            return
+
+        oi_df = fetch_oi_recent(symbol_raw, 5)
+        signal, reason = check_signal(df, oi_df)
+        if signal is None:
+            log.info(f"{symbol_raw}: no signal ({reason})")
+            return
+
+        await place_entry(symbol_raw, signal)
+    except Exception as e:
+        log.warning(f"scan_symbol error {symbol_raw}: {e}")
+
 async def scan_loop():
     while True:
         try:
@@ -309,28 +387,21 @@ async def scan_loop():
                 await asyncio.sleep(POLL_SECONDS)
                 continue
 
+            if symbols_need_refresh():
+                await refresh_symbol_universe()
+
             await check_position_status()
 
-            df = fetch_klines_with_taker(100)
-            latest_closed_ts = int(df.iloc[-2]["ts"])
-            if latest_closed_ts == state.last_candle_ts:
-                await asyncio.sleep(POLL_SECONDS)
-                continue
-            state.last_candle_ts = latest_closed_ts
-
-            df = add_indicators(df)
-            allowed, reason = trading_allowed()
-            if not allowed:
-                log.info(f"Trading blocked: {reason}")
+            allowed, _ = trading_allowed()
+            if not allowed or not state.symbols:
                 await asyncio.sleep(POLL_SECONDS)
                 continue
 
-            oi_df = fetch_oi_recent(5)
-            signal, reason = check_signal(df, oi_df)
-            if signal is None:
-                log.info(f"No signal: {reason}")
-            else:
-                await place_entry(signal)
+            for symbol_raw in state.symbols:
+                if state.open_position is not None:
+                    break  # slot taken, stop scanning until it frees up
+                await scan_symbol(symbol_raw)
+                await asyncio.sleep(REQUEST_DELAY_SEC)
 
         except Exception as e:
             log.error(f"Scan loop error: {e}")
@@ -339,6 +410,7 @@ async def scan_loop():
         await asyncio.sleep(POLL_SECONDS)
 
 async def main():
+    await refresh_symbol_universe()
     asyncio.create_task(scan_loop())
     await dp.start_polling(bot)
 
