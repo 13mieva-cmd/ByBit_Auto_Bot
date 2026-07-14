@@ -1,2 +1,5 @@
-numpy
-requests
+aiogram==3.4.1
+ccxt==4.2.25
+pandas==2.2.0
+numpy==1.26.3
+python-dotenv==1.0.1
