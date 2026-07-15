@@ -69,6 +69,7 @@ class BotState:
     open_position = None         # dict with entry/sl/tp/trailing info
     symbols = []                 # active universe of symbols (Bybit format, e.g. BTCUSDT)
     symbols_last_refresh = None
+    trade_history = []           # closed trades log for /history command
 
 state = BotState()
 
@@ -100,11 +101,18 @@ async def notify(text: str):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "🤖 <b>EvA Bot запущен.</b>\n"
-        f"Монет в сканере: {len(state.symbols)} (объём 24ч > {MIN_24H_VOLUME_USD:,.0f}$)\n"
-        f"TF: {TIMEFRAME}\n"
-        f"Маржа: {MARGIN_USD}$ x{int(LEVERAGE)} = {MARGIN_USD*LEVERAGE}$\n"
-        f"Лимит: {MAX_SIMULTANEOUS_TRADES} позиция / {MAX_DAILY_TRADES} сделки в день",
+        "🤖 <b>EvA Bot запущен.</b>\n\n"
+        f"📈 Монет в сканере: <b>{len(state.symbols)}</b> (объём 24ч &gt; {MIN_24H_VOLUME_USD:,.0f}$)\n"
+        f"⏱ Таймфрейм: {TIMEFRAME}\n"
+        f"💰 Маржа: {MARGIN_USD}$ x{int(LEVERAGE)} = <b>{MARGIN_USD*LEVERAGE:.0f}$</b> объём сделки\n"
+        f"🎯 TP1: 1:1 (закрытие 50%) → трейлинг {TRAIL_CALLBACK_PCT}%\n"
+        f"🔒 Лимиты: {MAX_SIMULTANEOUS_TRADES} позиция одновременно / {MAX_DAILY_TRADES} сделки в день\n\n"
+        "Команды:\n"
+        "/status — текущий статус и открытая позиция\n"
+        "/symbols — список сканируемых монет\n"
+        "/history — история последних сделок\n"
+        "/pause — поставить на паузу\n"
+        "/resume — снять с паузы",
         reply_markup=main_keyboard()
     )
 
@@ -115,6 +123,40 @@ async def cmd_symbols(message: Message):
         return
     chunk = ", ".join(state.symbols[:100])
     await message.answer(f"📋 <b>Сканируется {len(state.symbols)} монет:</b>\n{chunk}...")
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    reset_if_new_day()
+    pos = state.open_position
+    if pos:
+        text = format_position_card(pos)
+    else:
+        text = "Открытых позиций нет. Бот сканирует рынок."
+    await message.answer(text, reply_markup=main_keyboard())
+
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    if not state.trade_history:
+        await message.answer("История сделок пока пуста.")
+        return
+    lines = []
+    for t in state.trade_history[-10:]:
+        emoji = "✅" if t["pnl_usd"] >= 0 else "❌"
+        lines.append(
+            f"{emoji} {t['symbol']} | вход {t['entry']:.4f} → выход {t['exit']:.4f} | "
+            f"P&L: {t['pnl_usd']:+.2f}$ ({t['pnl_pct']:+.2f}%)"
+        )
+    await message.answer("📜 <b>Последние сделки:</b>\n" + "\n".join(lines))
+
+@dp.message(Command("pause"))
+async def cmd_pause(message: Message):
+    state.running = False
+    await message.answer("⏸ Сканирование поставлено на паузу.", reply_markup=main_keyboard())
+
+@dp.message(Command("resume"))
+async def cmd_resume(message: Message):
+    state.running = True
+    await message.answer("▶️ Сканирование запущено.", reply_markup=main_keyboard())
 
 @dp.callback_query(F.data == "toggle")
 async def cb_toggle(callback):
@@ -127,20 +169,34 @@ async def cb_toggle(callback):
 async def cb_stats(callback):
     reset_if_new_day()
     pos = state.open_position
-    pos_text = f"{pos['symbol']} @ {pos['entry']:.4f}" if pos else "нет открытой позиции"
+    pos_text = format_position_card(pos) if pos else "нет открытой позиции"
     text = (
         f"📊 <b>Статистика</b>\n"
         f"Монет в сканере: {len(state.symbols)}\n"
         f"Сделок сегодня: {state.trades_today}/{MAX_DAILY_TRADES}\n"
-        f"Открытая позиция: {pos_text}\n"
-        f"Статус: {'работает' if state.running else 'на паузе'}"
+        f"Статус: {'работает' if state.running else 'на паузе'}\n\n"
+        f"{pos_text}"
     )
     await callback.answer()
     await callback.message.answer(text, reply_markup=main_keyboard())
 
+def format_position_card(pos):
+    if not pos:
+        return "Открытых позиций нет."
+    risk_usd = abs(pos["entry"] - pos["sl"]) / pos["entry"] * pos["notional"]
+    reward_usd = abs(pos["tp1"] - pos["entry"]) / pos["entry"] * pos["notional"]
+    trail_status = "🟢 активен" if pos["trailing_active"] else "⚪ не активирован"
+    return (
+        f"💼 <b>Открытая позиция: {pos['symbol']}</b>\n"
+        f"Вход: {pos['entry']:.6f}\n"
+        f"Стоп: {pos['sl']:.6f} (риск ~{risk_usd:.2f}$)\n"
+        f"TP1: {pos['tp1']:.6f} (потенциал ~{reward_usd:.2f}$)\n"
+        f"Объём позиции: {pos['notional']:.0f}$\n"
+        f"Трейлинг: {trail_status}"
+    )
+
 # ---------------- SYMBOL UNIVERSE (Binance 24h volume > threshold) ----------------
 async def refresh_symbol_universe():
-    """Fetch all Binance USDT-M perpetual futures with 24h quote volume > MIN_24H_VOLUME_USD."""
     try:
         tickers = binance.fapiPublicGetTicker24hr()
         df = pd.DataFrame(tickers)
@@ -213,31 +269,44 @@ def add_indicators(df):
 
 # ---------------- SIGNAL LOGIC ----------------
 def check_signal(df, oi_df):
-    c1, c2, c3 = df.iloc[-4], df.iloc[-3], df.iloc[-2]  # -1 is still forming
+    """Returns (signal_dict_or_None, reason, debug_dict).
+    debug_dict always contains latest diagnostic values for logging/notifications."""
+    c1, c2, c3 = df.iloc[-4], df.iloc[-3], df.iloc[-2]
+
+    debug = {
+        "c1_volume": c1["volume"], "vol_ma20": c1["vol_ma20"],
+        "vol_ratio": c1["volume"]/c1["vol_ma20"] if c1["vol_ma20"] else 0,
+        "ema21": c3["ema21"], "ema50": c3["ema50"], "close": c3["close"],
+        "rsi": c3["rsi"], "cvd1": c1["cvd_delta"], "cvd2": c2["cvd_delta"], "cvd3": c3["cvd_delta"],
+    }
 
     if c1["volume"] < VOL_MULT * c1["vol_ma20"]:
-        return None, "нет аномалии объёма"
+        return None, "нет аномалии объёма", debug
     if not (c1["close"]>c1["open"] and c2["close"]>c2["open"] and c3["close"]>c3["open"]):
-        return None, "не все свечи зелёные"
+        return None, "не все свечи зелёные", debug
     if not (c2["close"]>c1["high"] and c3["close"]>c2["high"]):
-        return None, "нет последовательного роста хаев"
+        return None, "нет последовательного роста хаев", debug
     c3_range = c3["high"]-c3["low"]
     if c3_range>0 and (c3["high"]-c3["close"])/c3_range > MAX_UPPER_WICK_PCT:
-        return None, "верхняя тень 3-й свечи слишком длинная"
+        return None, "верхняя тень 3-й свечи слишком длинная", debug
     if not (c3["close"]>c3["ema21"]>c3["ema50"]):
-        return None, "нет тренда (EMA21/50)"
+        return None, "нет тренда (EMA21/50)", debug
     cvds = [c1["cvd_delta"], c2["cvd_delta"], c3["cvd_delta"]]
     if not (cvds[0] < cvds[1] < cvds[2]) or cvds[2] <= 0:
-        return None, "CVD не растёт"
+        return None, "CVD не растёт", debug
     local_high = df["high"].iloc[-30:-4].max()
+    debug["local_high"] = local_high
     if not (c2["close"]>local_high or c3["close"]>local_high):
-        return None, "нет пробоя локального уровня"
+        return None, "нет пробоя локального уровня", debug
     if np.isnan(c3["rsi"]) or c3["rsi"] > RSI_MAX:
-        return None, f"RSI перегрет ({c3['rsi']:.1f})"
+        return None, f"RSI перегрет ({c3['rsi']:.1f})", debug
+    oi_growth_pct = None
     if oi_df is not None and len(oi_df) >= 3:
         oi_vals = oi_df["sumOpenInterest"].iloc[-3:].values
         if not (oi_vals[0] < oi_vals[1] < oi_vals[2]):
-            return None, "OI не растёт стабильно"
+            return None, "OI не растёт стабильно", debug
+        oi_growth_pct = (oi_vals[-1]-oi_vals[0])/oi_vals[0]*100 if oi_vals[0] else 0
+    debug["oi_growth_pct"] = oi_growth_pct
 
     impulse_low = min(c1["low"], c2["low"], c3["low"])
     impulse_high = c3["high"]
@@ -249,13 +318,19 @@ def check_signal(df, oi_df):
     stop_loss = stop_ref*(1-SL_BUFFER)
     risk = entry_price - stop_loss
     if risk <= 0:
-        return None, "некорректный риск"
+        return None, "некорректный риск", debug
     tp1 = entry_price + risk*TP1_RR
 
-    return {
+    signal = {
         "entry_low": entry_low, "entry_high": entry_high, "entry_price": entry_price,
-        "stop_loss": stop_loss, "tp1": tp1
-    }, "OK"
+        "stop_loss": stop_loss, "tp1": tp1, "risk_pct": risk/entry_price*100,
+        "impulse_low": impulse_low, "impulse_high": impulse_high,
+        "c1_volume": c1["volume"], "vol_ma20": c1["vol_ma20"],
+        "vol_ratio": debug["vol_ratio"], "rsi": c3["rsi"],
+        "ema21": c3["ema21"], "ema50": c3["ema50"],
+        "oi_growth_pct": oi_growth_pct, "local_high": local_high,
+    }
+    return signal, "OK", debug
 
 # ---------------- RISK / DAILY CONTROL ----------------
 def reset_if_new_day():
@@ -278,6 +353,43 @@ def position_size(entry_price):
     qty = notional / entry_price
     return round(qty, 4), notional
 
+def build_signal_card(symbol_bybit, signal, qty, notional):
+    """Builds a detailed Telegram card explaining WHY the bot entered, with all numbers."""
+    risk_pct = signal["risk_pct"]
+    risk_usd = risk_pct/100 * notional
+    reward_usd = risk_usd * TP1_RR  # TP1 at 1:1
+    tp2_estimate_usd = risk_usd * 3  # per strategy: final target ~1:3 after trailing
+    vol_ratio = signal["vol_ratio"]
+    oi_txt = f"{signal['oi_growth_pct']:+.2f}% за 3 свечи" if signal["oi_growth_pct"] is not None else "н/д (фильтр отключен)"
+
+    card = (
+        f"🚀 <b>СИГНАЛ НА ВХОД: {symbol_bybit}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Почему бот входит:</b>\n"
+        f"📊 Объём аномалии: {signal['c1_volume']:.0f} (в {vol_ratio:.1f}x больше средней за 20 свечей)\n"
+        f"📈 Тренд: цена {signal['ema21']:.6f} EMA21 &gt; {signal['ema50']:.6f} EMA50 ✅\n"
+        f"🔥 Открытый интерес: {oi_txt}\n"
+        f"🎯 RSI(14): {signal['rsi']:.1f} (не перегрет, лимит {RSI_MAX})\n"
+        f"⛰ Пробит локальный уровень: {signal['local_high']:.6f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Параметры сделки:</b>\n"
+        f"💵 Цена входа (ретест): <b>{signal['entry_price']:.6f}</b>\n"
+        f"   Зона лимитки: {signal['entry_low']:.6f} — {signal['entry_high']:.6f}\n"
+        f"🛑 Стоп-лосс: <b>{signal['stop_loss']:.6f}</b> (-{risk_pct:.2f}%)\n"
+        f"🎯 Take Profit 1 (50% позиции, 1:1): <b>{signal['tp1']:.6f}</b> (+{risk_pct*TP1_RR:.2f}%)\n"
+        f"📐 После TP1 включится трейлинг {TRAIL_CALLBACK_PCT}% на остаток позиции\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Деньги:</b>\n"
+        f"💰 Маржа: {MARGIN_USD}$ x{int(LEVERAGE)} плечо\n"
+        f"📦 Объём позиции: <b>{notional:.0f}$</b> ({qty:.4f} монет)\n"
+        f"❌ Риск при срабатывании стопа: <b>-{risk_usd:.2f}$</b>\n"
+        f"✅ Прибыль на TP1 (50% позиции): <b>+{reward_usd/2:.2f}$</b>\n"
+        f"✅ Потенциал при движении до 1:3 (трейлинг): <b>+{tp2_estimate_usd:.2f}$</b> (ориентировочно)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 Сделок сегодня: {state.trades_today+1}/{MAX_DAILY_TRADES}"
+    )
+    return card
+
 async def place_entry(symbol_bybit, signal):
     qty, notional = position_size(signal["entry_price"])
     try:
@@ -298,18 +410,12 @@ async def place_entry(symbol_bybit, signal):
         state.open_position = {
             "symbol": symbol_bybit, "entry": signal["entry_price"],
             "sl": signal["stop_loss"], "tp1": signal["tp1"], "qty": qty,
-            "trailing_active": False, "order_id": order.get("id")
+            "notional": notional, "trailing_active": False, "order_id": order.get("id"),
+            "opened_at": datetime.datetime.now(datetime.UTC),
         }
         state.trades_today += 1
-        await notify(
-            f"🚀 <b>Найдена аномалия! Лимит на ретест выставлен.</b>\n"
-            f"Пара: {symbol_bybit}\n"
-            f"Вход: {signal['entry_price']:.6f}\n"
-            f"Стоп: {signal['stop_loss']:.6f}\n"
-            f"TP1: {signal['tp1']:.6f}\n"
-            f"Объём: {notional:.0f}$ (маржа {MARGIN_USD}$ x{int(LEVERAGE)})\n"
-            f"Сделок сегодня: {state.trades_today}/{MAX_DAILY_TRADES}"
-        )
+        card = build_signal_card(symbol_bybit, signal, qty, notional)
+        await notify(card)
     except Exception as e:
         log.error(f"Order placement failed for {symbol_bybit}: {e}")
         await notify(f"⚠️ <b>Ошибка при выставлении ордера ({symbol_bybit}):</b>\n{e}")
@@ -326,9 +432,11 @@ async def activate_trailing():
             "positionIdx": 0
         })
         pos["trailing_active"] = True
+        risk_usd = abs(pos["entry"]-pos["sl"])/pos["entry"]*pos["notional"]
         await notify(
-            f"✅ <b>TP1 достигнут ({pos['symbol']}), позиция частично закрыта.</b>\n"
-            f"Трейлинг-стоп активирован (откат {TRAIL_CALLBACK_PCT}%)."
+            f"✅ <b>TP1 достигнут: {pos['symbol']}</b>\n"
+            f"Зафиксирована прибыль: <b>+{risk_usd/2:.2f}$</b> (закрыто 50% позиции)\n"
+            f"Трейлинг-стоп активирован (откат {TRAIL_CALLBACK_PCT}%) на остаток."
         )
     except Exception as e:
         log.error(f"Trailing activation failed: {e}")
@@ -338,24 +446,42 @@ async def check_position_status():
     if state.open_position is None:
         return
     symbol = state.open_position["symbol"]
+    pos_state = state.open_position
     try:
         positions = bybit.fetch_positions([symbol])
         active = [p for p in positions if float(p.get("contracts", 0) or 0) > 0]
         if not active:
-            await notify(f"🏁 <b>Позиция {symbol} полностью закрыта.</b> Слот свободен.")
+            try:
+                ticker = bybit.fetch_ticker(symbol)
+                exit_price = ticker["last"]
+            except Exception:
+                exit_price = pos_state["entry"]
+            pnl_pct = (exit_price - pos_state["entry"]) / pos_state["entry"] * 100
+            pnl_usd = pnl_pct/100 * pos_state["notional"]
+            state.trade_history.append({
+                "symbol": symbol, "entry": pos_state["entry"], "exit": exit_price,
+                "pnl_pct": pnl_pct, "pnl_usd": pnl_usd,
+                "closed_at": datetime.datetime.now(datetime.UTC),
+            })
+            emoji = "✅" if pnl_usd >= 0 else "❌"
+            await notify(
+                f"🏁 <b>Позиция закрыта: {symbol}</b>\n"
+                f"Вход: {pos_state['entry']:.6f} → Выход: {exit_price:.6f}\n"
+                f"{emoji} Итоговый результат: <b>{pnl_usd:+.2f}$</b> ({pnl_pct:+.2f}%)\n"
+                f"Слот свободен для новых сигналов."
+            )
             state.open_position = None
             return
         pos = active[0]
         current_size = float(pos.get("contracts", 0) or 0)
-        original_qty = state.open_position["qty"]
-        if current_size <= original_qty * 0.55 and not state.open_position["trailing_active"]:
+        original_qty = pos_state["qty"]
+        if current_size <= original_qty * 0.55 and not pos_state["trailing_active"]:
             await activate_trailing()
     except Exception as e:
         log.error(f"Position check failed: {e}")
 
 # ---------------- MAIN SCAN LOOP (multi-symbol) ----------------
 async def scan_symbol(symbol_raw):
-    """Check one symbol for a signal. symbol_raw e.g. BTCUSDT."""
     try:
         df = fetch_klines_with_taker(symbol_raw, 100)
         if len(df) < 40:
@@ -371,7 +497,7 @@ async def scan_symbol(symbol_raw):
             return
 
         oi_df = fetch_oi_recent(symbol_raw, 5)
-        signal, reason = check_signal(df, oi_df)
+        signal, reason, debug = check_signal(df, oi_df)
         if signal is None:
             log.info(f"{symbol_raw}: no signal ({reason})")
             return
@@ -399,7 +525,7 @@ async def scan_loop():
 
             for symbol_raw in state.symbols:
                 if state.open_position is not None:
-                    break  # slot taken, stop scanning until it frees up
+                    break
                 await scan_symbol(symbol_raw)
                 await asyncio.sleep(REQUEST_DELAY_SEC)
 
