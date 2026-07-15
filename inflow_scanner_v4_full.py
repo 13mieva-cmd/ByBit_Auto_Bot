@@ -58,6 +58,8 @@ MAX_UPPER_WICK_PCT = 0.30
 FIB_LOW, FIB_HIGH = 0.382, 0.5
 SL_BUFFER = 0.001
 TP1_RR = 1.0
+ATR_LEN = 14
+MAX_CANDLE_ATR_MULT = float(os.environ.get("MAX_CANDLE_ATR_MULT", 2.5))
 POLL_SECONDS = 60  # check every minute, act only on new closed M15 candle
 
 # ---------------- STATE ----------------
@@ -265,6 +267,13 @@ def add_indicators(df):
     loss = (-delta.clip(upper=0)).rolling(RSI_LEN).mean()
     rs = gain / loss
     df["rsi"] = 100 - 100/(1+rs)
+
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    df["atr14"] = tr.rolling(ATR_LEN).mean()
     return df
 
 # ---------------- SIGNAL LOGIC ----------------
@@ -289,6 +298,19 @@ def check_signal(df, oi_df):
     c3_range = c3["high"]-c3["low"]
     if c3_range>0 and (c3["high"]-c3["close"])/c3_range > MAX_UPPER_WICK_PCT:
         return None, "верхняя тень 3-й свечи слишком длинная", debug
+
+    atr_val = c3["atr14"]
+    debug["atr14"] = atr_val
+    debug["c3_range"] = c3_range
+    debug["c3_atr_ratio"] = c3_range/atr_val if atr_val else None
+    if not np.isnan(atr_val) and atr_val > 0 and c3_range > MAX_CANDLE_ATR_MULT * atr_val:
+        return None, f"3-я свеча аномально большая ({c3_range/atr_val:.1f}x ATR, лимит {MAX_CANDLE_ATR_MULT}x)", debug
+    c1_range = c1["high"]-c1["low"]
+    c2_range = c2["high"]-c2["low"]
+    if not np.isnan(atr_val) and atr_val > 0:
+        if c1_range > MAX_CANDLE_ATR_MULT * atr_val or c2_range > MAX_CANDLE_ATR_MULT * atr_val:
+            return None, f"1-я или 2-я свеча аномально большая (>{MAX_CANDLE_ATR_MULT}x ATR)", debug
+
     if not (c3["close"]>c3["ema21"]>c3["ema50"]):
         return None, "нет тренда (EMA21/50)", debug
     cvds = [c1["cvd_delta"], c2["cvd_delta"], c3["cvd_delta"]]
@@ -329,6 +351,7 @@ def check_signal(df, oi_df):
         "vol_ratio": debug["vol_ratio"], "rsi": c3["rsi"],
         "ema21": c3["ema21"], "ema50": c3["ema50"],
         "oi_growth_pct": oi_growth_pct, "local_high": local_high,
+        "atr14": atr_val, "c3_atr_ratio": debug["c3_atr_ratio"],
     }
     return signal, "OK", debug
 
@@ -371,6 +394,7 @@ def build_signal_card(symbol_bybit, signal, qty, notional):
         f"🔥 Открытый интерес: {oi_txt}\n"
         f"🎯 RSI(14): {signal['rsi']:.1f} (не перегрет, лимит {RSI_MAX})\n"
         f"⛰ Пробит локальный уровень: {signal['local_high']:.6f}\n"
+        f"📏 Размер 3-й свечи: {signal['c3_atr_ratio']:.1f}x ATR14 (лимит {MAX_CANDLE_ATR_MULT}x, ретест безопасен) ✅\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Параметры сделки:</b>\n"
         f"💵 Цена входа (ретест): <b>{signal['entry_price']:.6f}</b>\n"
