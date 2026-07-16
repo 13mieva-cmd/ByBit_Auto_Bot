@@ -52,36 +52,37 @@ LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").lower() == "true"
 BYBIT_TRADE_BASE = "https://api-demo.bybit.com" if USE_DEMO_TRADING else "https://api.bybit.com"
 RECV_WINDOW = "5000"
 
-# --- сигнал (спека) ---
-TF = "15m"
-VOL_MA_LEN = 20
-VOL_SPIKE_MIN = 2.5
-QUIET_BARS = 12
-QUIET_MAX = 1.8
-WICK_MAX = 0.30
-ATR_LEN = 14
-BAR3_ATR_MAX = 2.5
-BODY_RATIO_MAX = 3.0
-OI_MIN_GROW = 0.01
-RSI_LEN = 14
-RSI_MAX = 75.0
-LEVEL_LOOKBACK = 96
-EMA_FAST, EMA_SLOW = 21, 50
+# --- сигнал (спека) — все пороги настраиваются через ENV в Railway ---
+TF = os.environ.get("TF", "15m")
+VOL_MA_LEN = int(os.environ.get("VOL_MA_LEN", 20))
+VOL_SPIKE_MIN = float(os.environ.get("VOL_SPIKE_MIN", 2.5))
+QUIET_BARS = int(os.environ.get("QUIET_BARS", 12))
+QUIET_MAX = float(os.environ.get("QUIET_MAX", 1.8))
+WICK_MAX = float(os.environ.get("WICK_MAX", 0.30))
+ATR_LEN = int(os.environ.get("ATR_LEN", 14))
+BAR3_ATR_MAX = float(os.environ.get("BAR3_ATR_MAX", 2.5))
+BODY_RATIO_MAX = float(os.environ.get("BODY_RATIO_MAX", 3.0))
+OI_MIN_GROW = float(os.environ.get("OI_MIN_GROW", 0.01))
+RSI_LEN = int(os.environ.get("RSI_LEN", 14))
+RSI_MAX = float(os.environ.get("RSI_MAX", 75.0))
+LEVEL_LOOKBACK = int(os.environ.get("LEVEL_LOOKBACK", 96))
+EMA_FAST = int(os.environ.get("EMA_FAST", 21))
+EMA_SLOW = int(os.environ.get("EMA_SLOW", 50))
 
-# --- вход/выход ---
-FIB_RETRACE = 0.382
-ENTRY_TTL_BARS = 8
-SL_BUFFER = 0.001
-TP1_RR = 1.0
-TRAIL_CALLBACK = 0.004
-FEE_MAKER = 0.0002
-FEE_TAKER = 0.00055
+# --- вход/выход — настраиваются через ENV ---
+FIB_RETRACE = float(os.environ.get("FIB_RETRACE", 0.382))
+ENTRY_TTL_BARS = int(os.environ.get("ENTRY_TTL_BARS", 8))
+SL_BUFFER = float(os.environ.get("SL_BUFFER", 0.001))
+TP1_RR = float(os.environ.get("TP1_RR", 1.0))
+TRAIL_CALLBACK = float(os.environ.get("TRAIL_CALLBACK", 0.004))
+FEE_MAKER = float(os.environ.get("FEE_MAKER", 0.0002))
+FEE_TAKER = float(os.environ.get("FEE_TAKER", 0.00055))
 
-# --- вселенная ---
-MAX_COINS = 120
-MIN_QUOTE_VOL24 = 30_000_000
-SCAN_EVERY_SEC = 90
-MANAGE_EVERY_SEC = 45
+# --- вселенная — настраиваются через ENV ---
+MAX_COINS = int(os.environ.get("MAX_COINS", 120))
+MIN_QUOTE_VOL24 = float(os.environ.get("MIN_QUOTE_VOL24", 5_000_000))
+SCAN_EVERY_SEC = int(os.environ.get("SCAN_EVERY_SEC", 90))
+MANAGE_EVERY_SEC = int(os.environ.get("MANAGE_EVERY_SEC", 45))
 
 def ensure_dirs():
     try:
