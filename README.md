@@ -1,11 +1,12 @@
-EVA v3 package
+EVA v3 deploy package
 
-Files:
+Contents:
 - inflow_scanner_v4_full.py
 - env.example
-- README.md
 
-Before deploy:
-1. Put valid Railway ENV values into env.example / Railway variables.
-2. Check TG_TOKEN has no spaces.
-3. Ensure integer ENV values are plain integers.
+Deploy notes:
+- Start command: python inflow_scanner_v4_full.py
+- In Railway, copy values from env.example into Variables.
+- TG_TOKEN must not contain spaces.
+- Integer variables must be plain integers without trailing dots.
+- Float variables may use decimals, e.g. 2.1 or 0.014.
