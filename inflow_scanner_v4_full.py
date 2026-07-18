@@ -83,6 +83,10 @@ ATR_TP1_MULT = 2.0     # TP1 = entry + 2.0*ATR -> закрыть 50% позиц�
 ATR_TP2_MULT = 4.5     # TP2 = entry + 4.5*ATR -> закрыть оставшиеся 50%
 ATR_TRAIL_MULT = 1.5   # после TP1: SL остатка -> БУ, трейлинг 1.5*ATR от пика до TP2
 
+# --- VALID_ENTRY: контроль качества входа относительно уровня пробоя ---
+ENTRY_MAX_EXT_ATR = float(os.environ.get("ENTRY_MAX_EXT_ATR", "1.2"))       # не входим дальше 1.2*ATR от уровня
+ENTRY_MIN_PULLBACK_ATR = float(os.environ.get("ENTRY_MIN_PULLBACK_ATR", "0.8"))  # должен быть откат к breakout+0.8*ATR
+
 # --- вселенная (ГЛОБАЛЬНЫЙ СКАНЕР: без статичного топ-N, до 500+ монет одновременно) ---
 MAX_COINS = int(os.environ.get("MAX_COINS", "500"))
 MIN_QUOTE_VOL24 = float(os.environ.get("MIN_QUOTE_VOL24", "3000000"))  # 3M USDT — отсекаем только мёртвую ликвидность
@@ -486,6 +490,31 @@ def detect_signal(o, h, l, c, v, tb, oi):
     level = max(h[i1 - LEVEL_LOOKBACK:i1])
     if not (c[i1] > level): return False, "уровень не пробит"
 
+    # 9b) VALID_ENTRY: контроль качества входа относительно уровня пробоя (ATR-полосы + откат + удержание)
+    breakout = level
+    close = c[i1]; low = l[i1]; prev_close = c[i1 - 1]
+    volume = v[i1]; volume_ma = vma
+
+    # не входим слишком далеко от уровня пробоя
+    if (close - breakout) > ENTRY_MAX_EXT_ATR * a:
+        return False, f"вход слишком далеко от уровня (+{(close-breakout)/a:.2f}x ATR > {ENTRY_MAX_EXT_ATR}x)"
+
+    # должен быть откат: close не выше breakout + 0.8*ATR
+    if close > breakout + ENTRY_MIN_PULLBACK_ATR * a:
+        return False, f"нет отката к уровню (close +{(close-breakout)/a:.2f}x ATR > {ENTRY_MIN_PULLBACK_ATR}x)"
+
+    # удержание уровня: low свечи не должен проваливаться ниже breakout
+    if low < breakout:
+        return False, "уровень не удержан (low ниже breakout)"
+
+    # подтверждение продолжения движения
+    if close <= prev_close:
+        return False, "нет подтверждения продолжения (close <= prev_close)"
+
+    # объём снова растёт (выше своей MA, не обязательно спайк)
+    if volume < volume_ma:
+        return False, "объём не подтверждает продолжение (< MA)"
+
     impulse = h[i1] - l[i1]
     if impulse <= 0: return False, "нет импульса"
     # FIB_RETRACE=0.0: entry = цена закрытия сигнальной свечи ≈ цена открытия следующей (маркет-вход)
@@ -502,6 +531,308 @@ def detect_signal(o, h, l, c, v, tb, oi):
         entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
         wick=upper_wick, close3=c[i1],
     )
+
+
+# ==============================================================
+# PROP-STYLE ENTRY LOGIC (встроено по спеке пользователя как есть,
+# функции management переименованы с префиксом prop_, чтобы не
+# конфликтовать с существующими manage_position/open_market_position
+# бота — сама логика и пороги НЕ изменены)
+# ==============================================================
+
+def check_long_entry(signal):
+    score = 0
+    reasons = []
+
+    vol_ratio = signal["volume"] / signal["vol_ma20"]
+
+    # 1. Volume impulse
+    if vol_ratio >= 2.5:
+        score += 2
+        reasons.append("Volume spike")
+    else:
+        return False, "No volume impulse"
+
+    # 2. Breakout
+    if signal["close"] > signal["prev_high"]:
+        score += 2
+        reasons.append("Breakout")
+    else:
+        return False, "No breakout"
+
+    # 3. Trend alignment
+    if signal["close"] > signal["ema21"] > signal["ema50"]:
+        score += 1
+        reasons.append("Trend aligned")
+
+    # 4. Smart money
+    if signal["oi_delta"] > 0 and signal["cvd_delta"] > 0:
+        score += 2
+        reasons.append("Smart money")
+    else:
+        return False, "No smart money"
+
+    # 5. RSI filter
+    if signal["rsi"] < 75:
+        score += 1
+    else:
+        return False, "Overbought"
+
+    # 6. Candle sanity check
+    candle_size = signal["high"] - signal["close"]
+    if signal["atr"] * 0.5 < candle_size < signal["atr"] * 2.5:
+        score += 1
+    else:
+        return False, "Bad candle"
+
+    if score >= 6:
+        return True, f"ENTRY OK | score={score} | {' | '.join(reasons)}"
+
+    return False, f"Weak setup score={score}"
+
+
+# =========================
+# POSITION OPEN
+# =========================
+
+def open_position(price, atr):
+    return {
+        "entry": price,
+        "sl": price - 1.5 * atr,
+        "tp1": price + 2.0 * atr,
+        "tp2": price + 4.5 * atr,
+        "size": 1.0,
+        "half_closed": False,
+        "trail_active": False,
+        "trail_sl": None,
+        "status": "OPEN"
+    }
+
+
+# =========================
+# POSITION MANAGEMENT (переименовано в prop_manage_position:
+# у бота уже есть своя manage_position(st, chat) для живой торговли
+# через Bybit — эта версия работает с локальным dict pos, как в спеке)
+# =========================
+
+def prop_manage_position(pos, price, atr):
+    if pos["status"] != "OPEN":
+        return pos, None
+
+    # STOP LOSS
+    if price <= pos["sl"]:
+        pos["status"] = "CLOSED"
+        return pos, "STOP LOSS"
+
+    # TP1
+    if not pos["half_closed"] and price >= pos["tp1"]:
+        pos["half_closed"] = True
+        pos["size"] = 0.5
+        pos["sl"] = pos["entry"]
+
+        pos["trail_active"] = True
+        pos["trail_sl"] = price - 1.5 * atr
+
+        return pos, "TP1 HIT"
+
+    # TRAILING
+    if pos["trail_active"]:
+        new_trail = price - 1.5 * atr
+
+        if new_trail > pos["trail_sl"]:
+            pos["trail_sl"] = new_trail
+
+        if price <= pos["trail_sl"]:
+            pos["status"] = "CLOSED"
+            return pos, "TRAIL STOP"
+
+    # TP2
+    if price >= pos["tp2"]:
+        pos["status"] = "CLOSED"
+        return pos, "TP2 HIT"
+
+    return pos, None
+
+
+# =========================
+# 🔌 INTEGRATION В ТВОЙ LOOP
+# =========================
+
+
+# ==============================================================
+# PROP-STRATEGY: ПОЛНОСТЬЮ ПАРАЛЛЕЛЬНЫЙ НЕЗАВИСИМЫЙ ЦИКЛ
+# Работает в своём потоке, со своим состоянием (prop_state.json),
+# своими слотами и своим тикером — НЕ пересекается с основной
+# стратегией (detect_signal / scan_once / manage_position) и не
+# делит с ней слоты MAX_CONCURRENT. Реальных ордеров НЕ шлёт —
+# режим PAPER (виртуальные позиции), чтобы можно было безопасно
+# сравнить обе стратегии на одном живом потоке данных.
+# ==============================================================
+
+PROP_ENABLED = os.environ.get("PROP_STRATEGY_ENABLED", "0") == "1"
+PROP_SCAN_EVERY_SEC = int(os.environ.get("PROP_SCAN_EVERY_SEC", "5"))
+PROP_MANAGE_EVERY_SEC = int(os.environ.get("PROP_MANAGE_EVERY_SEC", "5"))
+PROP_MAX_POSITIONS = int(os.environ.get("PROP_MAX_POSITIONS", "5"))
+PROP_NOTIONAL = float(os.environ.get("PROP_NOTIONAL_USD", str(NOTIONAL)))
+PROP_STATE_FILE = os.path.join(DATA_DIR, "prop_state.json")
+
+_prop_last_bar = {}  # sym -> timestamp последней обработанной ЗАКРЫТОЙ свечи (свой guard, независимый от основного бота)
+
+def prop_load_state():
+    try:
+        with open(PROP_STATE_FILE) as f:
+            d = json.load(f)
+            d.setdefault("positions", [])
+            return d
+    except Exception:
+        return {"positions": []}
+
+def prop_save_state(state):
+    try:
+        with open(PROP_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print("prop_save_state err:", e)
+
+def prop_build_signal(sym, kl, oi):
+    """Собирает dict 'signal' в формате, который ожидает check_long_entry(), из тех же
+    живых данных Binance (свечи+CVD) / Bybit-OI, что использует основной сканер."""
+    o, h, l, c, v, tb, ct = kl
+    o, h, l, c, v, tb, ct = o[:-1], h[:-1], l[:-1], c[:-1], v[:-1], tb[:-1], ct[:-1]
+    n = len(c)
+    if n < VOL_MA_LEN + 5 or n < ATR_LEN + 5:
+        return None
+    i1 = n - 1
+    current_candle_time = ct[-1]
+
+    vol_ma20 = sum(v[i1 - VOL_MA_LEN:i1]) / VOL_MA_LEN
+    if vol_ma20 <= 0:
+        return None
+    a = atr(h[:i1], l[:i1], c[:i1], ATR_LEN)
+    if a <= 0:
+        return None
+    e21 = ema_series(c, EMA_FAST)[-1]
+    e50 = ema_series(c, EMA_SLOW)[-1]
+    r = rsi(c[-(RSI_LEN * 6):], RSI_LEN) if n > RSI_LEN * 6 else 50.0
+    delta = 2 * tb[i1] - v[i1]  # CVD-дельта на закрытой свече (та же формула, что и в detect_signal)
+
+    oi_delta = 0.0
+    if oi and len(oi) >= 2 and oi[-2] > 0:
+        oi_delta = oi[-1] - oi[-2]
+
+    signal = dict(
+        sym=sym, ts=current_candle_time,
+        close=c[i1], high=h[i1], low=l[i1], prev_high=h[i1 - 1],
+        volume=v[i1], vol_ma20=vol_ma20,
+        ema21=e21, ema50=e50, rsi=r, atr=a,
+        oi_delta=oi_delta, cvd_delta=delta,
+    )
+    return signal
+
+def prop_scan_once(state, chat):
+    """Независимый скан: тот же список монет из universe() и тот же параллельный батч-фетчер
+    fetch_klines_oi_batch, что у основного бота (переиспользуем инфраструктуру данных),
+    но решение о входе принимает ИСКЛЮЧИТЕЛЬНО check_long_entry() из prop-модуля."""
+    if len(state["positions"]) >= PROP_MAX_POSITIONS:
+        return
+    coins = universe()
+    if not coins:
+        return
+    try:
+        batch = asyncio.run(fetch_klines_oi_batch(coins))
+    except Exception as e:
+        print("prop_scan_once batch err:", e)
+        return
+
+    open_syms = {p["sym"] for p in state["positions"] if p["status"] == "OPEN"}
+    for sym, (kl, oi) in batch.items():
+        if sym in open_syms:
+            continue
+        if len(state["positions"]) - sum(1 for p in state["positions"] if p["status"] != "OPEN") >= PROP_MAX_POSITIONS:
+            break
+        signal = prop_build_signal(sym, kl, oi[-8:] if oi else [])
+        if signal is None:
+            continue
+        if _prop_last_bar.get(sym) == signal["ts"]:
+            continue
+        _prop_last_bar[sym] = signal["ts"]
+
+        ok, reason = check_long_entry(signal)
+        if not ok:
+            continue
+        pos = open_position(signal["close"], signal["atr"])
+        pos["sym"] = sym
+        state["positions"].append(pos)
+        prop_save_state(state)
+        tg_send(chat, f"\U0001F680 [PROP] {sym}: {reason} @ ${signal['close']:.6g} "
+                      f"(PAPER, независимая стратегия, слот {len(open_syms)+1}/{PROP_MAX_POSITIONS})")
+
+def prop_manage_all(state, chat):
+    """Опрашивает цену на Bybit для каждой открытой prop-позиции каждые PROP_MANAGE_EVERY_SEC
+    и прогоняет через prop_manage_position() — TP1->БУ->трейлинг->TP2, как в спеке."""
+    changed = False
+    for pos in state["positions"]:
+        if pos["status"] != "OPEN":
+            continue
+        sym = pos["sym"]
+        price = bybit_price(sym); time.sleep(0.05)
+        if price is None:
+            continue
+        atr_now = pos.get("atr", (pos["tp1"] - pos["entry"]) / ATR_TP1_MULT)
+        pos_before_half = pos["half_closed"]
+        pos, event = prop_manage_position(pos, price, atr_now)
+        if event:
+            changed = True
+            emoji = "\U0001F4B0" if event in ("TP1 HIT", "TP2 HIT") else "\U0001F53B" if event == "STOP LOSS" else "\U0001F512"
+            tg_send(chat, f"{emoji} [PROP] {sym}: {event} @ ${price:.6g}")
+    if changed:
+        prop_save_state(state)
+
+def prop_loop():
+    """Полностью САМОСТОЯТЕЛЬНЫЙ поток: своя частота скана/менеджмента, своё состояние,
+    свои слоты. Запускается из main() отдельным threading.Thread и не влияет на основной
+    бот (detect_signal/scan_once/manage_position) при отключении через PROP_STRATEGY_ENABLED=0."""
+    if not PROP_ENABLED:
+        print("[PROP] отключена (PROP_STRATEGY_ENABLED=0) — не запускаю параллельный цикл.")
+        return
+    state = prop_load_state()
+    chat = load_chat()
+    print("[PROP] параллельная стратегия запущена (PAPER, независимо от основного бота)")
+    last_scan = last_manage = 0
+    while True:
+        try:
+            chat = load_chat()
+            now = time.time()
+            if now - last_manage >= PROP_MANAGE_EVERY_SEC:
+                last_manage = now
+                prop_manage_all(state, chat)
+            if now - last_scan >= PROP_SCAN_EVERY_SEC:
+                last_scan = now
+                prop_scan_once(state, chat)
+                open_n = sum(1 for p in state["positions"] if p["status"] == "OPEN")
+                print(f"[PROP scan] открытых позиций {open_n}/{PROP_MAX_POSITIONS}")
+        except Exception as e:
+            print("[PROP] loop err:", e)
+        time.sleep(2)
+
+def process_signal(state, signal):
+    price = signal["close"]
+    atr = signal["atr"]
+
+    # ENTRY
+    ok, reason = check_long_entry(signal)
+
+    if ok:
+        pos = open_position(price, atr)
+        state["positions"].append(pos)
+        print(f"\U0001F680 {reason} @ {price}")
+
+    # EXIT / MANAGEMENT
+    for pos in state["positions"]:
+        pos, event = prop_manage_position(pos, price, atr)
+
+        if event:
+            print(f"\u26A1 {event} @ {price}")
 
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
 def _default_state():
@@ -1080,6 +1411,11 @@ def _bt_reason(msg):
                        ("OI", "OI не растёт устойчиво"),
                        ("аптренда", "нет аптренда EMA"),
                        ("RSI", "RSI перегрет (>75)"),
+                       ("слишком далеко от уровня", "VALID_ENTRY: вход слишком далеко от уровня (>1.2x ATR)"),
+                       ("нет отката", "VALID_ENTRY: нет отката к уровню (>0.8x ATR)"),
+                       ("не удержан", "VALID_ENTRY: уровень не удержан (low < breakout)"),
+                       ("продолжения", "VALID_ENTRY: нет подтверждения продолжения"),
+                       ("не подтверждает продолжение", "VALID_ENTRY: объём не подтверждает продолжение"),
                        ("уровень", "уровень не пробит"),
                        ("истории", "мало истории"),
                        ("базы", "мало/ноль объёмной базы")):
@@ -1150,6 +1486,599 @@ def bt_portfolio(all_pos, deposit):
     eq = [deposit]
     for t in taken: eq.append(eq[-1] + t["pnl"])
     return taken, eq
+
+
+# ==============================================================
+# GRID SEARCH: перебор комбинаций параметров стратегии по
+# заранее закешированным историческим данным (без повторных
+# сетевых запросов на каждую комбинацию — иначе перебор из
+# 50-100 комбинаций растянулся бы на часы). Данные (klines+OI)
+# по каждой монете скачиваются ОДИН раз, а detect_signal с
+# разными порогами прогоняется по ним в памяти много раз.
+# ==============================================================
+
+import itertools
+import numpy as np
+import pandas as pd
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL_GRID = True
+except Exception:
+    HAS_MPL_GRID = False
+
+# Доп. алиасы параметров для grid_search (сверх тех, что уже есть в BT_PARAMS):
+# volume_threshold -> тот же VOL_SPIKE_MIN, что и "spike"
+# break_lookback    -> LEVEL_LOOKBACK (глубина поиска уровня пробоя)
+# oi_strength       -> тот же OI_MIN_GROW, что и "oi"
+BT_PARAMS["volume_threshold"] = ("VOL_SPIKE_MIN", lambda s: float(s))
+BT_PARAMS["break_lookback"] = ("LEVEL_LOOKBACK", lambda s: int(float(s)))
+BT_PARAMS["oi_strength"] = ("OI_MIN_GROW", lambda s: float(s))
+
+def _bt_prefetch(days, ncoins):
+    """Строит momentum-вселенную и один раз скачивает klines+OI по каждой монете.
+    Возвращает список (sym, o,h,l,c,v,tb,ct, oi_ts) для многократного переиспользования
+    без повторных сетевых запросов на каждую комбинацию параметров."""
+    coins = bt_build_universe(days, ncoins)
+    cached = []
+    for sym in coins:
+        try:
+            o, h, l, c, v, tb, ct = bt_klines(sym, days)
+            if len(c) < LEVEL_LOOKBACK + 60:
+                continue
+            oi_ts = bt_oi(sym, days)
+            if len(oi_ts) < 20:
+                continue
+            cached.append((sym, o, h, l, c, v, tb, ct, oi_ts))
+        except Exception as e:
+            print(f"grid prefetch {sym} err:", e)
+    return cached
+
+def _bt_run_once(config, cached, deposit):
+    """Прогоняет ОДНУ комбинацию параметров (config) по уже закешированным данным.
+    Возвращает (signals, trades, pf, ret, dd) — сигнатура, которую ожидает
+    пользовательский grid_search()."""
+    applied, saved = _bt_apply_overrides(config)
+    try:
+        all_pos = []
+        diag = dict(evals=0, no_oi=0, signals=0, reasons={})
+        for sym, o, h, l, c, v, tb, ct, oi_ts in cached:
+            all_pos += bt_simulate_coin(
+                sym, o[1:], h[1:], l[1:], c[1:], v[1:], tb[1:], ct[1:],
+                oi_ts, diag=diag
+            )
+        taken, eq = bt_portfolio(all_pos, deposit)
+        n = len(taken)
+        wins = [t for t in taken if t["pnl"] > 0]
+        losses = [t for t in taken if t["pnl"] <= 0]
+        gross_win = sum(t["pnl"] for t in wins)
+        gross_loss = abs(sum(t["pnl"] for t in losses))
+        pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
+        ret = (eq[-1] / deposit - 1.0) if eq else 0.0
+        peak = deposit; dd = 0.0
+        for x in eq:
+            peak = max(peak, x)
+            dd = max(dd, (peak - x) / peak if peak > 0 else 0.0)
+        return diag["signals"], n, pf, ret, dd
+    finally:
+        _bt_restore(saved)
+
+def grid_search(run_backtest_fn, param_grid):
+    """Ваша функция — сигнатура и логика без изменений."""
+    keys = list(param_grid.keys())
+    combinations = list(itertools.product(*param_grid.values()))
+
+    results = []
+
+    for values in combinations:
+        config = dict(zip(keys, values))
+
+        signals, trades, pf, ret, dd = run_backtest_fn(config)
+
+        results.append({
+            **config,
+            "signals": signals,
+            "trades": trades,
+            "pf": pf,
+            "return": ret,
+            "drawdown": dd
+        })
+
+        print(f"\u2705 {config} \u2192 PF={pf:.2f}, trades={trades}")
+
+    return pd.DataFrame(results)
+
+def plot_heatmap(df, x, y, metric="pf", save_path=None):
+    """Ваша функция — сигнатура и логика без изменений, кроме plt.show()->savefig,
+    т.к. на сервере (Railway) нет дисплея — картинка сохраняется в файл для отправки
+    через tg_photo(), plt.show() там просто ничего не сделает."""
+    if not HAS_MPL_GRID:
+        return None
+    pivot = df.pivot_table(
+        index=y,
+        columns=x,
+        values=metric,
+        aggfunc="mean"
+    )
+
+    plt.figure()
+    plt.imshow(pivot, aspect='auto')
+    plt.colorbar(label=metric)
+
+    plt.xticks(range(len(pivot.columns)), pivot.columns)
+    plt.yticks(range(len(pivot.index)), pivot.index)
+
+    plt.xlabel(x)
+    plt.ylabel(y)
+    plt.title(f"{metric} heatmap")
+
+    path = save_path or os.path.join(DATA_DIR, f"heatmap_{x}_{y}_{metric}.png")
+    plt.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close()
+    return path
+
+def stability_score(df, group_cols, metric="pf"):
+    """Ваша функция — без изменений: устойчивость = среднее / (std + eps),
+    высокий скор = комбинация стабильно хорошая, а не разово удачная."""
+    grouped = df.groupby(group_cols)[metric]
+
+    stability = grouped.mean() / (grouped.std() + 1e-6)
+
+    return stability.sort_values(ascending=False)
+
+def run_grid_search_telegram(chat, days=14, ncoins=30, param_grid=None):
+    """Обёртка для запуска через Telegram: /gridsearch [days] [ncoins].
+    Скачивает данные один раз, перебирает сетку параметров (ваш grid_search()),
+    строит хитмапы, считает stability_score, фильтрует по trades/pf/drawdown,
+    сохраняет CSV и шлёт итог + картинки обратно в чат."""
+    if BT_RUNNING["on"]:
+        tg_send(chat, "\u23F3 Бэктест/грид уже идёт — дождись окончания."); return
+    BT_RUNNING["on"] = True
+    try:
+        if param_grid is None:
+            param_grid = {
+                "volume_threshold": [1.2, 1.5, 2.0, 2.5],
+                "break_lookback": [1, 2, 3, 5],
+                "oi_strength": [0.5, 0.8, 1.0],
+            }
+        n_combos = 1
+        for v in param_grid.values():
+            n_combos *= len(v)
+        tg_send(chat, f"\U0001F52C Grid search: {days} дн \u00d7 до {ncoins} монет, "
+                      f"{n_combos} комбинаций параметров ({', '.join(param_grid.keys())}). "
+                      f"Скачиваю данные один раз...")
+        cached = _bt_prefetch(days, ncoins)
+        if not cached:
+            tg_send(chat, "\U0001F4ED Momentum-вселенная пуста за этот период — увеличь days/ncoins.")
+            return
+        tg_send(chat, f"\u2705 Данных по {len(cached)} монетам. Прогоняю {n_combos} комбинаций (это может занять несколько минут)...")
+
+        run_backtest_fn = lambda cfg: _bt_run_once(cfg, cached, DEPOSIT)
+        df = grid_search(run_backtest_fn, param_grid)
+
+        # Полный необработанный результат — сохраняем сразу, до фильтров
+        raw_csv = os.path.join(DATA_DIR, "grid_results.csv")
+        df.to_csv(raw_csv, index=False)
+
+        keys = list(param_grid.keys())
+        x_param, y_param = keys[0], keys[1] if len(keys) > 1 else keys[0]
+
+        heatmap_paths = []
+        p1 = plot_heatmap(df, x_param, y_param, "pf")
+        if p1: heatmap_paths.append((p1, f"PF heatmap: {x_param} \u00d7 {y_param}"))
+        p2 = plot_heatmap(df, x_param, y_param, "return")
+        if p2: heatmap_paths.append((p2, f"Return heatmap: {x_param} \u00d7 {y_param}"))
+
+        stability = stability_score(df, keys, metric="pf")
+
+        # Фильтр по надёжности: достаточно сделок, PF>1.2, просадка не критичная (<30%)
+        df_filtered = df[(df["trades"] > 30) & (df["pf"] > 1.2) & (df["drawdown"] < 0.3)]
+
+        lines = [f"\U0001F3C6 Grid search готов: {n_combos} комбинаций \u00d7 {len(cached)} монет.",
+                 f"Прошли фильтр (trades>30, PF>1.2, dd<30%): {len(df_filtered)} из {len(df)}.",
+                 "", "\U0001F4CA Топ-10 по стабильности (mean(PF)/std(PF)):"]
+        for idx, val in stability.head(10).items():
+            key_str = idx if isinstance(idx, str) else ", ".join(f"{k}={v}" for k, v in zip(keys, idx if isinstance(idx, tuple) else [idx]))
+            lines.append(f"\u2022 {key_str} \u2192 стабильность={val:.2f}")
+
+        if len(df_filtered) > 0:
+            best = df_filtered.sort_values("pf", ascending=False).iloc[0]
+            best_str = ", ".join(f"{k}={best[k]}" for k in keys)
+            lines.append("")
+            lines.append(f"\U0001F947 Лучшая надёжная комбинация: {best_str}")
+            lines.append(f"PF={best['pf']:.2f} \u00b7 trades={int(best['trades'])} \u00b7 "
+                          f"return={best['return']*100:.1f}% \u00b7 dd={best['drawdown']*100:.1f}%")
+            filtered_csv = os.path.join(DATA_DIR, "grid_results_filtered.csv")
+            df_filtered.to_csv(filtered_csv, index=False)
+
+        tg_send(chat, "\n".join(lines))
+        for path, caption in heatmap_paths:
+            tg_photo(chat, path, caption)
+    except Exception as e:
+        tg_send(chat, f"\u26A0\uFE0F grid search err: {e}")
+    finally:
+        BT_RUNNING["on"] = False
+
+
+# ==============================================================
+# DEMO / SANITY-CHECK МОДУЛЬ НА СИНТЕТИЧЕСКИХ ДАННЫХ
+# Внимание: этот блок работает на случайных ценах (np.random),
+# а не на реальных котировках Binance/Bybit — он НЕ связан с
+# живым detect_signal и НЕ участвует в реальной торговле бота.
+# Его смысл — быстрая проверка логики grid_search/heatmap/
+# stability_score на синтетике перед тем, как гонять их на
+# реальных исторических данных через /gridsearch.
+# Все функции даны как есть, но с префиксом demo_, чтобы не
+# конфликтовать с уже существующими в файле grid_search(),
+# plot_heatmap(), stability_score() — у них другие сигнатуры
+# (работают с реальными run_backtest_fn/monetary PF), и простое
+# совпадение имён привело бы к перезаписи рабочих версий более
+# новыми определениями ниже в файле — тогда команда /gridsearch
+# сломалась бы (TypeError: grid_search() missing 1 required
+# positional argument, т.к. demo-версия принимает только 1 аргумент).
+# ==============================================================
+
+def demo_backtest(prices, signals):
+    df = pd.DataFrame({
+        "price": prices,
+        "signal": signals
+    })
+
+    df["returns"] = df["price"].pct_change().fillna(0)
+    df["strategy"] = df["returns"] * df["signal"].shift(1).fillna(0)
+    df["equity"] = (1 + df["strategy"]).cumprod()
+
+    return df
+
+
+def demo_compute_metrics(df):
+    total_return = df["equity"].iloc[-1] - 1
+
+    wins = (df["strategy"] > 0).sum()
+    losses = (df["strategy"] < 0).sum()
+    winrate = wins / (wins + losses) if (wins + losses) else 0
+
+    cum_max = df["equity"].cummax()
+    drawdown = (df["equity"] - cum_max) / cum_max
+    max_dd = drawdown.min()
+
+    sharpe = df["strategy"].mean() / (df["strategy"].std() + 1e-9)
+
+    return total_return, winrate, max_dd, sharpe
+
+
+def demo_generate_signals(prices, config):
+    df = pd.DataFrame({"price": prices})
+    df["ret"] = df["price"].pct_change()
+
+    lb = config["break_lookback"]
+
+    df["roll_high"] = df["price"].rolling(lb).max()
+
+    cond = (
+        (df["price"] > df["roll_high"].shift(1)) &
+        (df["ret"] > 0)
+    )
+
+    df["signal"] = 0
+    df.loc[cond, "signal"] = 1
+    df["signal"] = df["signal"].replace(0, method="ffill").fillna(0)
+
+    return df["signal"]
+
+
+def demo_extract_trades(df):
+    trades = []
+    pos = 0
+    entry_price = 0
+
+    for i in range(1, len(df)):
+        sig = df["signal"].iloc[i]
+        price = df["price"].iloc[i]
+
+        if pos == 0 and sig == 1:
+            pos = 1
+            entry_price = price
+
+        elif pos == 1 and sig == 0:
+            pnl = price / entry_price - 1
+            trades.append(pnl)
+            pos = 0
+
+    return np.array(trades)
+
+
+def demo_trade_stats(trades):
+    if len(trades) == 0:
+        return 0, 0, 0
+
+    wins = trades[trades > 0]
+    losses = trades[trades <= 0]
+
+    winrate = len(wins) / len(trades)
+    pf = abs(wins.sum() / (losses.sum() + 1e-9))
+
+    return winrate, pf, len(trades)
+
+
+def demo_run_backtest_fn(config):
+    np.random.seed(42)
+    prices = pd.Series(np.cumprod(1 + np.random.normal(0, 0.01, 1000)))
+
+    signals = demo_generate_signals(prices, config)
+    df = demo_backtest(prices, signals)
+
+    ret, winrate, dd, sharpe = demo_compute_metrics(df)
+
+    trades_arr = demo_extract_trades(df)
+    winrate_t, pf, trades = demo_trade_stats(trades_arr)
+
+    return {
+        "signals": int((df["signal"].diff() != 0).sum()),
+        "trades": trades,
+        "pf": pf,
+        "return": ret,
+        "dd": dd
+    }
+
+
+def demo_grid_search(param_grid):
+    keys = list(param_grid.keys())
+    combos = list(itertools.product(*param_grid.values()))
+
+    results = []
+
+    for values in combos:
+        config = dict(zip(keys, values))
+
+        res = demo_run_backtest_fn(config)
+
+        results.append({**config, **res})
+
+        print(config, "-> PF:", round(res["pf"], 2), "trades:", res["trades"])
+
+    return pd.DataFrame(results)
+
+
+def demo_plot_heatmap(df, x, y, metric="pf", save_path=None):
+    """plt.show() заменён на savefig — на Railway нет дисплея, картинка нужна как файл."""
+    pivot = df.pivot_table(index=y, columns=x, values=metric)
+
+    plt.figure()
+    plt.imshow(pivot, aspect='auto')
+    plt.colorbar()
+    plt.xticks(range(len(pivot.columns)), pivot.columns)
+    plt.yticks(range(len(pivot.index)), pivot.index)
+    plt.title(metric)
+    plt.xlabel(x)
+    plt.ylabel(y)
+    path = save_path or os.path.join(DATA_DIR, f"demo_heatmap_{x}_{y}_{metric}.png")
+    plt.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close()
+    return path
+
+
+def demo_stability_score(df, cols):
+    g = df.groupby(cols)["pf"]
+    return (g.mean() / (g.std() + 1e-6)).sort_values(ascending=False)
+
+
+def demo_auto_optimize(base_config):
+    config = base_config.copy()
+
+    steps = [
+        ("break_lookback", [1, 2, 3, 5]),
+    ]
+
+    best = None
+
+    for name, values in steps:
+        print(f"\n\U0001F527 optimizing {name}")
+
+        for v in values:
+            config[name] = v
+            res = demo_run_backtest_fn(config)
+
+            print(name, v, res)
+
+            if best is None or res["pf"] > best["pf"]:
+                best = {**config, **res}
+
+    return best
+
+
+def demo_selfcheck():
+    """Запуск синтетической проверки — эквивалент вашего if __name__ блока,
+    но как вызываемая функция (не выполняется автоматически при импорте файла).
+    Можно вызвать вручную из консоли Railway или временно из main() для проверки,
+    что grid_search/heatmap/stability_score логически работают корректно."""
+    base_config = {"break_lookback": 1}
+
+    print("\n\U0001F680 AUTO OPTIMIZATION (synthetic)")
+    best = demo_auto_optimize(base_config)
+    print("\nBEST:", best)
+
+    print("\n\U0001F4CA GRID SEARCH (synthetic)")
+    param_grid = {"break_lookback": [1, 2, 3, 5]}
+
+    df = demo_grid_search(param_grid)
+    df = df[(df["trades"] > 5) & (df["pf"] > 1)]
+
+    print("\nTOP:")
+    print(df.sort_values("pf", ascending=False).head())
+
+    print("\n\U0001F525 HEATMAP (synthetic)")
+    hm_path = demo_plot_heatmap(df, "break_lookback", "break_lookback") if len(df) else None
+
+    print("\n\U0001F9E0 STABILITY (synthetic)")
+    stab = demo_stability_score(df, ["break_lookback"]) if len(df) else None
+    print(stab.head() if stab is not None else "no data")
+
+    return best, df, hm_path, stab
+
+
+def run_selfcheck_telegram(chat):
+    """Обёртка demo_selfcheck() для команды /selfcheck — прогоняет синтетическую
+    проверку логики grid_search/heatmap/stability на случайных данных (без сети,
+    без затрагивания реального detect_signal и живых позиций) и шлёт итог в чат."""
+    try:
+        tg_send(chat, "\U0001F9EA Synthetic self-check: проверяю grid_search/heatmap/stability на случайных данных (без сети)...")
+        best, df, hm_path, stab = demo_selfcheck()
+        lines = [f"\u2705 Self-check пройден. Комбинаций: {len(df)}.",
+                  f"Лучшая (синтетика): {best}"]
+        if stab is not None and len(stab):
+            lines.append("Stability top: " + ", ".join(f"{k}={v:.2f}" for k, v in stab.head(3).items()))
+        tg_send(chat, "\n".join(lines))
+        if hm_path:
+            tg_photo(chat, hm_path, "Synthetic heatmap (self-check)")
+    except Exception as e:
+        tg_send(chat, f"\u26A0\uFE0F self-check err: {e}")
+
+
+# ==============================================================
+# LIVE-DATA BACKTEST FN: та же идея, что и demo_run_backtest_fn,
+# но данные берутся из РЕАЛЬНЫХ котировок Binance (klines + OI),
+# а не из синтетики. Переписано с requests+pandas.merge_asof на
+# http_json() (уже есть в файле, urllib-based) — чтобы не тащить
+# в requirements.txt ещё одну HTTP-библиотеку (requests) при
+# наличии готовой инфраструктуры запросов. Названия функций с
+# префиксом live_, чтобы не конфликтовать с demo_* и с реальным
+# run_backtest()/bt_klines()/bt_oi(), которые работают с MOMENTUM-
+# вселенной и учитывают лимит слотов портфеля — этот блок проще:
+# считает метрики по ОДНОЙ монете за раз, без портфельных лимитов.
+# ==============================================================
+
+def live_get_klines(symbol="BTCUSDT", interval="1h", limit=500):
+    url = f"{BINANCE}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = http_json(url)
+
+    df = pd.DataFrame(data, columns=[
+        "time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "trades", "taker_base", "taker_quote", "ignore"
+    ])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+
+    return df[["time", "open", "high", "low", "close", "volume"]]
+
+def live_get_oi(symbol="BTCUSDT", interval="5m", limit=500):
+    url = f"{BINANCE}/futures/data/openInterestHist?symbol={symbol}&period={interval}&limit={limit}"
+    data = http_json(url)
+
+    df = pd.DataFrame(data)
+    df["time"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df["oi"] = df["sumOpenInterest"].astype(float)
+
+    return df[["time", "oi"]]
+
+def live_load_market_data(symbol="BTCUSDT"):
+    df_price = live_get_klines(symbol)
+    df_oi = live_get_oi(symbol)
+
+    df = pd.merge_asof(
+        df_price.sort_values("time"),
+        df_oi.sort_values("time"),
+        on="time"
+    )
+    df["oi"] = df["oi"].ffill()  # fillna(method=) устарел в новых pandas
+
+    return df
+
+def live_generate_signals(df, config):
+    df = df.copy()
+    df["ret"] = df["close"].pct_change()
+
+    df["vol_ma"] = df["volume"].rolling(20).mean()
+    df["vol_spike"] = df["volume"] / df["vol_ma"]
+
+    df["oi_delta"] = df["oi"].pct_change()
+
+    lb = config["break_lookback"]
+    df["high_roll"] = df["high"].rolling(lb).max()
+
+    signal = (
+        (df["vol_spike"] > config["volume_threshold"]) &
+        (df["oi_delta"] > config["oi_threshold"]) &
+        (df["close"] > df["high_roll"].shift(1))
+    )
+
+    df["signal"] = 0
+    df.loc[signal, "signal"] = 1
+    df["signal"] = df["signal"].mask(df["signal"] == 0).ffill().fillna(0)  # replace(method=) устарел
+
+    return df
+
+def live_run_backtest_fn(config, symbol="BTCUSDT"):
+    """Метрики стратегии по ОДНОЙ реальной монете за раз (для сравнения между
+    символами — см. live_multi_symbol_report ниже). Использует demo_backtest/
+    demo_compute_metrics (та же математика equity/PF/Sharpe), но на живых данных."""
+    df = live_load_market_data(symbol)
+    df = live_generate_signals(df, config)
+
+    prices = df["close"]
+    bt = demo_backtest(prices, df["signal"])
+    ret, winrate, dd, sharpe = demo_compute_metrics(bt)
+
+    trades = int((df["signal"].diff() != 0).sum())
+
+    pos_sum = bt.loc[bt["strategy"] > 0, "strategy"].sum()
+    neg_sum = bt.loc[bt["strategy"] < 0, "strategy"].sum()
+    pf = abs(pos_sum / (neg_sum + 1e-9))
+
+    return {
+        "signals": trades,
+        "trades": trades,
+        "pf": pf,
+        "return": ret,
+        "dd": dd,
+        "winrate": winrate,
+        "sharpe": sharpe,
+    }
+
+def live_multi_symbol_report(chat, config=None, symbols=None):
+    """Команда /crosscheck — прогоняет один и тот же конфиг сигналов по нескольким
+    символам сразу (BTC/ETH/SOL/BNB по умолчанию) на реальных данных Binance и
+    присылает сравнительную таблицу PF/return/winrate/Sharpe по каждой монете."""
+    if config is None:
+        config = {"break_lookback": 3, "volume_threshold": 1.5, "oi_threshold": 0.001}
+    if symbols is None:
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+
+    results = []
+    for s in symbols:
+        try:
+            res = live_run_backtest_fn(config, s)
+            res["symbol"] = s
+            results.append(res)
+        except Exception as e:
+            print(f"live_multi_symbol_report {s} err:", e)
+            tg_send(chat, f"\u26A0\uFE0F {s}: err {e}")
+
+    if not results:
+        tg_send(chat, "\U0001F4ED Не удалось получить данные ни по одной монете.")
+        return None
+
+    df = pd.DataFrame(results)
+    csv_path = os.path.join(DATA_DIR, "cross_symbol_report.csv")
+    df.to_csv(csv_path, index=False)
+
+    lines = [f"\U0001F310 Cross-symbol check: {config}", ""]
+    for _, row in df.iterrows():
+        lines.append(f"\u2022 {row['symbol']}: PF={row['pf']:.2f} \u00b7 trades={row['trades']} \u00b7 "
+                      f"return={row['return']*100:.1f}% \u00b7 winrate={row['winrate']*100:.0f}% \u00b7 "
+                      f"dd={row['dd']*100:.1f}% \u00b7 sharpe={row['sharpe']:.2f}")
+    tg_send(chat, "\n".join(lines))
+    return df
+
+def run_crosscheck_telegram(chat):
+    try:
+        tg_send(chat, "\U0001F310 Прогоняю сигналы по BTC/ETH/SOL/BNB на реальных данных Binance...")
+        live_multi_symbol_report(chat)
+    except Exception as e:
+        tg_send(chat, f"\u26A0\uFE0F crosscheck err: {e}")
 
 def run_backtest(chat, days=14, ncoins=30, overrides=None):
     if BT_RUNNING["on"]:
@@ -1262,6 +2191,9 @@ def tg_loop(st):
                             "   Калибровка порогов (живой бот не трогается): spike= quiet= qbars= wick= atr= oi= rsi=\n"
                             "   ATR-риск (частичная фиксация): slmult= (SL) tp1mult= (TP1 50%) tp2mult= (TP2 50%) trailmult= (трейлинг после TP1)\n"
                             "   Пример: /backtest 30 60 spike=1.5 quiet=2.5 qbars=5 slmult=1.5 tp1mult=2.0 tp2mult=4.5 \u00b7 или пресет: /backtest 30 60 soft\n"
+                            "/gridsearch [дней] [монет] — перебор volume_threshold\u00d7break_lookback\u00d7oi_strength, хитмапы PF+return, stability score, CSV\n"
+                            "/selfcheck — синтетическая проверка grid_search/heatmap/stability (без сети, без реальных данных)\n"
+                            "/crosscheck — сравнение сигналов по BTC/ETH/SOL/BNB на реальных данных (PF/return/winrate/sharpe)\n"
                             "/pause — пауза (новые сигналы не ищутся, позиция ведётся)\n"
                             "/resume — возобновить сканирование\n"
                             "/help — эта справка")
@@ -1288,6 +2220,13 @@ def tg_loop(st):
                 elif text.startswith("/backtest"):
                     bd, bc, ov = _parse_bt_args(text)
                     threading.Thread(target=run_backtest, args=(cid, bd, bc, ov), daemon=True).start()
+                elif text.startswith("/gridsearch"):
+                    bd, bc, _ov = _parse_bt_args(text)
+                    threading.Thread(target=run_grid_search_telegram, args=(cid, bd, bc, None), daemon=True).start()
+                elif text.startswith("/selfcheck"):
+                    threading.Thread(target=run_selfcheck_telegram, args=(cid,), daemon=True).start()
+                elif text.startswith("/crosscheck"):
+                    threading.Thread(target=run_crosscheck_telegram, args=(cid,), daemon=True).start()
         except Exception as e:
             print("tg_loop err:", e); time.sleep(3)
 
@@ -1296,6 +2235,7 @@ def main():
     chat = load_chat()
     print("EVA v4 запущен (PAPER, без условия 3 зелёных). chat:", "есть" if chat else "нет")
     threading.Thread(target=tg_loop, args=(st,), daemon=True).start()
+    threading.Thread(target=prop_loop, daemon=True).start()  # PROP-стратегия: полностью параллельный независимый цикл
     last_scan = last_manage = 0
     while True:
         try:
@@ -1315,181 +2255,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ================= BACKTEST + PLOT =================
-import pandas as pd
-import matplotlib.pyplot as plt
-
-def backtest(price_series, signals):
-    df = pd.DataFrame({"price": price_series})
-    df["signal"] = signals
-    df["returns"] = df["price"].pct_change()
-
-    df["strategy"] = df["signal"].shift(1) * df["returns"]
-    df["equity"] = (1 + df["strategy"]).cumprod()
-
-    return df
-
-def plot_equity(df):
-    plt.figure()
-    plt.plot(df["equity"])
-    plt.title("Strategy Equity Curve")
-    plt.xlabel("Time")
-    plt.ylabel("Equity")
-    plt.show()
-
-
-# Example usage (replace with your real data pipeline)
-if __name__ == "__main__":
-    import numpy as np
-
-    np.random.seed(42)
-    prices = pd.Series(np.cumprod(1 + np.random.normal(0, 0.01, 500)))
-
-    # Dummy signals: 1 = long, -1 = short
-    signals = pd.Series(np.where(prices.pct_change() > 0, 1, -1))
-
-    result = backtest(prices, signals)
-    print(result.tail())
-
-    plot_equity(result)
-
-
-# ================= PRO BACKTEST METRICS =================
-def compute_metrics(df):
-    total_return = df["equity"].iloc[-1] - 1
-
-    trades = df[df["signal"].diff() != 0]
-    wins = (df["strategy"] > 0).sum()
-    losses = (df["strategy"] < 0).sum()
-    winrate = wins / (wins + losses) if (wins + losses) > 0 else 0
-
-    # drawdown
-    cum_max = df["equity"].cummax()
-    drawdown = (df["equity"] - cum_max) / cum_max
-    max_dd = drawdown.min()
-
-    # sharpe (simple)
-    sharpe = df["strategy"].mean() / df["strategy"].std() if df["strategy"].std() != 0 else 0
-
-    print("\n===== PRO METRICS =====")
-    print(f"Total Return: {total_return:.2%}")
-    print(f"Winrate: {winrate:.2%}")
-    print(f"Max Drawdown: {max_dd:.2%}")
-    print(f"Sharpe: {sharpe:.2f}")
-    print(f"Trades: {wins + losses}")
-
-    return {
-        "return": total_return,
-        "winrate": winrate,
-        "max_dd": max_dd,
-        "sharpe": sharpe
-    }
-
-
-# Update main block
-if __name__ == "__main__":
-    import numpy as np
-    import pandas as pd
-
-    np.random.seed(42)
-    prices = pd.Series(np.cumprod(1 + np.random.normal(0, 0.01, 500)))
-
-    signals = pd.Series(np.where(prices.pct_change() > 0, 1, -1))
-
-    result = backtest(prices, signals)
-    compute_metrics(result)
-    plot_equity(result)
-
-
-# ================= TRADE-LEVEL ANALYTICS =================
-def extract_trades(df):
-    trades = []
-    position = 0
-    entry_price = 0
-    entry_idx = None
-
-    for i in range(1, len(df)):
-        sig_prev = df["signal"].iloc[i-1]
-        sig = df["signal"].iloc[i]
-        price = df["price"].iloc[i]
-
-        # Enter trade
-        if position == 0 and sig != 0:
-            position = sig
-            entry_price = price
-            entry_idx = i
-
-        # Exit or flip
-        elif position != 0 and sig != position:
-            pnl = (price / entry_price - 1) * position
-            trades.append({
-                "entry_idx": entry_idx,
-                "exit_idx": i,
-                "direction": position,
-                "entry_price": entry_price,
-                "exit_price": price,
-                "pnl": pnl,
-                "duration": i - entry_idx
-            })
-            position = sig
-            entry_price = price
-            entry_idx = i
-
-    return pd.DataFrame(trades)
-
-
-def trade_stats(trades):
-    if len(trades) == 0:
-        print("No trades")
-        return
-
-    wins = trades[trades.pnl > 0]
-    losses = trades[trades.pnl <= 0]
-
-    avg_win = wins.pnl.mean() if len(wins) else 0
-    avg_loss = losses.pnl.mean() if len(losses) else 0
-
-    expectancy = trades.pnl.mean()
-    profit_factor = abs(wins.pnl.sum() / losses.pnl.sum()) if losses.pnl.sum() != 0 else float('inf')
-
-    print("\n===== TRADE LEVEL STATS =====")
-    print(f"Trades: {len(trades)}")
-    print(f"Winrate: {len(wins)/len(trades):.2%}")
-    print(f"Avg Win: {avg_win:.2%}")
-    print(f"Avg Loss: {avg_loss:.2%}")
-    print(f"Expectancy: {expectancy:.4f}")
-    print(f"Profit Factor: {profit_factor:.2f}")
-    print(f"Avg Duration: {trades.duration.mean():.1f} bars")
-
-    return {
-        "trades": len(trades),
-        "winrate": len(wins)/len(trades),
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "expectancy": expectancy,
-        "profit_factor": profit_factor
-    }
-
-
-# ===== integrate into main =====
-if __name__ == "__main__":
-    import numpy as np
-    import pandas as pd
-
-    np.random.seed(42)
-    prices = pd.Series(np.cumprod(1 + np.random.normal(0, 0.01, 500)))
-
-    signals = pd.Series(np.where(prices.pct_change() > 0, 1, -1))
-
-    result = backtest(prices, signals)
-
-    # Ensure price column exists
-    result["price"] = prices.values
-
-    compute_metrics(result)
-    plot_equity(result)
-
-    trades = extract_trades(result)
-    trade_stats(trades)
