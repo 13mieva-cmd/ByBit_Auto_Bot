@@ -56,17 +56,17 @@ MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 0))
 # --- сигнал (спека) ---
 TF = "15m"
 VOL_MA_LEN = 20
-VOL_SPIKE_MIN = 2.0     # Volume Spike: Current Volume > 2.0 * SMA20 (объём "просыпается")
+VOL_SPIKE_MIN = 2.45     # Volume Spike: Current Volume > 2.0 * SMA20 (объём "просыпается")
 ATR_MIN_MOVE_MULT = 1.5 # Price Action: (Close - PrevClose) > 1.5*ATR14, реальный импульс, не шум
 BREAKOUT_LOOKBACK = 3   # пробой считаем не только над high пред. свечи, а над max(high) последних N свечей (шире, реже false-negative)
-QUIET_BARS = 8          # строго 8 чистых баров затишья перед импульсом
-QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
+QUIET_BARS = 7          # строго 8 чистых баров затишья перед импульсом
+QUIET_MAX = 2.05         # жёсткий порог шума в полке накопления
 QUIET_ALLOW = 0         # ноль толерантности к шуму в зоне накопления
 QUIET_REQUIRED = int(os.environ.get("QUIET_REQUIRED", 0))  # 0=OPTIONAL (не блокирует сигнал, только влияет на score/details), 1=обязательное отбрасывание как раньше
-WICK_MAX = 0.30
+WICK_MAX = 0.38
 ATR_LEN = 14
-BAR_ATR_MAX = 2.5       # FOMO CAP: строго. High-Low сигнальной свечи > 2.5*ATR -> сигнал отбрасывается целиком
-OI_MIN_GROW = 0.02      # OI-ПОДТВЕРЖДЕНИЕ: (OI_now - OI_prev)/OI_prev < 2% -> сигнал отбрасывается (фейковый объём без реального интереса)
+BAR_ATR_MAX = 3.2       # FOMO CAP: строго. High-Low сигнальной свечи > 2.5*ATR -> сигнал отбрасывается целиком
+OI_MIN_GROW = 0.014      # OI-ПОДТВЕРЖДЕНИЕ: (OI_now - OI_prev)/OI_prev < 2% -> сигнал отбрасывается (фейковый объём без реального интереса)
 RSI_LEN = 14
 RSI_MAX = 78.0          # поднято с 75: на сильных пампах RSI летит быстро
 CVD_MODE = "all"
@@ -74,16 +74,16 @@ LEVEL_LOOKBACK = 96
 EMA_FAST, EMA_SLOW = 21, 50
 
 # --- вход/выход (МАРКЕТ на открытии новой свечи сразу после сигнала; лимитка/ретест отключены) ---
-FIB_RETRACE = 0.0      # 0.0: лимитка-ретест на Фибо больше не используется (плохие исполнения на затухающих пампах)
-ENTRY_TTL_BARS = 0     # не используется при маркет-входе (оставлено для совместимости состояния)
+FIB_RETRACE = 0.382      # 0.0: лимитка-ретест на Фибо больше не используется (плохие исполнения на затухающих пампах)
+ENTRY_TTL_BARS = 8     # не используется при маркет-входе (оставлено для совместимости состояния)
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.00055
 
 # --- ATR-риск-менеджмент: частичная фиксация TP1/TP2 (position scaling) ---
-ATR_SL_MULT = 1.5      # SL = entry - 1.5*ATR
-ATR_TP1_MULT = 2.0     # TP1 = entry + 2.0*ATR -> закрыть 50% позиции
+ATR_SL_MULT = 1.8      # SL = entry - 1.5*ATR
+ATR_TP1_MULT = 2.2     # TP1 = entry + 2.0*ATR -> закрыть 50% позиции
 ATR_TP2_MULT = 4.5     # TP2 = entry + 4.5*ATR -> закрыть оставшиеся 50%
-ATR_TRAIL_MULT = 1.5   # после TP1: SL остатка -> БУ, трейлинг 1.5*ATR от пика до TP2
+ATR_TRAIL_MULT = 1.4   # после TP1: SL остатка -> БУ, трейлинг 1.5*ATR от пика до TP2
 
 # --- VALID_ENTRY: контроль качества входа относительно уровня пробоя ---
 ENTRY_MAX_EXT_ATR = float(os.environ.get("ENTRY_MAX_EXT_ATR", "1.2"))       # не входим дальше 1.2*ATR от уровня
