@@ -435,121 +435,72 @@ def atr(h, l, c, period=14):
 
 # ============================== СИГНАЛ (по спеке, БЕЗ "3 зелёных") ==============================
 def detect_signal(o, h, l, c, v, tb, oi):
-    """Импульсная свеча -1 (последняя закрытая). Возвращает (ok, details|причина)."""
+    """EVA v4 — сбалансированная версия"""
     n = len(c)
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
-    i1 = n - 1  # импульсная свеча
+    i1, i2, i3 = n - 3, n - 2, n - 1
 
-    # 1) Price Action v2 (упрощено по спеке — сигналов было 0, фильтры были пережаты):
-    #    ❌ убрали "зелёная свеча" (body>0) — заменили на close > prev_close (мягче,
-    #       не требует именно бычьего тела текущей свечи, только рост к пред. закрытию)
-    #    ❌ заменили "пробой high только пред. свечи" на "пробой над max(high) последних
-    #       BREAKOUT_LOOKBACK свечей" (уже сделано ранее)
-    #    ⚠️ ATR_MIN_MOVE_MULT-порог движения оставлен как есть (1.5x ATR) — если после
-    #       этой правки сигналов всё ещё 0/мало, следующий кандидат на смягчение — именно
-    #       он: он требует не просто рост, а рост >=1.5x ATR, что само по себе жёстче,
-    #       чем "close > prev_close" из вашей v2-спеки.
-    a = atr(h[:i1], l[:i1], c[:i1], ATR_LEN)
-    if a <= 0: return False, "нет ATR для риск-менеджмента"
-    if not (c[i1] > c[i1 - 1]):
-        return False, "close <= prev_close"
-    breakout_level = max(h[i1 - BREAKOUT_LOOKBACK:i1])
-    if not (c[i1] > breakout_level):
-        return False, f"нет пробоя over {BREAKOUT_LOOKBACK}-свечного диапазона"
-    price_move = c[i1] - c[i1 - 1]
-    if price_move < ATR_MIN_MOVE_MULT * a:
-        return False, f"движение цены слабое ({price_move/a:.2f}x ATR < {ATR_MIN_MOVE_MULT}x)"
+    # 1. Структура (разумный минимум)
+    green_count = sum(1 for i in (i1, i2, i3) if c[i] > o[i])
+    strong_momentum = (c[i2] > h[i1] or c[i3] > h[i2])
+    if green_count < 2 or not strong_momentum:
+        return False, "слабая структура"
 
-    # 2) затишье до импульса (OPTIONAL) + всплеск объёма на импульсной свече (Volume Spike: >2.0x SMA20)
-    #    Раньше "не было затишья" отбрасывало сигнал целиком (жёсткий блок), но в реальности
-    #    перед импульсом не всегда тишина — часто идёт "грязная аккумуляция" с шумным объёмом.
-    #    Теперь по умолчанию (QUIET_REQUIRED=0) затишье НЕ обязательно: считаем его только
-    #    как доп. информацию в details (quiet_ok), а отбрасываем сигнал лишь если совсем
-    #    нет всплеска объёма (spike < VOL_SPIKE_MIN) — это ядро фильтра, оно не смягчается.
+    # 2. Затишье + всплеск
     base = v[i1 - VOL_MA_LEN:i1]
-    if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
+    if len(base) < VOL_MA_LEN: return False, "мало базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
+    
     noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
-    quiet_ok = noisy <= QUIET_ALLOW
-    if QUIET_REQUIRED and not quiet_ok:
-        return False, f"не было затишья ({noisy} шумн.)"
+    if noisy > QUIET_ALLOW: return False, f"не было затишья ({noisy})"
+    
     spike = v[i1] / vma
     if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
 
-    # 3) фитиль импульсной свечи <= 30% размаха
-    rng1 = h[i1] - l[i1]
-    if rng1 <= 0: return False, "нулевая импульсная свеча"
-    upper_wick = (h[i1] - c[i1]) / rng1
-    if upper_wick > WICK_MAX: return False, f"фитиль {upper_wick*100:.0f}%>30%"
+    # 3. Фитиль
+    rng3 = h[i3] - l[i3]
+    if rng3 > 0 and (h[i3] - c[i3]) / rng3 > WICK_MAX:
+        return False, "длинный фитиль"
 
-    # 4) импульсная свеча не параболик (FOMO ATR-кап)
-    if rng1 > BAR_ATR_MAX * a: return False, f"свеча параболик ({rng1/a:.1f}x ATR)"
+    # 4. CVD
+    deltas = [2 * tb[i] - v[i] for i in (i1, i2, i3)]
+    if sum(deltas) <= 0 or deltas[-1] <= 0:
+        return False, "CVD слабый"
 
-    # 5) CVD: дельта > 0 на импульсной свече (агрессивные покупки)
-    delta = 2 * tb[i1] - v[i1]
-    if delta <= 0: return False, "дельта не растёт"
-
-    # 6) OI-ПОДТВЕРЖДЕНИЕ: рост Open Interest СТРОГО на сигнальной свече (Current vs Previous)
-    # (Current_OI - Previous_OI) / Previous_OI < OI_MIN_GROW (2%) -> сигнал отбрасывается мгновенно
-    oi_ok = False; oi_chg = 0.0
-    if len(oi) >= 2 and oi[-2] > 0:
-        oi_chg = (oi[-1] - oi[-2]) / oi[-2]
+    # 5. OI
+    oi_ok = False
+    if len(oi) >= 5:
+        oi_chg = (oi[-1] / oi[-5] - 1) if oi[-5] > 0 else 0
         oi_ok = oi_chg >= OI_MIN_GROW
-    if not oi_ok: return False, f"OI не растёт ({oi_chg*100:+.1f}%, нужно \u2265{OI_MIN_GROW*100:.0f}%)"
+    if not oi_ok: return False, "OI слабый"
 
-    # 7) тренд: close > EMA21 > EMA50
-    e21 = ema_series(c, EMA_FAST)[-1]; e50 = ema_series(c, EMA_SLOW)[-1]
-    if not (c[i1] > e21 > e50): return False, "нет аптренда EMA"
+    # 6. EMA + RSI + Уровень
+    e21 = ema_series(c, EMA_FAST)[-1]
+    if c[i3] <= e21: return False, "нет аптренда EMA"
 
-    # 8) RSI < 75
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
     if r > RSI_MAX: return False, f"RSI {r:.0f} перегрет"
 
-    # 9) пробой локального уровня (max high за сутки ДО импульса)
     level = max(h[i1 - LEVEL_LOOKBACK:i1])
-    if not (c[i1] > level): return False, "уровень не пробит"
+    if c[i3] <= level: return False, "уровень не пробит"
 
-    # 9b) VALID_ENTRY: контроль качества входа относительно уровня пробоя (ATR-полосы + откат + удержание)
-    breakout = level
-    close = c[i1]; low = l[i1]; prev_close = c[i1 - 1]
-    volume = v[i1]; volume_ma = vma
-
-    # не входим слишком далеко от уровня пробоя
-    if (close - breakout) > ENTRY_MAX_EXT_ATR * a:
-        return False, f"вход слишком далеко от уровня (+{(close-breakout)/a:.2f}x ATR > {ENTRY_MAX_EXT_ATR}x)"
-
-    # должен быть откат: close не выше breakout + 0.8*ATR
-    if close > breakout + ENTRY_MIN_PULLBACK_ATR * a:
-        return False, f"нет отката к уровню (close +{(close-breakout)/a:.2f}x ATR > {ENTRY_MIN_PULLBACK_ATR}x)"
-
-    # удержание уровня: low свечи не должен проваливаться ниже breakout
-    if low < breakout:
-        return False, "уровень не удержан (low ниже breakout)"
-
-    # подтверждение продолжения движения
-    if close <= prev_close:
-        return False, "нет подтверждения продолжения (close <= prev_close)"
-
-    # объём снова растёт (выше своей MA, не обязательно спайк)
-    if volume < volume_ma:
-        return False, "объём не подтверждает продолжение (< MA)"
-
-    impulse = h[i1] - l[i1]
+    # Расчёт входа
+    impulse = h[i3] - l[i1]
     if impulse <= 0: return False, "нет импульса"
-    # FIB_RETRACE=0.0: entry = цена закрытия сигнальной свечи ≈ цена открытия следующей (маркет-вход)
-    entry = c[i1] - FIB_RETRACE * (c[i1] - o[i1])
-    sl = entry - ATR_SL_MULT * a           # динамический SL: entry - 1.5*ATR
+
+    entry = h[i3] - FIB_RETRACE * impulse
+    sl = l[i1] * (1 - SL_BUFFER)
     if entry <= sl: return False, "вход ниже стопа"
+
     risk_pct = (entry - sl) / entry
-    tp1 = entry + ATR_TP1_MULT * a         # TP1: entry + 2.0*ATR -> закрыть 50%
-    tp2 = entry + ATR_TP2_MULT * a         # TP2: entry + 4.5*ATR -> закрыть остаток
+    tp1 = entry + (entry - sl) * TP1_RR
 
     return True, dict(
-        spike=spike, delta=delta, oi_chg=oi_chg, rsi=r,
-        e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i1],
-        entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
-        wick=upper_wick, close3=c[i1], quiet_ok=quiet_ok,
+        spike=spike, deltas=deltas, oi_chg=oi_chg if 'oi_chg' in locals() else 0, rsi=r,
+        e21=e21, e50=ema_series(c, EMA_SLOW)[-1], level=level, 
+        low1=l[i1], high3=h[i3], entry=entry, sl=sl, tp1=tp1, 
+        risk_pct=risk_pct, wick=(h[i3]-c[i3])/rng3 if rng3 > 0 else 0, close3=c[i3]
     )
 
 
