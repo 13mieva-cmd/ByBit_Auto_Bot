@@ -56,10 +56,11 @@ MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 0))
 # --- сигнал (спека) ---
 TF = "15m"
 VOL_MA_LEN = 20
-VOL_SPIKE_MIN = 2.0     # Volume Spike: Current Volume > 2.0 * SMA20 (объём "просыпается")
+VOL_SPIKE_MIN = float(os.environ.get("VOL_SPIKE_MIN", "1.5"))  # было 2.0 -> 1.5: по воронке рубило 10.5% всех / 77.8% оставшихся после close+breakout — крупный третий отсев
 ATR_MIN_MOVE_MULT = 1.5 # Price Action: (Close - PrevClose) > 1.5*ATR14, реальный импульс, не шум
 PRICE_MOVE_REQUIRED = int(os.environ.get("PRICE_MOVE_REQUIRED", 0))  # 0=OPTIONAL (не блокирует, только details), 1=обязательный порог 1.5x ATR как раньше
-BREAKOUT_LOOKBACK = 3   # пробой считаем не только над high пред. свечи, а над max(high) последних N свечей (шире, реже false-negative)
+BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "5"))  # было 3 -> 5: пробой над более широким диапазоном (по воронке рубило 34.8% всех / 72% оставшихся после close-фильтра)
+CLOSE_ABOVE_PREV_REQUIRED = int(os.environ.get("CLOSE_ABOVE_PREV_REQUIRED", "0"))  # 0=OPTIONAL: close<=prev_close рубило 51.7% всех проверок в воронке — самый крупный отсев, не блокирует по умолчанию
 QUIET_BARS = 8          # строго 8 чистых баров затишья перед импульсом
 QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
 QUIET_ALLOW = 0         # ноль толерантности к шуму в зоне накопления
@@ -453,7 +454,8 @@ def detect_signal(o, h, l, c, v, tb, oi):
     #       чем "close > prev_close" из вашей v2-спеки.
     a = atr(h[:i1], l[:i1], c[:i1], ATR_LEN)
     if a <= 0: return False, "нет ATR для риск-менеджмента"
-    if not (c[i1] > c[i1 - 1]):
+    close_above_prev_ok = c[i1] > c[i1 - 1]
+    if CLOSE_ABOVE_PREV_REQUIRED and not close_above_prev_ok:
         return False, "close <= prev_close"
     breakout_level = max(h[i1 - BREAKOUT_LOOKBACK:i1])
     if not (c[i1] > breakout_level):
@@ -566,7 +568,7 @@ def detect_signal(o, h, l, c, v, tb, oi):
         e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i1],
         entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
         wick=upper_wick, close3=c[i1], quiet_ok=quiet_ok, price_move_ok=price_move_ok,
-        valid_entry_ok=valid_entry_ok,
+        valid_entry_ok=valid_entry_ok, close_above_prev_ok=close_above_prev_ok,
     )
 
 
