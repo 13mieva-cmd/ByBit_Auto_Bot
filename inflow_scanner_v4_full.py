@@ -58,9 +58,11 @@ TF = "15m"
 VOL_MA_LEN = 20
 VOL_SPIKE_MIN = 2.0     # Volume Spike: Current Volume > 2.0 * SMA20 (объём "просыпается")
 ATR_MIN_MOVE_MULT = 1.5 # Price Action: (Close - PrevClose) > 1.5*ATR14, реальный импульс, не шум
+BREAKOUT_LOOKBACK = 3   # пробой считаем не только над high пред. свечи, а над max(high) последних N свечей (шире, реже false-negative)
 QUIET_BARS = 8          # строго 8 чистых баров затишья перед импульсом
 QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
 QUIET_ALLOW = 0         # ноль толерантности к шуму в зоне накопления
+QUIET_REQUIRED = int(os.environ.get("QUIET_REQUIRED", 0))  # 0=OPTIONAL (не блокирует сигнал, только влияет на score/details), 1=обязательное отбрасывание как раньше
 WICK_MAX = 0.30
 ATR_LEN = 14
 BAR_ATR_MAX = 2.5       # FOMO CAP: строго. High-Low сигнальной свечи > 2.5*ATR -> сигнал отбрасывается целиком
@@ -438,22 +440,40 @@ def detect_signal(o, h, l, c, v, tb, oi):
     if n < LEVEL_LOOKBACK + 30: return False, "мало истории"
     i1 = n - 1  # импульсная свеча
 
-    # 1) Price Action: close > high предыдущей свечи (пробой) И движение цены > 1.5*ATR14 (реальный импульс)
-    if not (c[i1] > o[i1]): return False, "импульсная свеча не зелёная"
-    if not (c[i1] > h[i1 - 1]): return False, "нет пробоя high пред. свечи"
+    # 1) Price Action v2 (упрощено по спеке — сигналов было 0, фильтры были пережаты):
+    #    ❌ убрали "зелёная свеча" (body>0) — заменили на close > prev_close (мягче,
+    #       не требует именно бычьего тела текущей свечи, только рост к пред. закрытию)
+    #    ❌ заменили "пробой high только пред. свечи" на "пробой над max(high) последних
+    #       BREAKOUT_LOOKBACK свечей" (уже сделано ранее)
+    #    ⚠️ ATR_MIN_MOVE_MULT-порог движения оставлен как есть (1.5x ATR) — если после
+    #       этой правки сигналов всё ещё 0/мало, следующий кандидат на смягчение — именно
+    #       он: он требует не просто рост, а рост >=1.5x ATR, что само по себе жёстче,
+    #       чем "close > prev_close" из вашей v2-спеки.
     a = atr(h[:i1], l[:i1], c[:i1], ATR_LEN)
     if a <= 0: return False, "нет ATR для риск-менеджмента"
+    if not (c[i1] > c[i1 - 1]):
+        return False, "close <= prev_close"
+    breakout_level = max(h[i1 - BREAKOUT_LOOKBACK:i1])
+    if not (c[i1] > breakout_level):
+        return False, f"нет пробоя over {BREAKOUT_LOOKBACK}-свечного диапазона"
     price_move = c[i1] - c[i1 - 1]
     if price_move < ATR_MIN_MOVE_MULT * a:
         return False, f"движение цены слабое ({price_move/a:.2f}x ATR < {ATR_MIN_MOVE_MULT}x)"
 
-    # 2) затишье до импульса + всплеск объёма на импульсной свече (Volume Spike: >2.0x SMA20)
+    # 2) затишье до импульса (OPTIONAL) + всплеск объёма на импульсной свече (Volume Spike: >2.0x SMA20)
+    #    Раньше "не было затишья" отбрасывало сигнал целиком (жёсткий блок), но в реальности
+    #    перед импульсом не всегда тишина — часто идёт "грязная аккумуляция" с шумным объёмом.
+    #    Теперь по умолчанию (QUIET_REQUIRED=0) затишье НЕ обязательно: считаем его только
+    #    как доп. информацию в details (quiet_ok), а отбрасываем сигнал лишь если совсем
+    #    нет всплеска объёма (spike < VOL_SPIKE_MIN) — это ядро фильтра, оно не смягчается.
     base = v[i1 - VOL_MA_LEN:i1]
     if len(base) < VOL_MA_LEN: return False, "мало объёмной базы"
     vma = sum(base) / len(base)
     if vma <= 0: return False, "нулевая база"
     noisy = sum(1 for x in v[i1 - QUIET_BARS:i1] if x > vma * QUIET_MAX)
-    if noisy > QUIET_ALLOW: return False, f"не было затишья ({noisy} шумн.)"
+    quiet_ok = noisy <= QUIET_ALLOW
+    if QUIET_REQUIRED and not quiet_ok:
+        return False, f"не было затишья ({noisy} шумн.)"
     spike = v[i1] / vma
     if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
 
@@ -529,7 +549,7 @@ def detect_signal(o, h, l, c, v, tb, oi):
         spike=spike, delta=delta, oi_chg=oi_chg, rsi=r,
         e21=e21, e50=e50, level=level, low1=l[i1], high3=h[i1],
         entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
-        wick=upper_wick, close3=c[i1],
+        wick=upper_wick, close3=c[i1], quiet_ok=quiet_ok,
     )
 
 
