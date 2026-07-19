@@ -60,7 +60,7 @@ VOL_SPIKE_MIN = float(os.environ.get("VOL_SPIKE_MIN", "1.5"))  # было 2.0 ->
 ATR_MIN_MOVE_MULT = 1.5 # Price Action: (Close - PrevClose) > 1.5*ATR14, реальный импульс, не шум
 PRICE_MOVE_REQUIRED = int(os.environ.get("PRICE_MOVE_REQUIRED", 0))  # 0=OPTIONAL (не блокирует, только details), 1=обязательный порог 1.5x ATR как раньше
 BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "2"))  # ВАЖНО: больше N = выше планка max(high) = ТРУДНЕЕ пробить, не легче! Прошлое увеличение 3->5 было ошибкой логики и подняло отсев с 34.8% до 89.7%. Снижаем до 2 (мягче исходных 3).
-BREAKOUT_REQUIRED = int(os.environ.get("BREAKOUT_REQUIRED", "1"))  # 1=обязателен (по умолчанию), 0=OPTIONAL если даже N=2 всё ещё режет слишком много
+BREAKOUT_REQUIRED = int(os.environ.get("BREAKOUT_REQUIRED", "0"))  # было 1 -> 0: даже при N=2 breakout рубил 84% всех проверок (топ-1 душитель по воронке) — теперь OPTIONAL, как остальные мягкие фильтры
 CLOSE_ABOVE_PREV_REQUIRED = int(os.environ.get("CLOSE_ABOVE_PREV_REQUIRED", "0"))  # 0=OPTIONAL: close<=prev_close рубило 51.7% всех проверок в воронке — самый крупный отсев, не блокирует по умолчанию
 QUIET_BARS = 8          # строго 8 чистых баров затишья перед импульсом
 QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
