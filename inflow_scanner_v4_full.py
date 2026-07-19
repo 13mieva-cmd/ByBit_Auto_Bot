@@ -56,7 +56,8 @@ MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 0))
 # --- сигнал (спека) ---
 TF = "15m"
 VOL_MA_LEN = 20
-VOL_SPIKE_MIN = float(os.environ.get("VOL_SPIKE_MIN", "1.5"))  # было 2.0 -> 1.5: по воронке рубило 10.5% всех / 77.8% оставшихся после close+breakout — крупный третий отсев
+VOL_SPIKE_MIN = float(os.environ.get("VOL_SPIKE_MIN", "1.2"))  # было 2.0 -> 1.5 -> 1.2: теперь топ-1 душитель в воронке (81.5% всех проверок) — снижаем порог дальше
+VOL_SPIKE_REQUIRED = int(os.environ.get("VOL_SPIKE_REQUIRED", "0"))  # 0=OPTIONAL: даже при 1.5x рубило 81.5% — переводим в мягкий режим как остальные топ-душители (breakout, close, price_move)
 ATR_MIN_MOVE_MULT = 1.5 # Price Action: (Close - PrevClose) > 1.5*ATR14, реальный импульс, не шум
 PRICE_MOVE_REQUIRED = int(os.environ.get("PRICE_MOVE_REQUIRED", 0))  # 0=OPTIONAL (не блокирует, только details), 1=обязательный порог 1.5x ATR как раньше
 BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "2"))  # ВАЖНО: больше N = выше планка max(high) = ТРУДНЕЕ пробить, не легче! Прошлое увеличение 3->5 было ошибкой логики и подняло отсев с 34.8% до 89.7%. Снижаем до 2 (мягче исходных 3).
@@ -66,7 +67,7 @@ QUIET_BARS = 8          # строго 8 чистых баров затишья 
 QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
 QUIET_ALLOW = 0         # ноль толерантности к шуму в зоне накопления
 QUIET_REQUIRED = int(os.environ.get("QUIET_REQUIRED", 0))  # 0=OPTIONAL (не блокирует сигнал, только влияет на score/details), 1=обязательное отбрасывание как раньше
-WICK_MAX = 0.30
+WICK_MAX = float(os.environ.get("WICK_MAX", "0.40"))  # было 0.30 -> 0.40: второй по значимости отсев в воронке (13.1%), смягчаем допуск фитиля
 ATR_LEN = 14
 BAR_ATR_MAX = 2.5       # FOMO CAP: строго. High-Low сигнальной свечи > 2.5*ATR -> сигнал отбрасывается целиком
 OI_MIN_GROW = 0.02      # OI-ПОДТВЕРЖДЕНИЕ: (OI_now - OI_prev)/OI_prev < 2% -> сигнал отбрасывается (фейковый объём без реального интереса)
@@ -486,7 +487,9 @@ def detect_signal(o, h, l, c, v, tb, oi):
     if QUIET_REQUIRED and not quiet_ok:
         return False, f"не было затишья ({noisy} шумн.)"
     spike = v[i1] / vma
-    if spike < VOL_SPIKE_MIN: return False, f"слабый всплеск x{spike:.1f}"
+    vol_spike_ok = spike >= VOL_SPIKE_MIN
+    if VOL_SPIKE_REQUIRED and not vol_spike_ok:
+        return False, f"слабый всплеск x{spike:.1f}"
 
     # 3) фитиль импульсной свечи <= 30% размаха
     rng1 = h[i1] - l[i1]
@@ -571,7 +574,7 @@ def detect_signal(o, h, l, c, v, tb, oi):
         entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
         wick=upper_wick, close3=c[i1], quiet_ok=quiet_ok, price_move_ok=price_move_ok,
         valid_entry_ok=valid_entry_ok, close_above_prev_ok=close_above_prev_ok,
-        breakout_ok=breakout_ok,
+        breakout_ok=breakout_ok, vol_spike_ok=vol_spike_ok,
     )
 
 
