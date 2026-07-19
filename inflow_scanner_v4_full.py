@@ -59,7 +59,8 @@ VOL_MA_LEN = 20
 VOL_SPIKE_MIN = float(os.environ.get("VOL_SPIKE_MIN", "1.5"))  # было 2.0 -> 1.5: по воронке рубило 10.5% всех / 77.8% оставшихся после close+breakout — крупный третий отсев
 ATR_MIN_MOVE_MULT = 1.5 # Price Action: (Close - PrevClose) > 1.5*ATR14, реальный импульс, не шум
 PRICE_MOVE_REQUIRED = int(os.environ.get("PRICE_MOVE_REQUIRED", 0))  # 0=OPTIONAL (не блокирует, только details), 1=обязательный порог 1.5x ATR как раньше
-BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "5"))  # было 3 -> 5: пробой над более широким диапазоном (по воронке рубило 34.8% всех / 72% оставшихся после close-фильтра)
+BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "2"))  # ВАЖНО: больше N = выше планка max(high) = ТРУДНЕЕ пробить, не легче! Прошлое увеличение 3->5 было ошибкой логики и подняло отсев с 34.8% до 89.7%. Снижаем до 2 (мягче исходных 3).
+BREAKOUT_REQUIRED = int(os.environ.get("BREAKOUT_REQUIRED", "1"))  # 1=обязателен (по умолчанию), 0=OPTIONAL если даже N=2 всё ещё режет слишком много
 CLOSE_ABOVE_PREV_REQUIRED = int(os.environ.get("CLOSE_ABOVE_PREV_REQUIRED", "0"))  # 0=OPTIONAL: close<=prev_close рубило 51.7% всех проверок в воронке — самый крупный отсев, не блокирует по умолчанию
 QUIET_BARS = 8          # строго 8 чистых баров затишья перед импульсом
 QUIET_MAX = 1.8         # жёсткий порог шума в полке накопления
@@ -458,7 +459,8 @@ def detect_signal(o, h, l, c, v, tb, oi):
     if CLOSE_ABOVE_PREV_REQUIRED and not close_above_prev_ok:
         return False, "close <= prev_close"
     breakout_level = max(h[i1 - BREAKOUT_LOOKBACK:i1])
-    if not (c[i1] > breakout_level):
+    breakout_ok = c[i1] > breakout_level
+    if BREAKOUT_REQUIRED and not breakout_ok:
         return False, f"нет пробоя over {BREAKOUT_LOOKBACK}-свечного диапазона"
     # По воронке бэктеста: "нет пробоя" рубило 34.8%, а связка close>prev_close + это
     # обязательное 1.5x ATR добивала почти всё остальное до 0 сигналов ("прочее" 63.4% —
@@ -569,6 +571,7 @@ def detect_signal(o, h, l, c, v, tb, oi):
         entry=entry, sl=sl, tp1=tp1, tp2=tp2, risk_pct=risk_pct, atr=a,
         wick=upper_wick, close3=c[i1], quiet_ok=quiet_ok, price_move_ok=price_move_ok,
         valid_entry_ok=valid_entry_ok, close_above_prev_ok=close_above_prev_ok,
+        breakout_ok=breakout_ok,
     )
 
 
