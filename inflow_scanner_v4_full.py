@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EVA v4 — EMA CROSSOVER STRATEGY (полная замена импульсной стратегии v3)
-=========================================================================
-ДАННЫЕ: Binance Futures (объёмы, taker buy volume -> CVD как доп. инфо)
-ЦЕНЫ/ТОРГОВЛЯ: Bybit (сверка цены + исполнение, символ должен быть на Bybit)
+EVA v6 — BETA MOMENTUM STRATEGY ("Следование за BTC") — полная замена SuperTrend+ADX v5
+=========================================================================================
+ДАННЫЕ: Binance Futures (klines) для BTC и альткоинов, корреляция считается на дневных барах
+ЦЕНЫ/ТОРГОВЛЯ: Bybit (сверка цены + исполнение)
 ИСПОЛНЕНИЕ: PAPER по умолчанию (AUTO_TRADE=0), реальные ордера Bybit demo/live при AUTO_TRADE=1
 
-СТРАТЕГИЯ (по спеке пользователя — "Улучшенный EMA Crossover Strategy"):
-Тренд-фолловинг на 15M/1H. Поддерживает LONG и SHORT (старая версия была только LONG).
+СТРАТЕГИЯ (по спеке пользователя — "Beta Momentum Strategy"):
+Бот отслеживает сильные движения BTC и открывает КОРЗИНУ позиций в самых коррелирующих
+и волатильных альткоинах в ТОМ ЖЕ направлении (альты обычно бета > 1, двигаются сильнее BTC).
 
-1. EMA9 x EMA21 crossover на сигнальной (последней закрытой) свече.
-2. Тренд-фильтр: цена > SMA200 для Long, цена < SMA200 для Short.
-3. Флэт-фильтр: кроссовер не считается валидным, если случился слишком близко к SMA200
-   (по умолчанию < 0.5*ATR — типичный шум боковика).
-4. RSI(14): > 45 для Long, < 55 для Short.
-5. ADX(14) > 20 и растёт — ОПЦИОНАЛЬНО (ADX_REQUIRED=0 по умолчанию, как в спеке "опционально").
-6. Подтверждение свечой: close в сторону сигнала (бычья для Long, медвежья для Short).
-7. Объёмный фильтр: объём сигнальной свечи >= среднего (SMA20) * VOL_CONFIRM_MULT.
-8. Риск-менеджмент: SL = 1.5*ATR, TP1 = 2*ATR (закрыть 50%, RR 1:2), остаток — трейлинг
-   1.5*ATR от пика (без фиксированного TP2 — "остаток trailing stop" по спеке).
-9. До MAX_CONCURRENT одновременных позиций, дневной лимит убытка через /pause (ручной триггер).
+РЕЖИМЫ (переключаются через ENV MODE=conservative|aggressive):
+  conservative (по умолчанию):
+    TF=1h, BTC_THRESHOLD=1.2% за 60 мин, MIN_CORR=0.85 (30 дн), монет в корзине 3-5,
+    LEVERAGE=6x, риск на корзину 0.75-1% депо, SL корзины 1.8-2.2%,
+    TP: 40% при +2.5%, 30% при +4%, остаток trailing (после +1.8%, шаг 0.8%),
+    фильтры ADX(BTC,14)>23, RSI(BTC) не в экстремуме, глобальный СТОП корзины -3%.
+  aggressive:
+    TF=15m, BTC_THRESHOLD=0.8% за 30-45 мин, MIN_CORR=0.78, монет в корзине 6-10,
+    LEVERAGE=10x, риск на корзину 1.5-2% депо, SL 1.4-1.8%,
+    TP: 50% при +2%, остаток trailing (после +1.2%), ADX(BTC)>20, глобальный СТОП -4.5%.
 
-ДЕПЛОЙ: Railway, переменные окружения — те же, что в v3 (см. ниже блок КОНФИГ).
+Максимальное время удержания позиции: 12-24ч (закрытие по таймауту, чтобы не висеть в развороте).
+Список альткоинов-кандидатов — фиксированный шорт-лист высокой ликвидности (по спеке), из
+которого бот динамически выбирает 3-10 самых коррелирующих с BTC на данный момент.
+
+ДЕПЛОЙ: Railway, переменные окружения — см. блок КОНФИГ ниже.
 Start Command: python <этот файл>.py
 """
 
@@ -38,55 +42,69 @@ TG_TOKEN = os.environ.get("TG_TOKEN", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DEPOSIT = float(os.environ.get("DEPOSIT_USD", 500))
 MARGIN = float(os.environ.get("MARGIN_USD", 50))
-LEVERAGE = float(os.environ.get("LEVERAGE", 10))
-NOTIONAL = MARGIN * LEVERAGE
 
-MAX_CONCURRENT = int(os.environ.get("MAX_OPEN_POSITIONS", os.environ.get("MAX_CONCURRENT", 2)))  # спека: 1-2 позиции
-MAX_OPEN_POSITIONS = MAX_CONCURRENT
-MAX_DAILY_TRADES = int(os.environ.get("MAX_DAILY_TRADES", 0))
-DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "6.0"))  # спека: пауза при убытке >5-7%/день
+MODE = os.environ.get("MODE", "conservative").lower()  # "conservative" | "aggressive"
+IS_CONSERVATIVE = MODE != "aggressive"
 
-# --- таймфрейм ---
-TF = os.environ.get("TF", "15m")
-VOL_MA_LEN = 20
-ATR_LEN = 14
+# --- параметры режима (по спеке, дефолты — середина диапазона) ---
+if IS_CONSERVATIVE:
+    TF = os.environ.get("TF", "1h")
+    BTC_LOOKBACK_MIN = int(os.environ.get("BTC_LOOKBACK_MIN", "60"))
+    BTC_THRESHOLD_PCT = float(os.environ.get("BTC_THRESHOLD_PCT", "1.2"))
+    MIN_CORR = float(os.environ.get("MIN_CORR", "0.85"))
+    BASKET_SIZE = int(os.environ.get("BASKET_SIZE", "4"))          # 3-5
+    LEVERAGE = float(os.environ.get("LEVERAGE", "6"))               # 5-7x
+    BASKET_RISK_PCT = float(os.environ.get("BASKET_RISK_PCT", "0.9"))   # 0.75-1%
+    SL_PCT = float(os.environ.get("SL_PCT", "2.0"))                 # 1.8-2.2%
+    TP1_PCT, TP1_PART = float(os.environ.get("TP1_PCT", "2.5")), float(os.environ.get("TP1_PART", "0.40"))
+    TP2_PCT, TP2_PART = float(os.environ.get("TP2_PCT", "4.0")), float(os.environ.get("TP2_PART", "0.30"))
+    TRAIL_ACTIVATE_PCT = float(os.environ.get("TRAIL_ACTIVATE_PCT", "1.8"))
+    TRAIL_STEP_PCT = float(os.environ.get("TRAIL_STEP_PCT", "0.8"))
+    ADX_MIN = float(os.environ.get("ADX_MIN", "23"))
+    BASKET_GLOBAL_SL_PCT = float(os.environ.get("BASKET_GLOBAL_SL_PCT", "3.0"))
+else:
+    TF = os.environ.get("TF", "15m")
+    BTC_LOOKBACK_MIN = int(os.environ.get("BTC_LOOKBACK_MIN", "40"))
+    BTC_THRESHOLD_PCT = float(os.environ.get("BTC_THRESHOLD_PCT", "0.8"))
+    MIN_CORR = float(os.environ.get("MIN_CORR", "0.78"))
+    BASKET_SIZE = int(os.environ.get("BASKET_SIZE", "8"))          # 6-10
+    LEVERAGE = float(os.environ.get("LEVERAGE", "10"))               # 8-12x
+    BASKET_RISK_PCT = float(os.environ.get("BASKET_RISK_PCT", "1.75"))  # 1.5-2%
+    SL_PCT = float(os.environ.get("SL_PCT", "1.6"))                  # 1.4-1.8%
+    TP1_PCT, TP1_PART = float(os.environ.get("TP1_PCT", "2.0")), float(os.environ.get("TP1_PART", "0.50"))
+    TP2_PCT, TP2_PART = 0.0, 0.0   # спека агрессивного режима: только один TP на 50%, остаток trailing
+    TRAIL_ACTIVATE_PCT = float(os.environ.get("TRAIL_ACTIVATE_PCT", "1.2"))
+    TRAIL_STEP_PCT = float(os.environ.get("TRAIL_STEP_PCT", "0.8"))
+    ADX_MIN = float(os.environ.get("ADX_MIN", "20"))
+    BASKET_GLOBAL_SL_PCT = float(os.environ.get("BASKET_GLOBAL_SL_PCT", "4.5"))
+
+ADX_LEN = 14
 RSI_LEN = 14
-
-# ================= EMA CROSSOVER STRATEGY v2 (по спеке пользователя) =================
-EMA_CROSS_FAST = int(os.environ.get("EMA_CROSS_FAST", "9"))
-EMA_CROSS_SLOW = int(os.environ.get("EMA_CROSS_SLOW", "21"))
-TREND_SMA_LEN = int(os.environ.get("TREND_SMA_LEN", "200"))          # SMA200 тренд-фильтр
-RSI_LONG_MIN = float(os.environ.get("RSI_LONG_MIN", "45"))           # RSI > 45 для Long
-RSI_SHORT_MAX = float(os.environ.get("RSI_SHORT_MAX", "55"))         # RSI < 55 для Short
-ADX_LEN = int(os.environ.get("ADX_LEN", "14"))
-ADX_MIN = float(os.environ.get("ADX_MIN", "20"))                     # только в сильном тренде
-ADX_REQUIRED = int(os.environ.get("ADX_REQUIRED", "0"))              # 0 = опционально (по спеке)
-VOL_CONFIRM_MULT = float(os.environ.get("VOL_CONFIRM_MULT", "1.0"))  # объём >= среднего
-FLAT_ZONE_ATR = float(os.environ.get("FLAT_ZONE_ATR", "0.5"))        # защита от флэта у SMA200
-CANDLE_CONFIRM_REQUIRED = int(os.environ.get("CANDLE_CONFIRM_REQUIRED", "1"))
-
-# --- ATR-риск-менеджмент (по спеке: SL 1-1.5xATR, TP RR 1:2+, остаток trailing) ---
-ATR_SL_MULT_EMA = float(os.environ.get("ATR_SL_MULT_EMA", "1.5"))
-ATR_TP1_MULT_EMA = float(os.environ.get("ATR_TP1_MULT_EMA", "2.0"))
-ATR_TRAIL_MULT_EMA = float(os.environ.get("ATR_TRAIL_MULT_EMA", "1.5"))
+RSI_EXTREME_LOW = float(os.environ.get("RSI_EXTREME_LOW", "20"))
+RSI_EXTREME_HIGH = float(os.environ.get("RSI_EXTREME_HIGH", "80"))
+CORR_LOOKBACK_DAYS = int(os.environ.get("CORR_LOOKBACK_DAYS", "30"))
+MAX_HOLD_HOURS = float(os.environ.get("MAX_HOLD_HOURS", "18" if IS_CONSERVATIVE else "14"))  # 12-24ч по спеке
+MAX_CONCURRENT_BASKETS = int(os.environ.get("MAX_CONCURRENT_BASKETS", "1"))  # одна активная корзина за раз
+SCAN_EVERY_SEC = int(os.environ.get("SCAN_EVERY_SEC", "300"))  # спека псевдокода: sleep(300)
+MANAGE_EVERY_SEC = 10
 FEE_MAKER = 0.0002
 FEE_TAKER = 0.00055
 
-# --- вселенная (глобальный скан ликвидных пар) ---
-MAX_COINS = int(os.environ.get("MAX_COINS", "500"))
-MIN_QUOTE_VOL24 = float(os.environ.get("MIN_QUOTE_VOL24", "3000000"))
-SCAN_EVERY_SEC = 5
-MANAGE_EVERY_SEC = 5
+# --- фиксированный шорт-лист альткоинов-кандидатов (спека) ---
+CANDIDATE_ALTS = ["ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT", "SUIUSDT",
+                  "TONUSDT", "NEARUSDT", "APTUSDT", "HBARUSDT"]
+CANDIDATE_ALTS_AGGRESSIVE_EXTRA = ["WIFUSDT", "POPCATUSDT", "PNUTUSDT"]  # только в агрессивном режиме
+if not IS_CONSERVATIVE:
+    CANDIDATE_ALTS = CANDIDATE_ALTS + CANDIDATE_ALTS_AGGRESSIVE_EXTRA
 
-# --- файлы (на volume) ---
 def ensure_dirs():
     try: os.makedirs(DATA_DIR, exist_ok=True)
     except Exception: pass
 ensure_dirs()
-STATE_FILE = os.path.join(DATA_DIR, "v4_state.json")
-TRADES_FILE = os.path.join(DATA_DIR, "v4_trades.csv")
-SIGNALS_FILE = os.path.join(DATA_DIR, "v4_signals.csv")
-CHAT_FILE = os.path.join(DATA_DIR, "v4_chat.txt")
+STATE_FILE = os.path.join(DATA_DIR, "v6_state.json")
+TRADES_FILE = os.path.join(DATA_DIR, "v6_trades.csv")
+SIGNALS_FILE = os.path.join(DATA_DIR, "v6_signals.csv")
+CHAT_FILE = os.path.join(DATA_DIR, "v6_chat.txt")
 
 BINANCE = "https://fapi.binance.com"
 BYBIT_LIVE = "https://api.bybit.com"
@@ -101,7 +119,7 @@ CATEGORY = "linear"
 
 # ============================== HTTP/TG ==============================
 def http_json(url, timeout=15):
-    req = urllib.request.Request(url, headers={"User-Agent": "eva-v4"})
+    req = urllib.request.Request(url, headers={"User-Agent": "eva-v6"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
@@ -130,7 +148,6 @@ def save_chat(cid):
     except Exception: pass
 
 # ============================== ДАННЫЕ ==============================
-_uni_cache = {"ts": 0, "coins": []}
 _RATE_SEM = asyncio.Semaphore(20)
 
 async def _fetch_json_async(session, url):
@@ -142,41 +159,10 @@ async def _fetch_json_async(session, url):
             print("async fetch err:", url, e)
             return None
 
-async def build_universe_async():
-    async with aiohttp.ClientSession() as session:
-        tick_task = _fetch_json_async(session, f"{BINANCE}/fapi/v1/ticker/24hr")
-        bybit_task = _fetch_json_async(session, f"{BYBIT}/v5/market/tickers?category=linear")
-        tick, by = await asyncio.gather(tick_task, bybit_task)
-    if not tick or not by:
-        return _uni_cache["coins"]
-    binance = {}
-    for t in tick:
-        s = t.get("symbol", "")
-        if not s.endswith("USDT"): continue
-        qv = float(t.get("quoteVolume", 0) or 0)
-        if qv < MIN_QUOTE_VOL24: continue
-        binance[s] = qv
-    bybit_syms = set()
-    for x in by.get("result", {}).get("list", []):
-        bybit_syms.add(x["symbol"])
-    coins = [s for s in sorted(binance, key=lambda k: -binance[k]) if s in bybit_syms][:MAX_COINS]
-    _uni_cache["coins"] = coins; _uni_cache["ts"] = time.time()
-    print(f"Universe updated: {len(coins)} coins (liquidity >= {MIN_QUOTE_VOL24:,.0f}$)")
-    return coins
-
-def universe():
-    if time.time() - _uni_cache["ts"] < 3600 and _uni_cache["coins"]:
-        return _uni_cache["coins"]
-    try:
-        return asyncio.run(build_universe_async())
-    except Exception as e:
-        print("universe err:", e)
-        return _uni_cache["coins"]
-
-async def fetch_klines_batch(symbols, need_bars):
+async def fetch_klines_batch(symbols, tf, need_bars):
     async with aiohttp.ClientSession() as session:
         async def one(sym):
-            k_url = f"{BINANCE}/fapi/v1/klines?symbol={sym}&interval={TF}&limit={need_bars}"
+            k_url = f"{BINANCE}/fapi/v1/klines?symbol={sym}&interval={tf}&limit={need_bars}"
             k_data = await _fetch_json_async(session, k_url)
             if not k_data or len(k_data) < need_bars - 5:
                 return sym, None
@@ -186,6 +172,13 @@ async def fetch_klines_batch(symbols, need_bars):
             return sym, (o, h, l, c, v, ct)
         results = await asyncio.gather(*[one(s) for s in symbols], return_exceptions=False)
     return {sym: data for sym, data in results if data is not None}
+
+def klines_sync(symbol, tf, limit):
+    d = http_json(f"{BINANCE}/fapi/v1/klines?symbol={symbol}&interval={tf}&limit={limit}")
+    o = [float(x[1]) for x in d]; h = [float(x[2]) for x in d]
+    l = [float(x[3]) for x in d]; c = [float(x[4]) for x in d]
+    v = [float(x[5]) for x in d]; ct = [int(x[0]) for x in d]
+    return o, h, l, c, v, ct
 
 def bybit_price(symbol):
     try:
@@ -263,37 +256,13 @@ def bybit_market_long(symbol, qty):
     })
 
 def bybit_market_short(symbol, qty):
-    """SHORT-вход — добавлено для EMA-crossover стратегии v2 (старая версия была только LONG)."""
     qty_r = bybit_round_qty(symbol, qty)
     return _bybit_signed("POST", "/v5/order/create", body={
         "category": CATEGORY, "symbol": symbol, "side": "Sell",
         "orderType": "Market", "qty": str(qty_r), "timeInForce": "IOC",
     })
 
-def bybit_cancel_order(symbol, order_id):
-    return _bybit_signed("POST", "/v5/order/cancel", body={
-        "category": CATEGORY, "symbol": symbol, "orderId": order_id,
-    })
-
-def bybit_set_stop(symbol, sl_price=None, tp_price=None):
-    body = {"category": CATEGORY, "symbol": symbol, "positionIdx": 0}
-    if sl_price is not None: body["stopLoss"] = str(bybit_round_price(symbol, sl_price))
-    if tp_price is not None: body["takeProfit"] = str(bybit_round_price(symbol, tp_price))
-    return _bybit_signed("POST", "/v5/position/trading-stop", body=body)
-
-def bybit_reduce_limit(symbol, qty, price, side="long"):
-    """side-aware: для long закрываем Sell-лимиткой, для short — Buy-лимиткой."""
-    qty_r = bybit_round_qty(symbol, qty)
-    price_r = bybit_round_price(symbol, price)
-    close_side = "Sell" if side == "long" else "Buy"
-    return _bybit_signed("POST", "/v5/order/create", body={
-        "category": CATEGORY, "symbol": symbol, "side": close_side,
-        "orderType": "Limit", "qty": str(qty_r), "price": str(price_r),
-        "timeInForce": "GTC", "reduceOnly": True,
-    })
-
 def bybit_close_market(symbol, qty, side="long"):
-    """side-aware: для long закрываем Sell-маркетом, для short — Buy-маркетом."""
     qty_r = bybit_round_qty(symbol, qty)
     close_side = "Sell" if side == "long" else "Buy"
     return _bybit_signed("POST", "/v5/order/create", body={
@@ -312,23 +281,6 @@ def bybit_wallet_balance():
         return None
 
 # ============================== ИНДИКАТОРЫ ==============================
-def ema_series(v, span):
-    if not v: return []
-    a = 2 / (span + 1); out = [v[0]]
-    for x in v[1:]: out.append(a * x + (1 - a) * out[-1])
-    return out
-
-def sma_series(v, period):
-    if not v: return []
-    if len(v) < period: return [sum(v) / len(v)] * len(v)
-    out = []
-    for i in range(len(v)):
-        if i < period - 1:
-            out.append(sum(v[:i + 1]) / (i + 1))
-        else:
-            out.append(sum(v[i - period + 1:i + 1]) / period)
-    return out
-
 def rsi(closes, period=14):
     if len(closes) < period + 1: return 50.0
     g = l = 0.0
@@ -344,19 +296,7 @@ def rsi(closes, period=14):
     if al == 0: return 100.0
     return 100 - 100 / (1 + ag / al)
 
-def atr(h, l, c, period=14):
-    n = len(c)
-    if n < period + 2: return 0.0
-    trs = []
-    for i in range(1, n):
-        trs.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
-    a = sum(trs[:period]) / period
-    for x in trs[period:]:
-        a = (a * (period - 1) + x) / period
-    return a
-
 def adx_series(h, l, c, period=14):
-    """Wilder ADX. Возвращает список той же длины, что h/l/c."""
     n = len(c)
     if n < period * 2 + 2:
         return [0.0] * n
@@ -391,92 +331,105 @@ def adx_series(h, l, c, period=14):
         adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
     return adx
 
-# ============================== СИГНАЛ: EMA9/21 CROSSOVER ==============================
-def detect_signal(o, h, l, c, v, ct):
-    """EMA9 x EMA21 crossover + SMA200 тренд + RSI + ADX(опц.) + объём + подтверждение свечой.
-    Возвращает (ok, dict|причина). dict содержит side='long'|'short'."""
-    n = len(c)
-    min_hist = max(TREND_SMA_LEN, ADX_LEN * 3, VOL_MA_LEN) + 5
-    if n < min_hist:
-        return False, "мало истории"
-    i1 = n - 1
+def pct_change_over(closes, bars_back):
+    if len(closes) < bars_back + 1: return 0.0
+    a, b = closes[-1 - bars_back], closes[-1]
+    if a == 0: return 0.0
+    return (b - a) / a * 100.0
 
-    ema_fast = ema_series(c, EMA_CROSS_FAST)
-    ema_slow = ema_series(c, EMA_CROSS_SLOW)
-    sma_trend = sma_series(c, TREND_SMA_LEN)
-    a = atr(h[:i1 + 1], l[:i1 + 1], c[:i1 + 1], ATR_LEN)
-    if a <= 0:
-        return False, "нет ATR для риск-менеджмента"
+def pearson_corr(x, y):
+    n = min(len(x), len(y))
+    if n < 5: return 0.0
+    x = x[-n:]; y = y[-n:]
+    mx = sum(x) / n; my = sum(y) / n
+    sx = sum((xi - mx) ** 2 for xi in x) ** 0.5
+    sy = sum((yi - my) ** 2 for yi in y) ** 0.5
+    if sx == 0 or sy == 0: return 0.0
+    cov = sum((x[i] - mx) * (y[i] - my) for i in range(n))
+    return cov / (sx * sy)
 
-    cross_up = ema_fast[i1 - 1] <= ema_slow[i1 - 1] and ema_fast[i1] > ema_slow[i1]
-    cross_down = ema_fast[i1 - 1] >= ema_slow[i1 - 1] and ema_fast[i1] < ema_slow[i1]
-    if not (cross_up or cross_down):
-        return False, "нет кроссовера EMA9/21"
-    side = "long" if cross_up else "short"
+def daily_returns(closes):
+    return [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1] != 0]
 
-    trend_ok = (c[i1] > sma_trend[i1]) if side == "long" else (c[i1] < sma_trend[i1])
-    if not trend_ok:
-        return False, f"против SMA{TREND_SMA_LEN} тренда"
+# ============================== КОРРЕЛЯЦИЯ И ВЫБОР МОНЕТ ==============================
+_corr_cache = {"ts": 0, "data": {}}
 
-    dist_to_sma = abs(c[i1] - sma_trend[i1])
-    if dist_to_sma < FLAT_ZONE_ATR * a:
-        return False, f"кроссовер близко к SMA{TREND_SMA_LEN} (флэт, {dist_to_sma/a:.2f}x<{FLAT_ZONE_ATR}x ATR)"
+def compute_correlations():
+    """Дневные свечи BTC + кандидатов за CORR_LOOKBACK_DAYS, корреляция returns с BTC.
+    Кэш на 1 час — пересчёт корреляции каждый цикл избыточен (спека: 30-дн окно почти не меняется внутри дня)."""
+    if time.time() - _corr_cache["ts"] < 3600 and _corr_cache["data"]:
+        return _corr_cache["data"]
+    need = CORR_LOOKBACK_DAYS + 5
+    try:
+        _, _, _, btc_c, _, _ = klines_sync("BTCUSDT", "1d", need)
+    except Exception as e:
+        print("corr btc fetch err:", e)
+        return _corr_cache["data"]
+    btc_ret = daily_returns(btc_c)
+    result = {}
+    for sym in CANDIDATE_ALTS:
+        try:
+            _, _, _, c, v, _ = klines_sync(sym, "1d", need)
+            ret = daily_returns(c)
+            corr = pearson_corr(btc_ret, ret)
+            avg_vol24 = sum(v[-7:]) / 7 if len(v) >= 7 else sum(v) / max(len(v), 1)
+            beta = 0.0
+            btc_var = sum(r * r for r in btc_ret) / len(btc_ret) if btc_ret else 0.0
+            if btc_var > 0 and len(ret) >= len(btc_ret):
+                n = min(len(ret), len(btc_ret))
+                cov = sum(ret[-n:][i] * btc_ret[-n:][i] for i in range(n)) / n
+                beta = cov / btc_var
+            result[sym] = dict(corr=corr, beta=beta, vol24=avg_vol24)
+        except Exception as e:
+            print(f"corr {sym} err:", e)
+        time.sleep(0.1)
+    _corr_cache["data"] = result; _corr_cache["ts"] = time.time()
+    return result
+
+def get_top_correlated_coins(num, min_correlation):
+    corrs = compute_correlations()
+    cands = [(s, d["corr"], d["beta"], d["vol24"]) for s, d in corrs.items() if d["corr"] >= min_correlation]
+    cands.sort(key=lambda x: (-x[1], -x[2]))
+    return [c[0] for c in cands[:num]]
+
+# ============================== СИГНАЛ: BTC MOMENTUM ==============================
+def get_btc_signal():
+    """Возвращает (ok, direction|None, details). Проверяет движение BTC, ADX, RSI (без экстремума)."""
+    need = max(BTC_LOOKBACK_MIN // {"15m": 15, "1h": 60}.get(TF, 60) + 5, ADX_LEN * 3 + 5, RSI_LEN * 6 + 5)
+    try:
+        o, h, l, c, v, ct = klines_sync("BTCUSDT", TF, need + 10)
+    except Exception as e:
+        return False, None, f"btc fetch err: {e}"
+    o, h, l, c, v, ct = o[:-1], h[:-1], l[:-1], c[:-1], v[:-1], ct[:-1]
+    bar_minutes = {"15m": 15, "1h": 60}.get(TF, 60)
+    bars_back = max(1, round(BTC_LOOKBACK_MIN / bar_minutes))
+    chg = pct_change_over(c, bars_back)
+    if abs(chg) < BTC_THRESHOLD_PCT:
+        return False, None, f"BTC движение {chg:+.2f}% < порога {BTC_THRESHOLD_PCT}%"
+    direction = "long" if chg > 0 else "short"
+
+    adx_vals = adx_series(h, l, c, ADX_LEN)
+    adx_now = adx_vals[-1] if adx_vals else 0.0
+    if adx_now <= ADX_MIN:
+        return False, None, f"ADX(BTC) {adx_now:.0f} <= {ADX_MIN} (слабый тренд)"
 
     r = rsi(c[-(RSI_LEN * 6):], RSI_LEN)
-    if side == "long" and not (r > RSI_LONG_MIN):
-        return False, f"RSI {r:.0f} <= {RSI_LONG_MIN} (слабо для Long)"
-    if side == "short" and not (r < RSI_SHORT_MAX):
-        return False, f"RSI {r:.0f} >= {RSI_SHORT_MAX} (слабо для Short)"
+    if r <= RSI_EXTREME_LOW or r >= RSI_EXTREME_HIGH:
+        return False, None, f"RSI(BTC) {r:.0f} в экстремальной зоне"
 
-    adx_vals = adx_series(h[:i1 + 1], l[:i1 + 1], c[:i1 + 1], ADX_LEN)
-    adx_now = adx_vals[i1] if i1 < len(adx_vals) else 0.0
-    adx_rising = i1 > 0 and adx_now > adx_vals[i1 - 1]
-    adx_ok = adx_now > ADX_MIN and adx_rising
-    if ADX_REQUIRED and not adx_ok:
-        return False, f"ADX {adx_now:.0f} слабый/падает (нужно >{ADX_MIN} и растёт)"
-
-    candle_confirm = (c[i1] > o[i1]) if side == "long" else (c[i1] < o[i1])
-    if CANDLE_CONFIRM_REQUIRED and not candle_confirm:
-        return False, "нет подтверждения свечой"
-
-    if len(v) < VOL_MA_LEN + 1:
-        return False, "мало объёмной базы"
-    vma = sum(v[i1 - VOL_MA_LEN:i1]) / VOL_MA_LEN
-    vol_ratio = (v[i1] / vma) if vma > 0 else 0.0
-    if not (vma > 0 and vol_ratio >= VOL_CONFIRM_MULT):
-        return False, f"объём слабее среднего (x{vol_ratio:.1f}<{VOL_CONFIRM_MULT}x)"
-
-    entry = c[i1]
-    if side == "long":
-        sl = entry - ATR_SL_MULT_EMA * a
-        tp1 = entry + ATR_TP1_MULT_EMA * a
-        risk_per_unit = entry - sl
-    else:
-        sl = entry + ATR_SL_MULT_EMA * a
-        tp1 = entry - ATR_TP1_MULT_EMA * a
-        risk_per_unit = sl - entry
-    if risk_per_unit <= 0:
-        return False, "риск на единицу <= 0"
-    risk_pct = risk_per_unit / entry
-
-    return True, dict(
-        side=side, entry=entry, sl=sl, tp1=tp1, atr=a, risk_pct=risk_pct,
-        rsi=r, adx=adx_now, adx_ok=adx_ok, ema_fast=ema_fast[i1], ema_slow=ema_slow[i1],
-        sma_trend=sma_trend[i1], vol_ratio=vol_ratio, close3=c[i1],
-    )
+    return True, direction, dict(chg=chg, adx=adx_now, rsi=r, price=c[-1])
 
 # ============================== СОСТОЯНИЕ/ЛИМИТЫ ==============================
 def _default_state():
     return dict(day=str(dt.datetime.now(dt.timezone.utc).date()),
                 trades_today=0, paused=False, day_start_equity=DEPOSIT,
-                pendings={}, positions={})
+                baskets={})
 
 def load_state():
     try:
         with open(STATE_FILE) as f: st = json.load(f)
     except Exception: return _default_state()
-    if "pendings" not in st: st["pendings"] = {}
-    if "positions" not in st: st["positions"] = {}
+    if "baskets" not in st: st["baskets"] = {}
     if "day_start_equity" not in st: st["day_start_equity"] = DEPOSIT
     return st
 
@@ -494,56 +447,25 @@ def roll_day(st, chat=None):
     if d != st.get("day"):
         st["day"] = d; st["trades_today"] = 0; st["day_start_equity"] = DEPOSIT
         save_state(st)
-        if chat: tg_send(chat, f"\U0001F305 Новый день (UTC) — счётчик сделок обнулён ({daily_txt(st)}).")
+        if chat: tg_send(chat, f"\U0001F305 Новый день (UTC) — счётчик сделок обнулён.")
 
-def slots_used(st):
-    return len(st.get("pendings", {})) + len(st.get("positions", {}))
-
-def engaged_syms(st):
-    return set(st.get("pendings", {})) | set(st.get("positions", {}))
-
-def daily_txt(st):
-    n = st.get("trades_today", 0)
-    return f"{n}/{MAX_DAILY_TRADES}" if MAX_DAILY_TRADES > 0 else f"{n} (дневного лимита сделок нет)"
-
-def open_risk_usd(st):
-    total = 0.0
-    for pos in st.get("positions", {}).values():
-        if not pos.get("half_closed"):
-            total += abs(pos["entry"] - pos["sl"]) * pos["qty"]
-    return total
-
-def today_pnl(st):
-    if not os.path.exists(TRADES_FILE): return 0.0
-    day = st.get("day")
-    total = 0.0
-    try:
-        for r in csv.DictReader(open(TRADES_FILE)):
-            if r["ts_open"][:10] == day or r["ts_close"][:10] == day:
-                total += float(r["pnl_usd"])
-    except Exception:
-        pass
-    return total
+def active_baskets(st):
+    return {k: v for k, v in st.get("baskets", {}).items() if v.get("status") == "open"}
 
 def trading_allowed(st):
     if st.get("paused"): return False, "пауза"
-    if MAX_DAILY_TRADES > 0 and st.get("trades_today", 0) >= MAX_DAILY_TRADES:
-        return False, f"дневной лимит {MAX_DAILY_TRADES} исчерпан"
-    if slots_used(st) >= MAX_CONCURRENT:
-        return False, f"заняты все слоты ({MAX_CONCURRENT}/{MAX_CONCURRENT})"
-    day_pnl = today_pnl(st)
-    if day_pnl < 0 and abs(day_pnl) / DEPOSIT * 100 >= DAILY_LOSS_LIMIT_PCT:
-        return False, f"дневной убыток {abs(day_pnl)/DEPOSIT*100:.1f}% >= лимита {DAILY_LOSS_LIMIT_PCT}% (пауза по спеке)"
+    if len(active_baskets(st)) >= MAX_CONCURRENT_BASKETS:
+        return False, f"активна корзина ({MAX_CONCURRENT_BASKETS} макс)"
     return True, ""
 
 # ============================== ЖУРНАЛЫ ==============================
-def log_signal(coin, price, side):
+def log_signal(direction, btc_chg, coins):
     try:
         new = not os.path.exists(SIGNALS_FILE)
         with open(SIGNALS_FILE, "a", newline="") as f:
             w = csv.writer(f)
-            if new: w.writerow(["ts", "coin", "side", "price"])
-            w.writerow([dt.datetime.now().isoformat(timespec="seconds"), coin, side, price])
+            if new: w.writerow(["ts", "direction", "btc_chg", "coins"])
+            w.writerow([dt.datetime.now().isoformat(timespec="seconds"), direction, btc_chg, ",".join(coins)])
     except Exception as e: print("log_signal err:", e)
 
 def log_trade(row):
@@ -551,186 +473,230 @@ def log_trade(row):
         new = not os.path.exists(TRADES_FILE)
         with open(TRADES_FILE, "a", newline="") as f:
             w = csv.writer(f)
-            if new: w.writerow(["ts_open", "ts_close", "coin", "side", "entry", "exit", "qty", "part", "pnl_usd", "r_mult", "reason"])
+            if new: w.writerow(["ts_open", "ts_close", "basket_id", "coin", "side", "entry", "exit",
+                                 "qty", "part", "pnl_usd", "reason"])
             w.writerow(row)
     except Exception as e: print("log_trade err:", e)
 
-# ============================== PAPER/LIVE ДВИЖОК ==============================
-def _profit_scenarios_ema(entry, sl, tp1, qty, side="long"):
-    """TP1 закрывает 50% (RR 1:2), остаток идёт в трейлинг (без фикс. TP2 — по спеке)."""
-    fee_in = NOTIONAL * FEE_MAKER
-    sign = 1 if side == "long" else -1
-    def leg(exit_px, q, fee_share):
-        return sign * (exit_px - entry) * q - exit_px * q * FEE_TAKER - fee_share
-    half = qty / 2
-    stop_full = leg(sl, qty, fee_in)
-    tp1_half = leg(tp1, half, fee_in / 2)
-    be_after_tp1 = tp1_half + leg(entry, half, fee_in / 2)
-    return stop_full, tp1_half, be_after_tp1
+# ============================== PAPER/LIVE ДВИЖОК (КОРЗИНА) ==============================
+def open_basket(st, chat, direction, coins, btc_info):
+    """Открывает корзину позиций по всем coins в направлении direction (long/short).
+    Риск на ВСЮ корзину = BASKET_RISK_PCT% депозита, делится равными частями между монетами."""
+    basket_id = str(int(time.time()))
+    basket_risk_usd = DEPOSIT * (BASKET_RISK_PCT / 100.0)
+    per_coin_risk_usd = basket_risk_usd / max(len(coins), 1)
+    margin_per_coin = MARGIN  # позиция на монету — как обычно, ограничена MARGIN*LEVERAGE
+    notional_per_coin = margin_per_coin * LEVERAGE
 
-def open_market_position(st, sym, d, chat):
-    side = d["side"]
-    qty = NOTIONAL / d["entry"]
-    fee_in = NOTIONAL * FEE_MAKER
-    risk_all = open_risk_usd(st)
-    risk_usd = NOTIONAL * d["risk_pct"]
-    stop_full, tp1_half, be_after_tp1 = _profit_scenarios_ema(d["entry"], d["sl"], d["tp1"], qty, side)
-    by = bybit_price(sym)
-    entry_px = d["entry"]
+    positions = {}
+    opened_syms = []
+    for sym in coins:
+        price = bybit_price(sym)
+        if price is None:
+            continue
+        qty = notional_per_coin / price
+        sl_dist = price * (SL_PCT / 100.0)
+        sl = price - sl_dist if direction == "long" else price + sl_dist
+        tp1 = price + price * (TP1_PCT / 100.0) if direction == "long" else price - price * (TP1_PCT / 100.0)
+        tp2 = None
+        if TP2_PCT > 0:
+            tp2 = price + price * (TP2_PCT / 100.0) if direction == "long" else price - price * (TP2_PCT / 100.0)
 
-    live_note = "PAPER (комиссии учтены)"
-    if AUTO_TRADE:
-        live_note = "LIVE" + (" DEMO" if BYBIT_USE_DEMO else " РЕАЛ") + " (Bybit)"
-        bybit_set_leverage(sym, LEVERAGE)
-        r_order = bybit_market_long(sym, qty) if side == "long" else bybit_market_short(sym, qty)
-        if r_order.get("retCode") != 0:
-            tg_send(chat, f"\u26A0\uFE0F {sym}: ОШИБКА рыночного входа на Bybit: {r_order.get('retMsg')}")
-            return
-        if by: entry_px = by
-        r_stop = bybit_set_stop(sym, sl_price=d["sl"], tp_price=None)
-        if r_stop.get("retCode") != 0:
-            tg_send(chat, f"\u26A0\uFE0F {sym}: SL не выставлен на Bybit: {r_stop.get('retMsg')}")
-        r_tp1 = bybit_reduce_limit(sym, qty / 2, d["tp1"], side=side)
-        tp1_order_id = r_tp1.get("result", {}).get("orderId") if r_tp1.get("retCode") == 0 else None
-        if r_tp1.get("retCode") != 0:
-            tg_send(chat, f"\u26A0\uFE0F {sym}: TP1-лимитка не выставлена: {r_tp1.get('retMsg')}")
-    else:
-        tp1_order_id = None
+        live_note = "PAPER"
+        if AUTO_TRADE:
+            live_note = "LIVE" + (" DEMO" if BYBIT_USE_DEMO else " РЕАЛ")
+            bybit_set_leverage(sym, LEVERAGE)
+            r_order = bybit_market_long(sym, qty) if direction == "long" else bybit_market_short(sym, qty)
+            if r_order.get("retCode") != 0:
+                tg_send(chat, f"\u26A0\uFE0F {sym}: ошибка входа в корзину: {r_order.get('retMsg')}")
+                continue
+            by = bybit_price(sym)
+            if by: price = by
 
-    st["positions"][sym] = dict(sym=sym, side=side, entry=entry_px, sl=d["sl"], tp1=d["tp1"],
-                                 atr=d["atr"], qty=qty, qty_init=qty, fee_in=fee_in,
-                                 half_closed=False, be_moved=False, peak=0.0,
-                                 tp1_order_id=tp1_order_id,
-                                 opened=dt.datetime.now().isoformat(timespec="seconds"))
-    st["trades_today"] = st.get("trades_today", 0) + 1
+        fee_in = qty * price * FEE_MAKER
+        positions[sym] = dict(sym=sym, side=direction, entry=price, sl=sl, tp1=tp1, tp2=tp2,
+                               qty=qty, qty_init=qty, fee_in=fee_in,
+                               tp1_done=False, tp2_done=(tp2 is None), trail_active=False,
+                               peak=price, opened=dt.datetime.now().isoformat(timespec="seconds"))
+        opened_syms.append(sym)
+
+    if not positions:
+        return
+
+    st["baskets"][basket_id] = dict(
+        id=basket_id, direction=direction, status="open",
+        opened_ts=time.time(), coins=positions,
+        equity_start=sum(p["qty"] * p["entry"] / LEVERAGE for p in positions.values()),
+        btc_chg=btc_info.get("chg", 0.0),
+    )
+    st["trades_today"] = st.get("trades_today", 0) + len(positions)
     save_state(st)
+    log_signal(direction, btc_info.get("chg", 0.0), opened_syms)
 
-    warn = ""
-    if risk_usd > DEPOSIT * 0.02:
-        warn = (f"\n\u26A0\uFE0F Риск {risk_usd:.0f}$ = {risk_usd/DEPOSIT*100:.1f}% депозита — "
-                f"выше правила 1-2%. Маржа {MARGIN:.0f}$ x{LEVERAGE:.0f} — агрессивно на реале.")
-    side_ru = "LONG (Buy)" if side == "long" else "SHORT (Sell)"
-    emoji_side = "\U0001F4C8" if side == "long" else "\U0001F4C9"
+    dir_ru = "LONG (BTC растёт)" if direction == "long" else "SHORT (BTC падает)"
+    emoji = "\U0001F4C8" if direction == "long" else "\U0001F4C9"
     L = [
-        f"{emoji_side} {sym} \u00b7 СИГНАЛ: EMA{EMA_CROSS_FAST}/{EMA_CROSS_SLOW} crossover \u2192 {side_ru} \u2014 {live_note}",
-        f"\U0001F4B5 Вход МАРКЕТОМ на открытии новой свечи: ${entry_px:.6g}" + (f" \u00b7 Binance close ${d['close3']:.6g}" if by else ""),
-        "",
-        "\U0001F9E0 ПОЧЕМУ ВХОЖУ — чек-лист:",
-        f"\u2705 Кроссовер EMA{EMA_CROSS_FAST} (${d['ema_fast']:.6g}) x EMA{EMA_CROSS_SLOW} (${d['ema_slow']:.6g})",
-        f"\u2705 Тренд-фильтр: цена {'>' if side=='long' else '<'} SMA{TREND_SMA_LEN} (${d['sma_trend']:.6g})",
-        f"\u2705 RSI {d['rsi']:.0f} ({'>' + str(RSI_LONG_MIN) if side=='long' else '<' + str(RSI_SHORT_MAX)})",
-        (f"\u2705 ADX {d['adx']:.0f} (>{ADX_MIN} и растёт)" if d['adx_ok'] else f"\u2139\uFE0F ADX {d['adx']:.0f} (слабый, но не обязателен)"),
-        f"\u2705 Объём сигнальной свечи x{d['vol_ratio']:.1f} от среднего (\u2265{VOL_CONFIRM_MULT}x)",
-        "",
-        "\U0001F4CB ПЛАН СДЕЛКИ (TP1 50% + трейлинг остатка):",
-        f"\U0001F4E6 Объём: ${NOTIONAL:.0f} = {qty:.4g} {sym.replace('USDT','')} (маржа {MARGIN:.0f}$ \u00d7 плечо {LEVERAGE:.0f})",
-        f"\U0001F6D1 Стоп: ${d['sl']:.6g} ({ATR_SL_MULT_EMA}\u00d7ATR, \u2212{d['risk_pct']*100:.2f}%) \u2192 потеря {stop_full:+.2f}$",
-        f"\U0001F3AF TP1: ${d['tp1']:.6g} ({ATR_TP1_MULT_EMA}\u00d7ATR, RR 1:{ATR_TP1_MULT_EMA/ATR_SL_MULT_EMA:.1f}) \u2192 закрываю 50% \u2192 {tp1_half:+.2f}$",
-        f"\U0001F513 После TP1: SL остатка \u2192 БУ ({be_after_tp1:+.2f}$), далее трейлинг {ATR_TRAIL_MULT_EMA}\u00d7ATR",
-        f"{warn}",
-        "",
-        (f"\U0001F517 Суммарный риск занятых слотов: \u2248{risk_all:.2f}$ ({risk_all/DEPOSIT*100:.1f}% депозита)"
-         if slots_used(st) > 1 else None),
-        f"\U0001F9EA Слоты: {slots_used(st)}/{MAX_CONCURRENT} заняты \u00b7 сделок сегодня: {st.get('trades_today',0)}",
-        "Команды: /pos \u00b7 /stats \u00b7 /pause \u00b7 /help",
+        f"{emoji} НОВАЯ КОРЗИНА \u2014 {dir_ru}",
+        f"\U0001F9E0 Триггер: BTC {btc_info.get('chg', 0):+.2f}% за {BTC_LOOKBACK_MIN} мин \u00b7 "
+        f"ADX(BTC) {btc_info.get('adx', 0):.0f} \u00b7 RSI(BTC) {btc_info.get('rsi', 0):.0f}",
+        f"\U0001F4CB Монеты ({len(opened_syms)}): {', '.join(s.replace('USDT','') for s in opened_syms)}",
+        f"\U0001F4B0 Риск корзины: {BASKET_RISK_PCT}% депо (${basket_risk_usd:.2f}) \u00b7 плечо {LEVERAGE:.0f}x",
+        f"\U0001F6D1 SL по каждой монете: {SL_PCT}% от входа \u00b7 глобальный стоп корзины \u2212{BASKET_GLOBAL_SL_PCT}%",
+        f"\U0001F3AF TP1 {TP1_PCT}% \u2192 {TP1_PART*100:.0f}%" + (f" \u00b7 TP2 {TP2_PCT}% \u2192 {TP2_PART*100:.0f}%" if TP2_PCT > 0 else "") +
+        f" \u00b7 остаток trailing (после +{TRAIL_ACTIVATE_PCT}%, шаг {TRAIL_STEP_PCT}%)",
+        f"\u23F1 Макс. время удержания: {MAX_HOLD_HOURS:.0f}ч",
+        f"Режим: {'консервативный' if IS_CONSERVATIVE else 'агрессивный'} \u00b7 Команды: /status \u00b7 /close_all \u00b7 /pause",
     ]
-    tg_send(chat, "\n".join(x for x in L if x is not None))
-    log_signal(sym, d["close3"], side)
+    tg_send(chat, "\n".join(L))
 
 
-def close_part(st, chat, pos, price, part, reason):
-    side = pos.get("side", "long")
+def close_coin_position(st, chat, basket, sym, price, part, reason):
+    pos = basket["coins"][sym]
+    side = pos["side"]
     sign = 1 if side == "long" else -1
     qty_close = pos["qty"] * part
-    if AUTO_TRADE:
+    if AUTO_TRADE and qty_close > 0:
+        r = bybit_close_market(sym, qty_close, side=side)
+        if r.get("retCode") != 0:
+            tg_send(chat, f"\u26A0\uFE0F {sym}: ошибка закрытия части корзины: {r.get('retMsg')}")
         if part >= 0.999:
-            r = bybit_close_market(pos["sym"], qty_close, side=side)
-            if r.get("retCode") != 0:
-                tg_send(chat, f"\u26A0\uFE0F {pos['sym']}: ошибка закрытия на Bybit: {r.get('retMsg')}")
-            bybit_cancel_all(pos["sym"])
-        else:
-            if "СТОП" in reason.upper():
-                r = bybit_close_market(pos["sym"], qty_close, side=side)
-                if r.get("retCode") != 0:
-                    tg_send(chat, f"\u26A0\uFE0F {pos['sym']}: ошибка частичного закрытия на Bybit: {r.get('retMsg')}")
-        if pos.get("be_moved"):
-            r_sl = bybit_set_stop(pos["sym"], sl_price=pos["sl"], tp_price=None)
-            if r_sl.get("retCode") != 0:
-                tg_send(chat, f"\u26A0\uFE0F {pos['sym']}: SL в БУ не обновлён на Bybit: {r_sl.get('retMsg')}")
+            bybit_cancel_all(sym)
     gross = sign * (price - pos["entry"]) * qty_close
     fee_exit = price * qty_close * FEE_TAKER
-    fee_in_share = pos.get("fee_in", 0.0) * (qty_close / pos.get("qty_init", qty_close))
+    fee_in_share = pos["fee_in"] * (qty_close / pos["qty_init"])
     pnl = gross - fee_exit - fee_in_share
-    risk_per_unit = abs(pos["entry"] - pos["sl"])
-    r_mult = (sign * (price - pos["entry"]) / risk_per_unit) if risk_per_unit > 0 else 0
-    log_trade([pos["opened"], dt.datetime.now().isoformat(timespec="seconds"),
-               pos["sym"], side, f"{pos['entry']:.8g}", f"{price:.8g}", f"{qty_close:.8g}",
-               f"{part:.2f}", f"{pnl:.2f}", f"{r_mult:.2f}", reason])
     pos["qty"] -= qty_close
-    emoji = "\U0001F4B0" if pnl >= 0 else "\U0001F53B"
-    tg_send(chat, f"{emoji} {pos['sym']} ({side}): {reason} по ${price:.6g}\n"
-                  f"PnL части: {pnl:+.2f}$ ({r_mult:+.2f}R, комиссии учтены)")
-    if pos["qty"] <= 1e-12 or part >= 0.999:
-        st["positions"].pop(pos["sym"], None)
-        tg_send(chat, f"\U0001F4CB {pos['sym']} закрыта полностью. Слот освободился "
-                      f"({slots_used(st)}/{MAX_CONCURRENT} занято). Сегодня сделок: {daily_txt(st)}.")
-    save_state(st)
+    log_trade([pos["opened"], dt.datetime.now().isoformat(timespec="seconds"),
+               basket["id"], sym, side, f"{pos['entry']:.8g}", f"{price:.8g}",
+               f"{qty_close:.8g}", f"{part:.2f}", f"{pnl:.2f}", reason])
+    return pnl
 
 
-def manage_position(st, chat):
-    """side-aware менеджмент: TP1 закрывает 50%, SL остатка -> БУ, трейлинг ATR до полного выхода
-    (без фиксированного TP2 — остаток идёт по трейлингу, как в спеке)."""
-    for sym, pos in list(st.get("positions", {}).items()):
-        price = bybit_price(sym); time.sleep(0.05)
-        if price is None: continue
-        side = pos.get("side", "long")
-        long_side = side == "long"
-        if not pos["half_closed"]:
-            hit_sl = price <= pos["sl"] if long_side else price >= pos["sl"]
-            hit_tp1 = price >= pos["tp1"] if long_side else price <= pos["tp1"]
+def manage_baskets(st, chat):
+    for bid, basket in list(st.get("baskets", {}).items()):
+        if basket.get("status") != "open": continue
+        direction = basket["direction"]
+        sign = 1 if direction == "long" else -1
+        hold_hours = (time.time() - basket["opened_ts"]) / 3600.0
+
+        total_pnl = 0.0; total_margin = 0.0
+        for sym, pos in list(basket["coins"].items()):
+            if pos["qty"] <= 1e-12: continue
+            price = bybit_price(sym); time.sleep(0.03)
+            if price is None: continue
+            total_margin += pos["qty_init"] * pos["entry"] / LEVERAGE
+            unrealized = sign * (price - pos["entry"]) * pos["qty"]
+            total_pnl += unrealized
+
+        basket_pnl_pct = (total_pnl / total_margin * 100.0) if total_margin > 0 else 0.0
+
+        force_close_all = False; close_reason = ""
+        if basket_pnl_pct <= -BASKET_GLOBAL_SL_PCT:
+            force_close_all = True; close_reason = f"ГЛОБАЛЬНЫЙ СТОП КОРЗИНЫ ({basket_pnl_pct:+.1f}%)"
+        elif hold_hours >= MAX_HOLD_HOURS:
+            force_close_all = True; close_reason = f"ТАЙМ-АУТ ({hold_hours:.1f}ч >= {MAX_HOLD_HOURS:.0f}ч)"
+
+        if force_close_all:
+            realized = 0.0
+            for sym, pos in list(basket["coins"].items()):
+                if pos["qty"] <= 1e-12: continue
+                price = bybit_price(sym) or pos["entry"]
+                realized += close_coin_position(st, chat, basket, sym, price, 1.0, close_reason)
+            basket["status"] = "closed"; basket["closed_ts"] = time.time()
+            save_state(st)
+            emoji = "\U0001F4B0" if realized >= 0 else "\U0001F53B"
+            tg_send(chat, f"{emoji} Корзина закрыта целиком: {close_reason}\nPnL корзины: {realized:+.2f}$")
+            continue
+
+        any_alive = False
+        for sym, pos in list(basket["coins"].items()):
+            if pos["qty"] <= 1e-12: continue
+            price = bybit_price(sym); time.sleep(0.03)
+            if price is None: continue
+            any_alive = True
+            move_pct = sign * (price - pos["entry"]) / pos["entry"] * 100.0
+
+            hit_sl = price <= pos["sl"] if direction == "long" else price >= pos["sl"]
             if hit_sl:
-                close_part(st, chat, pos, pos["sl"], 1.0, "СТОП-ЛОСС"); continue
-            if hit_tp1:
-                close_part(st, chat, pos, pos["tp1"], 0.5, f"ТЕЙК-ПРОФИТ 1 ({ATR_TP1_MULT_EMA}\u00d7ATR)")
-                if sym in st.get("positions", {}):
-                    pos["half_closed"] = True; pos["be_moved"] = True
-                    pos["sl"] = pos["entry"]; pos["peak"] = price; save_state(st)
-                    tg_send(chat, f"\U0001F513 {sym}: SL остатка \u2192 БУ (${pos['entry']:.6g}), "
-                                  f"трейлинг {ATR_TRAIL_MULT_EMA}\u00d7ATR.")
-                continue
-        else:
-            if long_side:
-                if price > pos["peak"]: pos["peak"] = price; save_state(st)
-                trail_stop = pos["peak"] - ATR_TRAIL_MULT_EMA * pos["atr"]
-                if price <= trail_stop:
-                    close_part(st, chat, pos, trail_stop, 1.0, "ТРЕЙЛИНГ-СТОП (ATR)"); continue
-                if price <= pos["sl"]:
-                    close_part(st, chat, pos, pos["sl"], 1.0, "СТОП В БУ")
-            else:
-                if pos["peak"] == 0 or price < pos["peak"]: pos["peak"] = price; save_state(st)
-                trail_stop = pos["peak"] + ATR_TRAIL_MULT_EMA * pos["atr"]
-                if price >= trail_stop:
-                    close_part(st, chat, pos, trail_stop, 1.0, "ТРЕЙЛИНГ-СТОП (ATR)"); continue
-                if price >= pos["sl"]:
-                    close_part(st, chat, pos, pos["sl"], 1.0, "СТОП В БУ")
+                pnl = close_coin_position(st, chat, basket, sym, pos["sl"], 1.0, "СТОП-ЛОСС")
+                tg_send(chat, f"\U0001F53B {sym}: стоп по корзине ${pos['sl']:.6g} \u00b7 PnL {pnl:+.2f}$")
+                save_state(st); continue
+
+            if not pos["tp1_done"]:
+                hit_tp1 = price >= pos["tp1"] if direction == "long" else price <= pos["tp1"]
+                if hit_tp1:
+                    pnl = close_coin_position(st, chat, basket, sym, pos["tp1"], TP1_PART, f"TP1 +{TP1_PCT}%")
+                    pos["tp1_done"] = True
+                    tg_send(chat, f"\U0001F3AF {sym}: TP1 +{TP1_PCT}% \u2192 закрыл {TP1_PART*100:.0f}% \u00b7 PnL {pnl:+.2f}$")
+                    save_state(st)
+
+            if pos["tp1_done"] and not pos["tp2_done"] and TP2_PCT > 0:
+                hit_tp2 = price >= pos["tp2"] if direction == "long" else price <= pos["tp2"]
+                if hit_tp2:
+                    pnl = close_coin_position(st, chat, basket, sym, pos["tp2"], TP2_PART, f"TP2 +{TP2_PCT}%")
+                    pos["tp2_done"] = True
+                    tg_send(chat, f"\U0001F3AF {sym}: TP2 +{TP2_PCT}% \u2192 закрыл {TP2_PART*100:.0f}% \u00b7 PnL {pnl:+.2f}$")
+                    save_state(st)
+
+            if pos["tp2_done"] and pos["qty"] > 1e-12:
+                if not pos["trail_active"] and move_pct >= TRAIL_ACTIVATE_PCT:
+                    pos["trail_active"] = True
+                    pos["peak"] = price
+                    save_state(st)
+                if pos["trail_active"]:
+                    if direction == "long":
+                        pos["peak"] = max(pos["peak"], price)
+                        trail_stop = pos["peak"] * (1 - TRAIL_STEP_PCT / 100.0)
+                        if price <= trail_stop:
+                            pnl = close_coin_position(st, chat, basket, sym, trail_stop, 1.0, "ТРЕЙЛИНГ-СТОП")
+                            tg_send(chat, f"\U0001F512 {sym}: трейлинг-стоп ${trail_stop:.6g} \u00b7 PnL {pnl:+.2f}$")
+                            save_state(st)
+                    else:
+                        pos["peak"] = min(pos["peak"], price) if pos["peak"] else price
+                        trail_stop = pos["peak"] * (1 + TRAIL_STEP_PCT / 100.0)
+                        if price >= trail_stop:
+                            pnl = close_coin_position(st, chat, basket, sym, trail_stop, 1.0, "ТРЕЙЛИНГ-СТОП")
+                            tg_send(chat, f"\U0001F512 {sym}: трейлинг-стоп ${trail_stop:.6g} \u00b7 PnL {pnl:+.2f}$")
+                            save_state(st)
+
+        remaining_qty = sum(p["qty"] for p in basket["coins"].values())
+        if remaining_qty <= 1e-9:
+            basket["status"] = "closed"; basket["closed_ts"] = time.time(); save_state(st)
+            tg_send(chat, f"\U0001F4CB Корзина {bid} полностью закрыта (все монеты вышли по TP/трейлингу).")
+
+def close_all_baskets(st, chat):
+    closed_any = False
+    for bid, basket in list(st.get("baskets", {}).items()):
+        if basket.get("status") != "open": continue
+        realized = 0.0
+        for sym, pos in list(basket["coins"].items()):
+            if pos["qty"] <= 1e-12: continue
+            price = bybit_price(sym) or pos["entry"]
+            realized += close_coin_position(st, chat, basket, sym, price, 1.0, "РУЧНОЕ ЗАКРЫТИЕ /close_all")
+        basket["status"] = "closed"; basket["closed_ts"] = time.time()
+        closed_any = True
+        tg_send(chat, f"\U0001F6D1 Корзина {bid} закрыта вручную. PnL: {realized:+.2f}$")
+    save_state(st)
+    if not closed_any:
+        tg_send(chat, "Нет активных корзин.")
 
 # ============================== СТАТИСТИКА ==============================
-def pos_text(st):
-    poss = dict(st.get("positions", {}))
-    margin_used = MARGIN * slots_used(st)
-    head = (f"\U0001F4CA Слоты: {slots_used(st)}/{MAX_CONCURRENT} \u00b7 "
-            f"сделок сегодня {daily_txt(st)} \u00b7 маржа занята {margin_used:.0f}$/{DEPOSIT:.0f}$")
-    if not poss:
-        return head + "\nВсе слоты свободны — сканирую рынок (EMA9/21 crossover)."
+def status_text(st):
+    baskets = active_baskets(st)
+    head = f"\U0001F4CA Режим: {'консервативный' if IS_CONSERVATIVE else 'агрессивный'} \u00b7 активных корзин: {len(baskets)}/{MAX_CONCURRENT_BASKETS}"
+    if not baskets:
+        return head + "\nЖду сильного движения BTC для входа."
     L = [head]
-    for sym, pos in poss.items():
-        pr = bybit_price(sym) or pos["entry"]
-        side = pos.get("side", "long")
-        sign = 1 if side == "long" else -1
-        upnl = sign * (pr - pos["entry"]) * pos["qty"]
-        stage = "трейлинг (стоп в плюсе)" if pos["half_closed"] else "жду TP1/SL"
-        L.append(f"\U0001F4CC {sym} ({side}): вход ${pos['entry']:.6g} \u2192 сейчас ${pr:.6g} "
-                 f"({upnl:+.2f}$) \u00b7 {stage}")
+    for bid, b in baskets.items():
+        hold_h = (time.time() - b["opened_ts"]) / 3600.0
+        L.append(f"\n\U0001F9FA Корзина {bid} ({b['direction']}) \u00b7 держим {hold_h:.1f}ч из {MAX_HOLD_HOURS:.0f}ч:")
+        for sym, pos in b["coins"].items():
+            if pos["qty"] <= 1e-12: continue
+            pr = bybit_price(sym) or pos["entry"]
+            sign = 1 if pos["side"] == "long" else -1
+            upnl = sign * (pr - pos["entry"]) * pos["qty"]
+            stage = "trailing" if pos["trail_active"] else ("после TP1" if pos["tp1_done"] else "жду TP1/SL")
+            L.append(f"  \U0001F4CC {sym}: ${pos['entry']:.6g}\u2192${pr:.6g} ({upnl:+.2f}$) \u00b7 {stage}")
     return "\n".join(L)
 
 def stats_text():
@@ -740,72 +706,42 @@ def stats_text():
     if not rows: return "\U0001F4CA Сделок ещё нет."
     n = len(rows)
     pnls = [float(r["pnl_usd"]) for r in rows]
-    rs = [float(r["r_mult"]) for r in rows]
     wins = sum(1 for x in pnls if x > 0)
     total = sum(pnls)
-    return ("\U0001F4CA СТАТИСТИКА (EMA Crossover v2, с комиссиями)\n"
-            f"Закрытий: {n} \u00b7 в плюсе: {wins} ({wins/n*100:.0f}%)\n"
-            f"Средний R: {sum(rs)/n:+.2f} \u00b7 Сумма PnL: {total:+.2f}$\n"
+    return ("\U0001F4CA СТАТИСТИКА (Beta Momentum, с комиссиями)\n"
+            f"Закрытий позиций: {n} \u00b7 в плюсе: {wins} ({wins/n*100:.0f}%)\n"
+            f"Сумма PnL: {total:+.2f}$\n"
             f"Депозит {DEPOSIT:.0f}$ \u2192 {'\u2705' if total>=0 else '\u274C'} {total/DEPOSIT*100:+.1f}%")
 
 # ============================== ОСНОВНОЙ ЦИКЛ ==============================
-last_processed_candle_time = {}
-_reject_stats = {}
-_scan_counter = {"total": 0, "last_reset": time.time()}
 BT_RUNNING = {"on": False}
+_last_btc_signal_ts = {"ts": 0}
 
 def scan_once(st, chat):
     if BT_RUNNING["on"]: return
     ok_allowed, why = trading_allowed(st)
     if not ok_allowed: return
-    busy = engaged_syms(st)
-    coins = [s for s in universe() if s not in busy]
-    if not coins: return
 
-    need_bars = max(TREND_SMA_LEN, ADX_LEN * 3, VOL_MA_LEN) + 20
-    try:
-        batch = asyncio.run(fetch_klines_batch(coins, need_bars))
-    except Exception as e:
-        print("batch fetch err:", e); return
+    ok, direction, info = get_btc_signal()
+    if not ok:
+        return
+    if isinstance(info, str):
+        return
 
-    for sym, (o, h, l, c, v, ct) in batch.items():
-        o, h, l, c, v, ct = o[:-1], h[:-1], l[:-1], c[:-1], v[:-1], ct[:-1]
-        if len(c) < need_bars - 5: continue
-        current_candle_time = ct[-1]
-        if current_candle_time <= last_processed_candle_time.get(sym, 0): continue
-        last_processed_candle_time[sym] = current_candle_time
+    coins = get_top_correlated_coins(BASKET_SIZE, MIN_CORR)
+    if not coins:
+        return
+    open_basket(st, chat, direction, coins, info)
 
-        _scan_counter["total"] += 1
-        ok, d = detect_signal(o, h, l, c, v, ct)
-        if not ok:
-            reason_key = str(d).split(" (")[0].split(" x")[0]
-            _reject_stats[reason_key] = _reject_stats.get(reason_key, 0) + 1
-            continue
-        allowed, why = trading_allowed(st)
-        if not allowed: return
-        open_market_position(st, sym, d, chat)
-        busy.add(sym)
-        if slots_used(st) >= MAX_CONCURRENT: return
-
-def debug_text():
-    elapsed_h = (time.time() - _scan_counter["last_reset"]) / 3600
-    total = _scan_counter["total"]
-    if total == 0:
-        return "\U0001F50D Пока нет данных: сканирование только запустилось."
-    lines = [f"\U0001F50D Диагностика за {elapsed_h:.1f}ч \u00b7 проверок закрытых свечей: {total}", ""]
-    for reason, cnt in sorted(_reject_stats.items(), key=lambda x: -x[1])[:15]:
-        lines.append(f"\u2022 {reason}: {cnt} ({cnt/total*100:.1f}%)")
-    return "\n".join(lines)
-
-# ============================== БЭКТЕСТЕР (упрощённый, EMA v2, long+short) ==============================
-def bt_klines(symbol, days):
-    need_bars_per_day = {"15m": 96, "1h": 24}.get(TF, 96)
-    need = int(days * need_bars_per_day) + max(TREND_SMA_LEN, ADX_LEN * 3, VOL_MA_LEN) + 40
+# ============================== БЭКТЕСТЕР (упрощённый, корзина, long+short) ==============================
+def bt_klines(symbol, tf, days):
+    need_bars_per_day = {"15m": 96, "1h": 24}.get(tf, 24)
+    need = int(days * need_bars_per_day) + 60
     out = []; end = None
     while len(out) < need:
-        url = f"{BINANCE}/fapi/v1/klines?symbol={symbol}&interval={TF}&limit=1500"
+        url = f"{BINANCE}/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=1500"
         if end: url += f"&endTime={end}"
-        d = http_json(url); time.sleep(0.15)
+        d = http_json(url); time.sleep(0.12)
         if not d: break
         out = d + out
         end = int(d[0][0]) - 1
@@ -816,114 +752,153 @@ def bt_klines(symbol, days):
     v = [float(x[5]) for x in out]; ct = [int(x[6]) for x in out]
     return o, h, l, c, v, ct
 
-def _bt_leg(pos, price, part):
-    sign = 1 if pos["side"] == "long" else -1
-    qty_close = pos["qty"] * part
-    gross = sign * (price - pos["entry"]) * qty_close
-    fee_exit = price * qty_close * FEE_TAKER
-    fee_in_share = pos["fee_in"] * (qty_close / pos["qty_init"])
-    pnl = gross - fee_exit - fee_in_share
-    pos["qty"] -= qty_close
-    pos["pnl"] += pnl
-    return pnl
-
-def bt_simulate_coin(sym, o, h, l, c, v, ct, diag=None):
-    W = max(TREND_SMA_LEN, ADX_LEN * 3, VOL_MA_LEN) + 20
-    positions = []; pos = None
-    for i in range(W, len(c)):
-        bar_h, bar_l = h[i], l[i]
-        if pos:
-            long_side = pos["side"] == "long"
-            if not pos["half"]:
-                hit_sl = bar_l <= pos["sl"] if long_side else bar_h >= pos["sl"]
-                hit_tp1 = bar_h >= pos["tp1"] if long_side else bar_l <= pos["tp1"]
-                if hit_sl:
-                    _bt_leg(pos, pos["sl"], 1.0); pos["close_ts"] = ct[i]; positions.append(pos); pos = None
-                elif hit_tp1:
-                    _bt_leg(pos, pos["tp1"], 0.5)
-                    pos["half"] = True; pos["sl"] = pos["entry"]
-                    pos["peak"] = pos["tp1"]
-            if pos and pos["half"]:
-                if long_side:
-                    pos["peak"] = max(pos.get("peak", 0), bar_h)
-                    trail = pos["peak"] - ATR_TRAIL_MULT_EMA * pos["atr"]
-                    if bar_l <= trail:
-                        _bt_leg(pos, trail, 1.0); pos["close_ts"] = ct[i]; positions.append(pos); pos = None; continue
-                    if bar_l <= pos["sl"]:
-                        _bt_leg(pos, pos["sl"], 1.0); pos["close_ts"] = ct[i]; positions.append(pos); pos = None
-                else:
-                    pos["peak"] = min(pos.get("peak", 1e18), bar_l)
-                    trail = pos["peak"] + ATR_TRAIL_MULT_EMA * pos["atr"]
-                    if bar_h >= trail:
-                        _bt_leg(pos, trail, 1.0); pos["close_ts"] = ct[i]; positions.append(pos); pos = None; continue
-                    if bar_h >= pos["sl"]:
-                        _bt_leg(pos, pos["sl"], 1.0); pos["close_ts"] = ct[i]; positions.append(pos); pos = None
-        if pos is None:
-            if diag is not None: diag["evals"] += 1
-            ok, d = detect_signal(o[i + 1 - W:i + 1], h[i + 1 - W:i + 1], l[i + 1 - W:i + 1],
-                                   c[i + 1 - W:i + 1], v[i + 1 - W:i + 1], ct[i + 1 - W:i + 1])
-            if ok:
-                if diag is not None: diag["signals"] += 1
-                qty = NOTIONAL / d["entry"]
-                pos = dict(sym=sym, side=d["side"], entry=d["entry"], sl=d["sl"], tp1=d["tp1"],
-                           atr=d["atr"], qty=qty, qty_init=qty, fee_in=NOTIONAL * FEE_MAKER,
-                           half=False, peak=0.0, pnl=0.0, open_ts=ct[i])
-            elif diag is not None:
-                diag["reasons"][str(d)] = diag["reasons"].get(str(d), 0) + 1
-    return positions
-
-def bt_portfolio(all_pos, deposit):
-    taken = []
-    for p in sorted(all_pos, key=lambda x: x["open_ts"]):
-        active = [t for t in taken if t["close_ts"] > p["open_ts"]]
-        if len(active) < MAX_CONCURRENT:
-            taken.append(p)
-    taken.sort(key=lambda x: x["close_ts"])
-    eq = [deposit]
-    for t in taken: eq.append(eq[-1] + t["pnl"])
-    return taken, eq
-
-def run_backtest(chat, days=14, ncoins=30):
+def run_backtest(chat, days=14, ncoins=None):
     if BT_RUNNING["on"]:
         tg_send(chat, "\u23F3 Бэктест уже идёт."); return
     BT_RUNNING["on"] = True
     try:
-        days = max(3, min(days, 30)); ncoins = max(5, min(ncoins, 60))
-        tg_send(chat, f"\U0001F9EA Бэктест EMA{EMA_CROSS_FAST}/{EMA_CROSS_SLOW} crossover: {days} дн \u00d7 до {ncoins} монет.")
+        days = max(3, min(days, 30))
+        ncoins = ncoins or BASKET_SIZE
+        tg_send(chat, f"\U0001F9EA Бэктест Beta Momentum ({MODE}): {days} дн, корзина до {ncoins} монет.")
         try:
-            tick = http_json(f"{BINANCE}/fapi/v1/ticker/24hr", timeout=15)
-        except Exception:
-            tg_send(chat, "\u274C Не удалось получить список монет."); return
-        cands = sorted(
-            [(t["symbol"], float(t.get("quoteVolume", 0) or 0)) for t in tick if t.get("symbol", "").endswith("USDT")],
-            key=lambda x: -x[1])
-        coins = [s for s, qv in cands if qv >= MIN_QUOTE_VOL24][:ncoins]
-        all_pos = []; diag = dict(evals=0, signals=0, reasons={})
-        for k, sym in enumerate(coins, 1):
+            corrs = compute_correlations()
+        except Exception as e:
+            tg_send(chat, f"\u274C Ошибка расчёта корреляций: {e}"); return
+        coins_all = [s for s, d in sorted(corrs.items(), key=lambda x: -x[1]["corr"]) if d["corr"] >= MIN_CORR][:ncoins]
+        if not coins_all:
+            tg_send(chat, "\u274C Нет монет с достаточной корреляцией к BTC."); return
+
+        try:
+            bo, bh, bl, bc, bv, bct = bt_klines("BTCUSDT", TF, days)
+        except Exception as e:
+            tg_send(chat, f"\u274C Ошибка загрузки BTC: {e}"); return
+
+        alt_data = {}
+        for sym in coins_all:
             try:
-                o, h, l, c, v, ct = bt_klines(sym, days)
-                if len(c) < max(TREND_SMA_LEN, ADX_LEN * 3) + 60: continue
-                all_pos += bt_simulate_coin(sym, o[:-1], h[:-1], l[:-1], c[:-1], v[:-1], ct[:-1], diag=diag)
-            except Exception as e:
-                print(f"bt {sym} err:", e)
-            if k % 10 == 0:
-                tg_send(chat, f"\u2699\uFE0F {k}/{len(coins)} монет \u00b7 сигналов {diag['signals']} \u00b7 сделок {len(all_pos)}")
-        taken, eq = bt_portfolio(all_pos, DEPOSIT)
-        if not taken:
-            tg_send(chat, f"\U0001F4ED За {days} дн по {len(coins)} монетам сделок не было (сигналов: {diag['signals']}).")
-            return
-        n = len(taken); wins = sum(1 for t in taken if t["pnl"] > 0)
-        total = eq[-1] - DEPOSIT
+                alt_data[sym] = bt_klines(sym, TF, days)
+            except Exception:
+                pass
+
+        bar_minutes = {"15m": 15, "1h": 60}.get(TF, 60)
+        bars_back = max(1, round(BTC_LOOKBACK_MIN / bar_minutes))
+        adx_vals = adx_series(bh, bl, bc, ADX_LEN)
+        W = max(ADX_LEN * 3, RSI_LEN * 6, bars_back) + 10
+
+        all_trades = []; basket_open = None
+        n = len(bc)
+        for i in range(W, n):
+            if basket_open:
+                hold_h = (bct[i] - basket_open["open_ts"]) / 1000.0 / 3600.0
+                direction = basket_open["direction"]; sign = 1 if direction == "long" else -1
+                total_pnl = 0.0; total_margin = 0.0; all_closed = True
+                for sym, pos in basket_open["coins"].items():
+                    if pos["qty"] <= 1e-12: continue
+                    all_closed = False
+                    ad = alt_data.get(sym)
+                    if not ad: continue
+                    idx = pos["idx_map"].get(i)
+                    if idx is None: continue
+                    bar_h, bar_l, bar_c = ad[1][idx], ad[2][idx], ad[3][idx]
+                    total_margin += pos["qty_init"] * pos["entry"] / LEVERAGE
+                    if not pos["tp1_done"]:
+                        hit_sl = bar_l <= pos["sl"] if direction == "long" else bar_h >= pos["sl"]
+                        hit_tp1 = bar_h >= pos["tp1"] if direction == "long" else bar_l <= pos["tp1"]
+                        if hit_sl:
+                            pnl = sign * (pos["sl"] - pos["entry"]) * pos["qty"] - pos["sl"] * pos["qty"] * FEE_TAKER - pos["fee_in"]
+                            pos["qty"] = 0; all_trades.append(pnl); continue
+                        if hit_tp1:
+                            part_qty = pos["qty"] * TP1_PART
+                            pnl = sign * (pos["tp1"] - pos["entry"]) * part_qty - pos["tp1"] * part_qty * FEE_TAKER - pos["fee_in"] * TP1_PART
+                            pos["qty"] -= part_qty; all_trades.append(pnl); pos["tp1_done"] = True
+                            if TP2_PCT <= 0: pos["tp2_done"] = True
+                    if pos["tp1_done"] and not pos.get("tp2_done") and TP2_PCT > 0:
+                        hit_tp2 = bar_h >= pos["tp2"] if direction == "long" else bar_l <= pos["tp2"]
+                        if hit_tp2:
+                            part_qty = pos["qty"] * (TP2_PART / (1 - TP1_PART))
+                            part_qty = min(part_qty, pos["qty"])
+                            pnl = sign * (pos["tp2"] - pos["entry"]) * part_qty - pos["tp2"] * part_qty * FEE_TAKER - pos["fee_in"] * TP2_PART
+                            pos["qty"] -= part_qty; all_trades.append(pnl); pos["tp2_done"] = True
+                    if pos.get("tp2_done", TP2_PCT <= 0 and pos["tp1_done"]) and pos["qty"] > 1e-12:
+                        move_pct = sign * (bar_c - pos["entry"]) / pos["entry"] * 100.0
+                        if not pos["trail_active"] and move_pct >= TRAIL_ACTIVATE_PCT:
+                            pos["trail_active"] = True; pos["peak"] = bar_c
+                        if pos["trail_active"]:
+                            if direction == "long":
+                                pos["peak"] = max(pos["peak"], bar_h)
+                                trail = pos["peak"] * (1 - TRAIL_STEP_PCT / 100.0)
+                                if bar_l <= trail:
+                                    pnl = sign * (trail - pos["entry"]) * pos["qty"] - trail * pos["qty"] * FEE_TAKER - pos["fee_in"] * (pos["qty"]/pos["qty_init"])
+                                    pos["qty"] = 0; all_trades.append(pnl)
+                            else:
+                                pos["peak"] = min(pos["peak"], bar_l) if pos["peak"] else bar_l
+                                trail = pos["peak"] * (1 + TRAIL_STEP_PCT / 100.0)
+                                if bar_h >= trail:
+                                    pnl = sign * (trail - pos["entry"]) * pos["qty"] - trail * pos["qty"] * FEE_TAKER - pos["fee_in"] * (pos["qty"]/pos["qty_init"])
+                                    pos["qty"] = 0; all_trades.append(pnl)
+                basket_pnl_pct = 0.0
+                if total_margin > 0:
+                    live_pnl = sum(sign * (alt_data[s][3][pos["idx_map"].get(i, 0)] - pos["entry"]) * pos["qty"]
+                                   for s, pos in basket_open["coins"].items() if pos["qty"] > 1e-12 and s in alt_data)
+                    basket_pnl_pct = live_pnl / total_margin * 100.0 if total_margin else 0.0
+                timeout = hold_h >= MAX_HOLD_HOURS
+                global_stop = basket_pnl_pct <= -BASKET_GLOBAL_SL_PCT
+                remaining = sum(p["qty"] for p in basket_open["coins"].values())
+                if remaining <= 1e-9 or timeout or global_stop:
+                    if timeout or global_stop:
+                        for sym, pos in basket_open["coins"].items():
+                            if pos["qty"] <= 1e-12: continue
+                            ad = alt_data.get(sym)
+                            if not ad: continue
+                            idx = pos["idx_map"].get(i)
+                            if idx is None: continue
+                            exit_px = ad[3][idx]
+                            pnl = sign * (exit_px - pos["entry"]) * pos["qty"] - exit_px * pos["qty"] * FEE_TAKER - pos["fee_in"] * (pos["qty"]/pos["qty_init"])
+                            all_trades.append(pnl)
+                    basket_open = None
+                continue
+
+            if i < len(adx_vals) and adx_vals[i] > ADX_MIN:
+                chg = pct_change_over(bc[:i + 1], bars_back)
+                if abs(chg) >= BTC_THRESHOLD_PCT:
+                    r = rsi(bc[max(0, i - RSI_LEN * 6):i + 1], RSI_LEN)
+                    if RSI_EXTREME_LOW < r < RSI_EXTREME_HIGH:
+                        direction = "long" if chg > 0 else "short"
+                        sign = 1 if direction == "long" else -1
+                        coins_pos = {}
+                        for sym in coins_all:
+                            ad = alt_data.get(sym)
+                            if not ad or len(ad[3]) <= i: continue
+                            entry = ad[3][i]
+                            sl = entry * (1 - SL_PCT/100) if direction == "long" else entry * (1 + SL_PCT/100)
+                            tp1 = entry * (1 + TP1_PCT/100) if direction == "long" else entry * (1 - TP1_PCT/100)
+                            tp2 = None
+                            if TP2_PCT > 0:
+                                tp2 = entry * (1 + TP2_PCT/100) if direction == "long" else entry * (1 - TP2_PCT/100)
+                            notional = MARGIN * LEVERAGE
+                            qty = notional / entry
+                            idx_map = {j: j for j in range(i, min(i + int(MAX_HOLD_HOURS * 60 / bar_minutes) + 5, len(ad[3])))}
+                            coins_pos[sym] = dict(entry=entry, sl=sl, tp1=tp1, tp2=tp2, qty=qty, qty_init=qty,
+                                                   fee_in=qty*entry*FEE_MAKER, tp1_done=False,
+                                                   tp2_done=(tp2 is None), trail_active=False, peak=entry,
+                                                   idx_map=idx_map)
+                        if coins_pos:
+                            basket_open = dict(direction=direction, open_ts=bct[i], coins=coins_pos)
+
+        if not all_trades:
+            tg_send(chat, f"\U0001F4ED За {days} дн сделок не было (порог движения BTC не пробит или ADX/RSI фильтры блокировали)."); return
+        n_trades = len(all_trades)
+        wins = sum(1 for x in all_trades if x > 0)
+        total = sum(all_trades)
+        eq = [DEPOSIT]
+        for x in all_trades: eq.append(eq[-1] + x)
         peak = DEPOSIT; dd = 0.0
-        for x in eq:
-            peak = max(peak, x); dd = max(dd, (peak - x) / peak)
-        longs = sum(1 for t in taken if t["side"] == "long")
-        shorts = n - longs
-        tg_send(chat, (f"\U0001F9EA БЭКТЕСТ EMA{EMA_CROSS_FAST}/{EMA_CROSS_SLOW}: {days} дн \u00d7 {len(coins)} монет\n"
-                       f"Сделок: {n} (Long {longs} \u00b7 Short {shorts})\n"
-                       f"В плюсе: {wins} ({wins/n*100:.0f}%)\n"
+        for x in eq: peak = max(peak, x); dd = max(dd, (peak - x) / peak)
+        tg_send(chat, (f"\U0001F9EA БЭКТЕСТ Beta Momentum ({MODE}): {days} дн \u00d7 {len(coins_all)} альтов\n"
+                       f"Частичных закрытий: {n_trades}\n"
+                       f"В плюсе: {wins} ({wins/n_trades*100:.0f}%)\n"
                        f"Итог: {total:+.2f}$ ({total/DEPOSIT*100:+.1f}% депо) \u00b7 макс.просадка {dd*100:.1f}%\n"
-                       f"\u26A0\uFE0F Комиссии учтены; спред/проскальзывание нет; пессимизм: в спорном баре стоп раньше тейка."))
+                       f"\u26A0\uFE0F Комиссии учтены; спред/проскальзывание нет; корзина упрощена до одной активной за раз."))
     finally:
         BT_RUNNING["on"] = False
 
@@ -944,49 +919,46 @@ def tg_loop(st):
                 save_chat(cid)
                 if text.startswith("/help"):
                     tg_send(cid,
-                        "\U0001F4D6 Команды EVA v4 (EMA Crossover):\n"
+                        "\U0001F4D6 Команды EVA v6 (Beta Momentum \u2014 следование за BTC):\n"
                         "/start — запуск и краткая сводка\n"
-                        "/pos — текущие позиции: цена, PnL, стадия\n"
-                        "/stats — статистика: win rate, средний R, PnL\n"
-                        "/debug — топ причин отказа сигналов\n"
-                        "/backtest [дней] [монет] — прогон по истории (long+short)\n"
-                        "/pause — пауза (позиции ведутся, новые не ищутся)\n"
+                        "/status — активные корзины: монеты, PnL, стадия\n"
+                        "/stats — статистика: win rate, PnL\n"
+                        "/backtest [дней] — прогон по истории\n"
+                        "/close_all — закрыть все корзины немедленно\n"
+                        "/pause — пауза (новые корзины не открываются)\n"
                         "/resume — возобновить сканирование\n"
                         "/help — эта справка")
                 elif text.startswith("/start"):
                     st["paused"] = False; save_state(st)
-                    tg_send(cid, "\U0001F916 EVA v4 — EMA9/21 Crossover (Long+Short)\n"
-                             "Данные: Binance \u00b7 Цены/исполнение: Bybit\n"
-                             f"Лимиты: до {MAX_CONCURRENT} позиций \u00b7 "
-                             f"{'дневной лимит сделок ' + str(MAX_DAILY_TRADES) if MAX_DAILY_TRADES>0 else 'без дневного лимита сделок'} \u00b7 "
-                             f"дневной стоп по убытку {DAILY_LOSS_LIMIT_PCT}% \u00b7 "
-                             f"Объём ${NOTIONAL:.0f} (маржа {MARGIN:.0f}$ x{LEVERAGE:.0f})\n"
-                             "Команды: /pos \u00b7 /stats \u00b7 /backtest \u00b7 /pause \u00b7 /resume \u00b7 /help")
+                    tg_send(cid, f"\U0001F916 EVA v6 — Beta Momentum (следование за BTC), режим: {'консервативный' if IS_CONSERVATIVE else 'агрессивный'}\n"
+                             f"TF={TF} \u00b7 порог BTC {BTC_THRESHOLD_PCT}%/{BTC_LOOKBACK_MIN}мин \u00b7 корр>{MIN_CORR} \u00b7 "
+                             f"корзина до {BASKET_SIZE} монет \u00b7 плечо {LEVERAGE:.0f}x\n"
+                             f"Риск корзины {BASKET_RISK_PCT}% депо \u00b7 SL {SL_PCT}% \u00b7 глобальный стоп \u2212{BASKET_GLOBAL_SL_PCT}%\n"
+                             "Команды: /status \u00b7 /stats \u00b7 /backtest \u00b7 /close_all \u00b7 /pause \u00b7 /resume")
                 elif text.startswith("/pause"):
                     st["paused"] = True; save_state(st)
-                    tg_send(cid, "\u23F8 Пауза: новые сигналы не ищу.")
+                    tg_send(cid, "\u23F8 Пауза: новые корзины не открываю.")
                 elif text.startswith("/resume"):
                     st["paused"] = False; save_state(st)
                     tg_send(cid, "\u25B6\uFE0F Сканирование возобновлено.")
-                elif text.startswith("/pos"):
-                    tg_send(cid, pos_text(st))
+                elif text.startswith("/status"):
+                    tg_send(cid, status_text(st))
                 elif text.startswith("/stats"):
                     tg_send(cid, stats_text())
-                elif text.startswith("/debug"):
-                    tg_send(cid, debug_text())
+                elif text.startswith("/close_all"):
+                    close_all_baskets(st, cid)
                 elif text.startswith("/backtest"):
                     parts = text.split()[1:]
                     nums = [p for p in parts if p.isdigit()]
                     bd = int(nums[0]) if len(nums) > 0 else 14
-                    bc = int(nums[1]) if len(nums) > 1 else 30
-                    threading.Thread(target=run_backtest, args=(cid, bd, bc), daemon=True).start()
+                    threading.Thread(target=run_backtest, args=(cid, bd), daemon=True).start()
         except Exception as e:
             print("tg_loop err:", e); time.sleep(3)
 
 def main():
     st = load_state()
     chat = load_chat()
-    print("EVA v4 (EMA Crossover Long+Short) запущен. chat:", "есть" if chat else "нет")
+    print(f"EVA v6 (Beta Momentum, режим={MODE}) запущен. chat:", "есть" if chat else "нет")
     threading.Thread(target=tg_loop, args=(st,), daemon=True).start()
     last_scan = last_manage = 0
     while True:
@@ -996,11 +968,11 @@ def main():
             now = time.time()
             if now - last_manage >= MANAGE_EVERY_SEC:
                 last_manage = now
-                manage_position(st, chat)
+                manage_baskets(st, chat)
             if now - last_scan >= SCAN_EVERY_SEC:
                 last_scan = now
                 scan_once(st, chat)
-                print(f"[scan] слоты {slots_used(st)}/{MAX_CONCURRENT} \u00b7 сделок сегодня {st.get('trades_today',0)}")
+                print(f"[scan] активных корзин {len(active_baskets(st))}/{MAX_CONCURRENT_BASKETS} \u00b7 сделок сегодня {st.get('trades_today',0)}")
         except Exception as e:
             print("main err:", e)
         time.sleep(2)
