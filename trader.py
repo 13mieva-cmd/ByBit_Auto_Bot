@@ -15,7 +15,7 @@ log = logging.getLogger("trader")
 
 class BybitTrader:
     def __init__(self, api_key: str, api_secret: str,
-                 base_url: str = "https://api.bybit.com", recv_window: int = 5000):
+                 base_url: str = "base_url: str = "https://api-demo.bybit.com"", recv_window: int = 5000):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url
