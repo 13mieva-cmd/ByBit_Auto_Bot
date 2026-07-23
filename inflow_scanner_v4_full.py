@@ -58,7 +58,7 @@ from visuals import progress_bar, sparkline, position_progress
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("scanner")
 
-BYBIT_BASE = "base_url: str = "https://api-demo.bybit.com""
+BYBIT_BASE = "base_url: str = "https://api-demo.bybit.com"
 last_alert: dict[str, float] = {}
 SEM = asyncio.Semaphore(10)
 
