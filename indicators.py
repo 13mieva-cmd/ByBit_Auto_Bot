@@ -1,4 +1,5 @@
-"""Indicators: RSI, EMA, sparkline."""
+"""Indicators: RSI, EMA, Bollinger Bands, sparkline."""
+import math
 from typing import Optional
 
 
@@ -27,6 +28,27 @@ def calculate_ema(values: list[float], period: int) -> Optional[float]:
     for v in values[period:]:
         ema = v * k + ema * (1 - k)
     return ema
+
+
+def calculate_bollinger(
+    closes: list[float], period: int = 20, mult: float = 2.0
+) -> Optional[dict]:
+    """Bollinger Bands on the last candle: upper, middle, lower, bandwidth (%)."""
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    middle = sum(window) / period
+    variance = sum((c - middle) ** 2 for c in window) / period
+    std = math.sqrt(variance)
+    upper = middle + mult * std
+    lower = middle - mult * std
+    bandwidth = (upper - lower) / middle * 100 if middle > 0 else 0.0
+    return {
+        "upper": upper,
+        "middle": middle,
+        "lower": lower,
+        "bandwidth": bandwidth,
+    }
 
 
 def sparkline(values: list[float], width: int = 10) -> str:
