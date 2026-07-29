@@ -1,7 +1,7 @@
 """
 Configuration for Bybit Open Interest LONG Scanner v2.
 Detects birth of an uptrend via Price + OI confluence.
-Three signal types: Standard, OI Surge, Pullback Continuation.
+Signal types: Standard, OI Surge, Pullback Continuation, BB Squeeze.
 """
 import os
 
@@ -44,6 +44,19 @@ PULLBACK_RSI_1H_MAX = float(os.getenv("PULLBACK_RSI_1H_MAX", "58"))
 PULLBACK_EMA_DISTANCE_PCT = float(os.getenv("PULLBACK_EMA_DISTANCE_PCT", "2.0"))
 PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "8.0"))
 PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "-1.0"))
+
+# ---------- BB SQUEEZE signal ----------
+ENABLE_BB_SQUEEZE = os.getenv("ENABLE_BB_SQUEEZE", "true").lower() == "true"
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_MULT = float(os.getenv("BB_MULT", "2.0"))
+# Squeeze: bandwidth in lower percentile of lookback OR below absolute max
+BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 1h bars
+BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "20"))  # bottom 20%
+BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "3.5"))  # % hard cap
+# After squeeze: close above upper band, then small pullback entry
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.8"))
+BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "62"))
+BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "5.0"))
 
 # ---------- EMA filter ----------
 USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"
@@ -95,6 +108,8 @@ BLACKLIST = {
 # Bybit API credentials — set in Railway Variables, NEVER hardcode
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+# demo: https://api-demo.bybit.com | mainnet: https://api.bybit.com
+BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api-demo.bybit.com")
 
 # ---------- Risk ----------
 DEPOSIT_USD = float(os.getenv("DEPOSIT_USD", "500"))
@@ -110,13 +125,19 @@ AUTO_HARD_SL_PCT = float(os.getenv("AUTO_HARD_SL_PCT", "2.0"))
 AUTO_PULLBACK_TP_PCT = float(os.getenv("AUTO_PULLBACK_TP_PCT", "1.8"))
 AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 
+# BB Squeeze auto trade
+AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.2"))
+AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.4"))
+
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "25"))
 CONSECUTIVE_LOSS_BLOCK = int(os.getenv("CONSECUTIVE_LOSS_BLOCK", "3"))
 
 # Which signal types are eligible for auto-trade
-AUTO_TRADE_SIGNAL_TYPES = os.getenv("AUTO_TRADE_SIGNAL_TYPES", "STANDARD,SURGE,PULLBACK")
+AUTO_TRADE_SIGNAL_TYPES = os.getenv(
+    "AUTO_TRADE_SIGNAL_TYPES", "STANDARD,SURGE,PULLBACK,BB_SQUEEZE"
+)
 
 # Reconciliation interval (sec)
 RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "30"))
@@ -130,6 +151,8 @@ AUTO_TP1_TRIGGER_PCT = float(os.getenv("AUTO_TP1_TRIGGER_PCT", "1.5"))
 AUTO_TRAIL_DISTANCE_PCT = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT", "1.0"))
 AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))
 AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
+AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.1"))
+AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.7"))
 
 # BTC trend filter for auto-entry
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"

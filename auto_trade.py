@@ -10,8 +10,10 @@ import aiohttp
 from aiogram import Bot
 
 from config import (
+    BYBIT_BASE_URL,
     POSITION_SIZE_USD, AUTO_TP_PCT, AUTO_HARD_SL_PCT,
     AUTO_PULLBACK_TP_PCT, AUTO_PULLBACK_SL_PCT,
+    AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
     MAX_AUTO_POSITIONS, DAILY_LOSS_LIMIT_USD, CONSECUTIVE_LOSS_BLOCK,
     AUTO_TRADE_SIGNAL_TYPES, RECONCILE_INTERVAL_SEC,
     POST_TRADE_COOLDOWN_HOURS,
@@ -21,13 +23,14 @@ from config import (
     LEVERAGE, DEPOSIT_USD,
     AUTO_TRAIL_ENABLED, AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT,
     AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB,
+    AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB,
 )
 from trader import BybitTrader
 
 log = logging.getLogger("auto")
 
 
-BYBIT_PUBLIC = "https://api-demo.bybit.com"
+BYBIT_PUBLIC = BYBIT_BASE_URL
 
 
 async def check_btc_health() -> dict:
@@ -162,6 +165,9 @@ class AutoTrader:
             if sig_type == "PULLBACK":
                 tp_pct = AUTO_PULLBACK_TP_PCT
                 sl_pct = AUTO_PULLBACK_SL_PCT
+            elif sig_type == "BB_SQUEEZE":
+                tp_pct = AUTO_BB_TP_PCT
+                sl_pct = AUTO_BB_SL_PCT
             else:
                 tp_pct = AUTO_TP_PCT
                 sl_pct = AUTO_HARD_SL_PCT
@@ -279,6 +285,8 @@ class AutoTrader:
         gain_pct = (mark - entry) / entry * 100
         if tracked.get("signal_type") == "PULLBACK":
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB
+        elif tracked.get("signal_type") == "BB_SQUEEZE":
+            trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB
         else:
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT
         if gain_pct < trigger:

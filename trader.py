@@ -15,7 +15,7 @@ log = logging.getLogger("trader")
 
 class BybitTrader:
     def __init__(self, api_key: str, api_secret: str,
-                 base_url: str = "https://api.bybit.com", recv_window: int = 5000):
+                 base_url: str = "https://api-demo.bybit.com", recv_window: int = 5000):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url
@@ -48,15 +48,18 @@ class BybitTrader:
                     }
 
                     async with session.get(url, headers=headers, timeout=15) as r:
+                        raw = await r.text()
+                        if not raw:
+                            log.error(f"{method} {path}: empty body status={r.status} url={self.base_url}")
+                            return {"retCode": -1, "retMsg": f"empty body, status={r.status}"}
                         try:
-                            data = await r.json(content_type=None)
+                            data = json.loads(raw)
                         except Exception:
-                            text = await r.text()
-                            log.error(f"{method} {path}: non-json response status={r.status} body={text[:500]}")
+                            log.error(f"{method} {path}: non-json status={r.status} body={raw[:500]}")
                             return {"retCode": -1, "retMsg": f"non-json response, status={r.status}"}
 
                         if not isinstance(data, dict):
-                            log.error(f"{method} {path}: invalid response type {type(data).__name__}")
+                            log.error(f"{method} {path}: invalid type {type(data).__name__} body={raw[:300]}")
                             return {"retCode": -1, "retMsg": f"invalid response type: {type(data).__name__}"}
 
                         return data
@@ -72,15 +75,18 @@ class BybitTrader:
                     }
 
                     async with session.post(f"{self.base_url}{path}", data=body, headers=headers, timeout=15) as r:
+                        raw = await r.text()
+                        if not raw:
+                            log.error(f"{method} {path}: empty body status={r.status} url={self.base_url}")
+                            return {"retCode": -1, "retMsg": f"empty body, status={r.status}"}
                         try:
-                            data = await r.json(content_type=None)
+                            data = json.loads(raw)
                         except Exception:
-                            text = await r.text()
-                            log.error(f"{method} {path}: non-json response status={r.status} body={text[:500]}")
+                            log.error(f"{method} {path}: non-json status={r.status} body={raw[:500]}")
                             return {"retCode": -1, "retMsg": f"non-json response, status={r.status}"}
 
                         if not isinstance(data, dict):
-                            log.error(f"{method} {path}: invalid response type {type(data).__name__}")
+                            log.error(f"{method} {path}: invalid type {type(data).__name__} body={raw[:300]}")
                             return {"retCode": -1, "retMsg": f"invalid response type: {type(data).__name__}"}
 
                         return data
@@ -444,6 +450,44 @@ class BybitTrader:
         params = {"category": "linear", "symbol": symbol}
         resp = await self._signed_request("POST", "/v5/order/cancel-all", params)
         return isinstance(resp, dict) and resp.get("retCode") == 0
+
+
+    async def set_trailing_stop(self, symbol: str, trail_pct: float) -> dict:
+        """Включить биржевой трейлинг-стоп. trail_pct — дистанция в % от цены.
+        Снимает фиксированный TP, оставляет SL как трейлинг."""
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": "no instrument info"}
+
+        positions = await self.get_open_positions(symbol)
+        if not positions:
+            return {"ok": False, "error": "нет позиции"}
+
+        mark = positions[0].get("mark_price") or positions[0].get("entry_price") or 0
+        if mark <= 0:
+            return {"ok": False, "error": "нет mark price"}
+
+        # Bybit trailingStop — абсолютное расстояние в цене
+        trail_dist = mark * (trail_pct / 100.0)
+        trail_str = self._fmt(self._round_price(trail_dist, info["tick_size"]), info["tick_size"])
+
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "trailingStop": trail_str,
+            "tpslMode": "Full",
+            "positionIdx": 0,
+        }
+        # Снять фиксированный TP, чтобы трейлинг вёл сам
+        params["takeProfit"] = "0"
+
+        resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
+        if not isinstance(resp, dict):
+            return {"ok": False, "error": f"invalid response: {resp!r}"}
+        if resp.get("retCode") not in (0, 34040):
+            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
+        return {"ok": True, "trailing_stop": trail_str, "trail_pct": trail_pct}
 
     async def get_closed_pnl(self, symbol: str = None, limit: int = 20) -> list:
         params = {"category": "linear", "limit": str(limit)}

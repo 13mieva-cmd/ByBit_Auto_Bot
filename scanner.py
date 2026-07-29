@@ -44,7 +44,7 @@ from config import (
     POSITIONS_FILE, IGNORE_FILE, STATS_FILE,
     DAILY_REPORT_HOUR_UTC,
     BLACKLIST,
-    BYBIT_API_KEY, BYBIT_API_SECRET,
+    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_BASE_URL,
     POSITION_SIZE_USD, AUTO_TP_PCT, AUTO_HARD_SL_PCT,
     AUTO_PULLBACK_TP_PCT, AUTO_PULLBACK_SL_PCT,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
@@ -63,7 +63,7 @@ from visuals import progress_bar, sparkline, position_progress
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("scanner")
 
-BYBIT_BASE = "https://api-demo.bybit.com"
+BYBIT_BASE = BYBIT_BASE_URL
 last_alert: dict[str, float] = {}
 SEM = asyncio.Semaphore(10)
 
@@ -1657,7 +1657,7 @@ async def main():
     # Initialize auto-trading if API keys present
     auto_status = "🔴 Авто-торговля: НЕ настроена (нет API ключей)"
     if BYBIT_API_KEY and BYBIT_API_SECRET:
-        trader = BybitTrader(BYBIT_API_KEY, BYBIT_API_SECRET)
+        trader = BybitTrader(BYBIT_API_KEY, BYBIT_API_SECRET, base_url=BYBIT_BASE_URL)
         # Verify connection
         balance = await trader.get_wallet_balance_usdt()
         if balance is None:
