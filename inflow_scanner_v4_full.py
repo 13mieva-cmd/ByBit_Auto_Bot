@@ -460,7 +460,7 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     """
     BB Squeeze on 15m (strict) → breakout upper → small pullback entry.
-    1) Fresh squeeze: bandwidth was in lower percentile / below MAX_BW within last FRESH_BARS
+    1) Fresh squeeze (OR): relative percentile of this coin OR absolute MAX_BW, within FRESH_BARS
     2) Breakout: recent 15m close above upper band
     3) Volume: 15m vol spike >= BB_BREAKOUT_VOL_MIN on/near breakout
     4) Pullback: 0.15%..BB_PULLBACK_MAX_PCT from breakout high
@@ -479,22 +479,28 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     hist = d.get("bb_history_bw") or []
     # hist[0] = current bar bandwidth, hist[1] = previous, ...
 
-    # Percentile threshold from full lookback
-    threshold = BB_SQUEEZE_MAX_BW
+    # Свежий минимум bandwidth за последние FRESH_BARS
+    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
+    recent = hist[:fresh_n] if hist else [bw]
+    min_recent = min(recent)
+
+    # Настоящее ИЛИ (не min-порог):
+    # 1) относительно истории ЭТОЙ монеты: min_recent в нижних PERCENTILE%
+    # 2) абсолютный cap: min_recent <= MAX_BW
+    # Раньше threshold=min(MAX, pct) + OR MAX делал перцентиль мёртвым;
+    # потом min-only лишал относительную ветку для монет с широкими полосами.
+    percentile_ok = False
     if hist and len(hist) >= 10:
         sorted_bw = sorted(hist)
         pidx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
-        threshold = min(threshold, sorted_bw[pidx])
-
-    # Fresh squeeze: at least one of the last FRESH_BARS was in squeeze zone
-    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist)))
-    recent = hist[:fresh_n] if hist else [bw]
-    min_recent = min(recent)
-    is_fresh_squeeze = min_recent <= threshold or min_recent <= BB_SQUEEZE_MAX_BW
-    # Current or recent bar still not wildly expanded (avoid late entries)
-    if bw > BB_SQUEEZE_MAX_BW * 1.8:
+        percentile_ok = min_recent <= sorted_bw[pidx]
+    cap_ok = min_recent <= BB_SQUEEZE_MAX_BW
+    if not (percentile_ok or cap_ok):
         return None
-    if not is_fresh_squeeze:
+
+    # Не входим, если полосы уже сильно расширились после squeeze
+    # (относительно свежего минимума — работает и для «широких» монет)
+    if min_recent > 0 and bw > min_recent * 1.8 and bw > BB_SQUEEZE_MAX_BW * 1.5:
         return None
 
     # Breakout above upper on 15m (current or last 1-2 bars)
@@ -999,10 +1005,11 @@ async def cmd_settings(msg: types.Message):
         f"• 2 зелёные свечи подряд на 1h\n"
         f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
         f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
-        f"• Свежее сужение 15m (bw ≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
-        f"• Пробой верхней границы BB (15m)\n"
+        f"• Свежее сужение 15m за {BB_SQUEEZE_FRESH_BARS} баров:\n"
+        f"  bw ≤{BB_SQUEEZE_MAX_BW}% <b>или</b> нижние {BB_SQUEEZE_PERCENTILE:.0f}% истории монеты\n"
+        f"• Пробой upper 15m + объём ×{BB_BREAKOUT_VOL_MIN}\n"
         f"• Вход на откате 0.15…{BB_PULLBACK_MAX_PCT}% от high пробоя\n"
-        f"• RSI 1ч ≤{BB_PULLBACK_RSI_MAX}, OI 24ч ≥+{BB_OI_24H_MIN}%\n"
+        f"• RSI 15м ≤{BB_PULLBACK_RSI_MAX}, OI 24ч ≥+{BB_OI_24H_MIN}%\n"
         f"• Авто: TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%\n\n"
         f"<b>Ручная сделка (трекер):</b>\n"
         f"• TP1: +{TP1_PCT}% / TP2: +{TP2_PCT}%\n"
