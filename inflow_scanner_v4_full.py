@@ -162,12 +162,18 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         if rsi_4h is None:
             return None
 
-        # Fetch 1h klines (used by SURGE and pullback)
-        klines_1h = await get_klines(session, symbol, "60", max(EMA_PERIOD + 5, BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5, 80))
+        # Fetch 1h klines (used by SURGE, pullback, EMA filter)
+        klines_1h = await get_klines(session, symbol, "60", max(EMA_PERIOD + 5, 30))
         if len(klines_1h) < 25:
             return None
         closes_1h = [float(k[4]) for k in klines_1h]
         current_price = closes_1h[-1]
+
+        # Fetch 15m klines for BB Squeeze (compression + breakout on 15m)
+        klines_15m = await get_klines(
+            session, symbol, "15", max(BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5, 80)
+        )
+        closes_15m = [float(k[4]) for k in klines_15m] if klines_15m else []
 
         # EMA50 on 1h
         ema50 = calculate_ema(closes_1h, EMA_PERIOD)
@@ -258,18 +264,21 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
     if rsi_1h is None:
         return None
 
-    # Bollinger Bands (1h) + bandwidth history for squeeze detection
-    bb = calculate_bollinger(closes_1h, BB_PERIOD, BB_MULT)
+    # Bollinger Bands on 15m + bandwidth history for squeeze detection
+    bb = calculate_bollinger(closes_15m, BB_PERIOD, BB_MULT) if closes_15m else None
     bb_history_bw = []
     need = BB_PERIOD + BB_SQUEEZE_LOOKBACK
-    if len(closes_1h) >= need:
+    if len(closes_15m) >= need:
         for i in range(BB_SQUEEZE_LOOKBACK):
-            end = len(closes_1h) - i
+            end = len(closes_15m) - i
             if end < BB_PERIOD:
                 break
-            b = calculate_bollinger(closes_1h[:end], BB_PERIOD, BB_MULT)
+            b = calculate_bollinger(closes_15m[:end], BB_PERIOD, BB_MULT)
             if b:
                 bb_history_bw.append(b["bandwidth"])
+
+    # RSI 15m — for BB pullback entry (not overbought on the signal TF)
+    rsi_15m = calculate_rsi(closes_15m, 14) if len(closes_15m) >= 15 else None
 
     base_data = {
         "symbol": symbol,
@@ -296,6 +305,7 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "bb_lower": bb["lower"] if bb else None,
         "bb_bandwidth": bb["bandwidth"] if bb else None,
         "bb_history_bw": bb_history_bw,
+        "rsi_15m": rsi_15m,
     }
 
     # ========== Try STANDARD signal ==========
@@ -317,7 +327,7 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
 
     # ========== Try BB SQUEEZE signal ==========
     if ENABLE_BB_SQUEEZE:
-        bb_sig = try_bb_squeeze(base_data, closes_1h)
+        bb_sig = try_bb_squeeze(base_data, closes_15m)
         if bb_sig:
             return bb_sig
 
@@ -434,15 +444,17 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 
 
 
-def try_bb_squeeze(d: dict, closes_1h: list[float]) -> Optional[dict]:
+def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     """
-    BB Squeeze -> breakout above upper band -> small pullback entry.
-    1) Squeeze: bandwidth in lower BB_SQUEEZE_PERCENTILE of lookback OR < MAX_BW
-    2) Breakout: recent close above upper band
+    BB Squeeze on 15m → breakout above upper band → small pullback entry.
+    1) Squeeze (15m): bandwidth in lower BB_SQUEEZE_PERCENTILE of lookback OR < MAX_BW
+    2) Breakout (15m): recent close above upper band
     3) Pullback: price retraced 0.15%..BB_PULLBACK_MAX_PCT from breakout high
-    4) Filters: above EMA50, OI 24h, RSI not overbought
+    4) Filters: above EMA50 (1h), OI 24h, RSI 15m not overbought
     """
     if d.get("bb_upper") is None or d.get("bb_bandwidth") is None:
+        return None
+    if not closes_15m or len(closes_15m) < BB_PERIOD + 3:
         return None
     if USE_EMA_FILTER and d["ema50_1h"] is not None and d["price"] < d["ema50_1h"]:
         return None
@@ -463,26 +475,31 @@ def try_bb_squeeze(d: dict, closes_1h: list[float]) -> Optional[dict]:
     if not is_squeeze:
         return None
 
+    # Breakout above upper on 15m (current or last 1-2 bars)
     broke = False
     breakout_high = d["price"]
-    look = min(3, len(closes_1h))
+    look = min(3, len(closes_15m))
     for i in range(1, look + 1):
-        c = closes_1h[-i]
+        c = closes_15m[-i]
         if c > d["bb_upper"]:
             broke = True
             breakout_high = max(breakout_high, c)
     if not broke:
         return None
 
+    # Small pullback from breakout high
     pullback_pct = (breakout_high - d["price"]) / breakout_high * 100 if breakout_high > 0 else 0
     if pullback_pct < 0.15:
         return None
     if pullback_pct > BB_PULLBACK_MAX_PCT:
         return None
-    if d["rsi_1h"] > BB_PULLBACK_RSI_MAX:
+
+    rsi_15 = d.get("rsi_15m")
+    if rsi_15 is not None and rsi_15 > BB_PULLBACK_RSI_MAX:
         return None
 
-    if len(closes_1h) < 3 or closes_1h[-1] <= closes_1h[-3]:
+    # Momentum still alive on 15m: price above close 2 bars ago
+    if len(closes_15m) < 3 or closes_15m[-1] <= closes_15m[-3]:
         return None
 
     stars = 1
@@ -596,7 +613,7 @@ SIGNAL_LOGIC = {
     "STANDARD": "Цена↑ 4ч + OI↑ 4ч + объём = свежие деньги входят",
     "SURGE":    "Цена↑ 1ч + OI↑ 1ч = очень ранний старт тренда",
     "PULLBACK": "Тренд вверх + откат к EMA21 + OI растёт = вход на ретесте",
-    "BB_SQUEEZE": "Сужение Bollinger → пробой upper → вход на небольшом откате",
+    "BB_SQUEEZE": "Сужение Bollinger 15m → пробой upper → вход на небольшом откате",
 }
 
 
@@ -622,7 +639,7 @@ def format_alert(s: dict) -> str:
     bb_line = ""
     if s.get("signal_type") == "BB_SQUEEZE":
         bb_line = (
-            f"📉 BB: bw {s.get('bb_bandwidth', 0):.2f}% | "
+            f"📉 BB 15m: bw {s.get('bb_bandwidth', 0):.2f}% | "
             f"откат {s.get('bb_pullback_pct', 0):.2f}%\n"
         )
 
@@ -889,7 +906,7 @@ async def cmd_start(msg: types.Message):
         "<b>4 типа сигналов:</b>\n"
         "🟢 STANDARD — цена↑ + OI↑ 4ч + объём\n"
         "⚡ SURGE — цена↑ + OI↑ 1ч (ранний вход)\n"
-        "↩️ PULLBACK — откат к EMA21 в тренде\n📉 BB_SQUEEZE — squeeze BB → пробой → откат\n\n"
+        "↩️ PULLBACK — откат к EMA21 в тренде\n📉 BB_SQUEEZE — squeeze BB 15m → пробой → откат\n\n"
         "<b>Логика выхода:</b>\n"
         "🎯 TP1 +2% (закрыть 50%)\n"
         "🎯 TP2 +5% (закрыть остаток)\n"
@@ -950,8 +967,8 @@ async def cmd_settings(msg: types.Message):
         f"• 2 зелёные свечи подряд на 1h\n"
         f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
         f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
-        f"• Сужение полос (bw ≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
-        f"• Пробой верхней границы BB\n"
+        f"• Сужение полос 15m (bw ≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
+        f"• Пробой верхней границы BB (15m)\n"
         f"• Вход на откате 0.15…{BB_PULLBACK_MAX_PCT}% от high пробоя\n"
         f"• RSI 1ч ≤{BB_PULLBACK_RSI_MAX}, OI 24ч ≥+{BB_OI_24H_MIN}%\n"
         f"• Авто: TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%\n\n"
@@ -1294,7 +1311,7 @@ async def cmd_auto(msg: types.Message):
         f"<b>Команды:</b>\n"
         f"/auto_on — включить общий\n"
         f"/auto_off — выключить общий\n"
-        f"/sig_off TYPE — выключить тип (STANDARD/SURGE/PULLBACK)\n"
+        f"/sig_off TYPE — выключить тип (STANDARD/SURGE/PULLBACK/BB_SQUEEZE)\n"
         f"/sig_on TYPE — включить тип\n"
         f"/btc_filter — статус BTC-фильтра\n"
         f"/cooldown — список монет в кулдауне ({POST_TRADE_COOLDOWN_HOURS}ч)\n"
