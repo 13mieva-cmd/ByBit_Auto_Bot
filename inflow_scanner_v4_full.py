@@ -34,6 +34,7 @@ from config import (
     PULLBACK_EMA_DISTANCE_PCT, PULLBACK_OI_24H_MIN, PULLBACK_OI_1H_MIN,
     ENABLE_BB_SQUEEZE, BB_PERIOD, BB_MULT,
     BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
+    BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
     BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
     USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
     BTC_MIN_1H_CHANGE,
@@ -280,6 +281,17 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
     # RSI 15m — for BB pullback entry (not overbought on the signal TF)
     rsi_15m = calculate_rsi(closes_15m, 14) if len(closes_15m) >= 15 else None
 
+    # Volume spike 15m (breakout confirmation)
+    vol_spike_15m = 0.0
+    if klines_15m and len(klines_15m) >= 21:
+        try:
+            vols_15 = [float(k[5]) for k in klines_15m]
+            avg_v = sum(vols_15[-21:-1]) / 20
+            if avg_v > 0:
+                vol_spike_15m = vols_15[-1] / avg_v
+        except (ValueError, TypeError, IndexError):
+            vol_spike_15m = 0.0
+
     base_data = {
         "symbol": symbol,
         "price": current_price,
@@ -306,6 +318,7 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "bb_bandwidth": bb["bandwidth"] if bb else None,
         "bb_history_bw": bb_history_bw,
         "rsi_15m": rsi_15m,
+        "vol_spike_15m": vol_spike_15m,
     }
 
     # ========== Try STANDARD signal ==========
@@ -446,11 +459,12 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 
 def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     """
-    BB Squeeze on 15m → breakout above upper band → small pullback entry.
-    1) Squeeze (15m): bandwidth in lower BB_SQUEEZE_PERCENTILE of lookback OR < MAX_BW
-    2) Breakout (15m): recent close above upper band
-    3) Pullback: price retraced 0.15%..BB_PULLBACK_MAX_PCT from breakout high
-    4) Filters: above EMA50 (1h), OI 24h, RSI 15m not overbought
+    BB Squeeze on 15m (strict) → breakout upper → small pullback entry.
+    1) Fresh squeeze: bandwidth was in lower percentile / below MAX_BW within last FRESH_BARS
+    2) Breakout: recent 15m close above upper band
+    3) Volume: 15m vol spike >= BB_BREAKOUT_VOL_MIN on/near breakout
+    4) Pullback: 0.15%..BB_PULLBACK_MAX_PCT from breakout high
+    5) Filters: EMA50 1h, OI 24h, RSI 15m not overbought
     """
     if d.get("bb_upper") is None or d.get("bb_bandwidth") is None:
         return None
@@ -463,28 +477,44 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
 
     bw = d["bb_bandwidth"]
     hist = d.get("bb_history_bw") or []
-    is_squeeze = False
+    # hist[0] = current bar bandwidth, hist[1] = previous, ...
+
+    # Percentile threshold from full lookback
+    threshold = BB_SQUEEZE_MAX_BW
     if hist and len(hist) >= 10:
         sorted_bw = sorted(hist)
-        idx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
-        threshold = sorted_bw[idx]
-        if bw <= threshold:
-            is_squeeze = True
-    if bw <= BB_SQUEEZE_MAX_BW:
-        is_squeeze = True
-    if not is_squeeze:
+        pidx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
+        threshold = min(threshold, sorted_bw[pidx])
+
+    # Fresh squeeze: at least one of the last FRESH_BARS was in squeeze zone
+    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist)))
+    recent = hist[:fresh_n] if hist else [bw]
+    min_recent = min(recent)
+    is_fresh_squeeze = min_recent <= threshold or min_recent <= BB_SQUEEZE_MAX_BW
+    # Current or recent bar still not wildly expanded (avoid late entries)
+    if bw > BB_SQUEEZE_MAX_BW * 1.8:
+        return None
+    if not is_fresh_squeeze:
         return None
 
     # Breakout above upper on 15m (current or last 1-2 bars)
     broke = False
     breakout_high = d["price"]
+    breakout_bar = 0
     look = min(3, len(closes_15m))
     for i in range(1, look + 1):
         c = closes_15m[-i]
         if c > d["bb_upper"]:
             broke = True
-            breakout_high = max(breakout_high, c)
+            if c >= breakout_high:
+                breakout_high = c
+                breakout_bar = i
     if not broke:
+        return None
+
+    # Volume confirmation on 15m
+    vol15 = d.get("vol_spike_15m") or 0.0
+    if vol15 < BB_BREAKOUT_VOL_MIN:
         return None
 
     # Small pullback from breakout high
@@ -498,14 +528,14 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     if rsi_15 is not None and rsi_15 > BB_PULLBACK_RSI_MAX:
         return None
 
-    # Momentum still alive on 15m: price above close 2 bars ago
+    # Momentum still alive on 15m
     if len(closes_15m) < 3 or closes_15m[-1] <= closes_15m[-3]:
         return None
 
     stars = 1
-    if d["oi_change_24h"] >= BB_OI_24H_MIN * 1.8 and d["vol_spike_1h"] >= 1.3:
+    if d["oi_change_24h"] >= BB_OI_24H_MIN * 1.5 and vol15 >= BB_BREAKOUT_VOL_MIN * 1.3:
         stars = 2
-    if stars == 2 and d["btc_1h"] >= -0.3 and bw <= BB_SQUEEZE_MAX_BW * 0.7:
+    if stars == 2 and d["btc_1h"] >= -0.3 and min_recent <= BB_SQUEEZE_MAX_BW * 0.75:
         stars = 3
 
     return {
@@ -514,6 +544,7 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
         "signal_type": "BB_SQUEEZE",
         "bb_pullback_pct": round(pullback_pct, 2),
         "bb_bandwidth": round(bw, 2),
+        "vol_spike_15m": round(vol15, 2),
     }
 
 
@@ -640,7 +671,8 @@ def format_alert(s: dict) -> str:
     if s.get("signal_type") == "BB_SQUEEZE":
         bb_line = (
             f"📉 BB 15m: bw {s.get('bb_bandwidth', 0):.2f}% | "
-            f"откат {s.get('bb_pullback_pct', 0):.2f}%\n"
+            f"откат {s.get('bb_pullback_pct', 0):.2f}% | "
+            f"vol×{s.get('vol_spike_15m', 0):.1f}\n"
         )
 
     return (
@@ -967,7 +999,7 @@ async def cmd_settings(msg: types.Message):
         f"• 2 зелёные свечи подряд на 1h\n"
         f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
         f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
-        f"• Сужение полос 15m (bw ≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
+        f"• Свежее сужение 15m (bw ≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
         f"• Пробой верхней границы BB (15m)\n"
         f"• Вход на откате 0.15…{BB_PULLBACK_MAX_PCT}% от high пробоя\n"
         f"• RSI 1ч ≤{BB_PULLBACK_RSI_MAX}, OI 24ч ≥+{BB_OI_24H_MIN}%\n"

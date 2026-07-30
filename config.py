@@ -45,18 +45,22 @@ PULLBACK_EMA_DISTANCE_PCT = float(os.getenv("PULLBACK_EMA_DISTANCE_PCT", "2.0"))
 PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "8.0"))
 PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "-1.0"))
 
-# ---------- BB SQUEEZE signal (15m timeframe) ----------
+# ---------- BB SQUEEZE signal (15m, strict preset) ----------
 ENABLE_BB_SQUEEZE = os.getenv("ENABLE_BB_SQUEEZE", "true").lower() == "true"
 BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))          # BB period on 15m
 BB_MULT = float(os.getenv("BB_MULT", "2.0"))
 # Squeeze on 15m: bandwidth in lower percentile of lookback OR below absolute max
 BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 48×15m ≈ 12h
-BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "20"))  # bottom 20%
-BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "4.0"))  # % hard cap (15m often wider)
+BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "15"))  # bottom 15%
+BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "3.2"))  # % hard cap — stricter
+# Squeeze must have been present in the last N bars (fresh, not stale)
+BB_SQUEEZE_FRESH_BARS = int(os.getenv("BB_SQUEEZE_FRESH_BARS", "6"))  # 6×15m ≈ 1.5h
+# Breakout volume: current 15m vol vs avg of prior 20 bars
+BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.3"))
 # After squeeze: close above upper band on 15m, then small pullback entry
-BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.5"))
-BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "65"))  # RSI 15m
-BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "5.0"))
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.2"))
+BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "60"))  # RSI 15m
+BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "6.0"))
 
 # ---------- EMA filter ----------
 USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"
@@ -126,8 +130,8 @@ AUTO_PULLBACK_TP_PCT = float(os.getenv("AUTO_PULLBACK_TP_PCT", "1.8"))
 AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 
 # BB Squeeze auto trade
-AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.2"))
-AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.4"))
+AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.0"))
+AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.2"))
 
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
@@ -151,8 +155,8 @@ AUTO_TP1_TRIGGER_PCT = float(os.getenv("AUTO_TP1_TRIGGER_PCT", "1.5"))
 AUTO_TRAIL_DISTANCE_PCT = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT", "1.0"))
 AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))
 AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
-AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.1"))
-AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.7"))
+AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.0"))
+AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.6"))
 
 # BTC trend filter for auto-entry
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
