@@ -22,6 +22,8 @@ class BybitTrader:
         self.recv_window = recv_window
         self._instruments_cache: dict = {}
         self._cache_time: float = 0
+        # 0 = one-way (positionIdx=0), 3 = hedge (Buy=1, Sell=2). None = unknown
+        self._position_mode: int | None = None
 
     def _sign(self, timestamp: str, payload: str) -> str:
         param = f"{timestamp}{self.api_key}{self.recv_window}{payload}"
@@ -225,6 +227,39 @@ class BybitTrader:
         log.warning(f"set-leverage {symbol} {leverage}x: {resp.get('retMsg')}")
         return False
 
+
+    async def ensure_position_mode(self) -> int:
+        """Гарантируем one-way (mode=0). Если аккаунт в hedge — пробуем переключить.
+        Возвращает mode: 0=one-way, 3=hedge.
+        Ошибка 10001 'position idx not match' бывает когда шлём idx=0 в hedge mode.
+        """
+        if self._position_mode is not None:
+            return self._position_mode
+
+        # Пытаемся включить one-way для USDT linear
+        resp = await self._signed_request(
+            "POST",
+            "/v5/position/switch-mode",
+            {"category": "linear", "coin": "USDT", "mode": 0},
+        )
+        if isinstance(resp, dict) and resp.get("retCode") in (0, 110025):
+            # 0 = ok, 110025 = already in this mode
+            self._position_mode = 0
+            log.info("Position mode: one-way (0)")
+            return 0
+
+        # Не удалось переключить (открытые позиции в hedge и т.п.) — работаем в hedge
+        msg = resp.get("retMsg", "") if isinstance(resp, dict) else str(resp)
+        log.warning(f"switch-mode to one-way failed: {msg}; using hedge positionIdx")
+        self._position_mode = 3
+        return 3
+
+    def position_idx_for(self, side: str = "Buy") -> int:
+        """positionIdx под текущий mode. side: Buy|Sell."""
+        if self._position_mode == 3:
+            return 1 if side == "Buy" else 2
+        return 0
+
     @staticmethod
     def _round_qty_down(qty: float, step: float) -> float:
         if step <= 0:
@@ -305,6 +340,8 @@ class BybitTrader:
         lev = leverage if leverage else 10.0
         lev = min(float(lev), float(info["max_leverage"]))
         await self.set_leverage(symbol, lev)
+        await self.ensure_position_mode()
+        pos_idx = self.position_idx_for("Buy")
 
         order_params = {
             "category": "linear",
@@ -319,7 +356,7 @@ class BybitTrader:
             "slOrderType": "Market",
             "tpTriggerBy": "LastPrice",
             "slTriggerBy": "LastPrice",
-            "positionIdx": 0,
+            "positionIdx": pos_idx,
         }
 
         resp = await self._signed_request("POST", "/v5/order/create", order_params)
@@ -363,6 +400,7 @@ class BybitTrader:
         tp_price = self._round_price(entry * (1 + tp_pct / 100), info["tick_size"])
         sl_price = self._round_price(entry * (1 - sl_pct / 100), info["tick_size"])
 
+        await self.ensure_position_mode()
         params = {
             "category": "linear",
             "symbol": symbol,
@@ -371,7 +409,7 @@ class BybitTrader:
             "tpslMode": "Full",
             "tpTriggerBy": "LastPrice",
             "slTriggerBy": "LastPrice",
-            "positionIdx": 0,
+            "positionIdx": self.position_idx_for("Buy"),
         }
 
         resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
@@ -426,6 +464,8 @@ class BybitTrader:
             return {"ok": False, "error": "no instrument info"}
 
         qty_str = self._fmt(pos["size"], info["qty_step"])
+        await self.ensure_position_mode()
+        # Закрытие лонга = Sell; в hedge idx лонга = 1
         params = {
             "category": "linear",
             "symbol": symbol,
@@ -433,7 +473,7 @@ class BybitTrader:
             "orderType": "Market",
             "qty": qty_str,
             "reduceOnly": True,
-            "positionIdx": 0,
+            "positionIdx": self.position_idx_for("Buy"),
         }
 
         resp = await self._signed_request("POST", "/v5/order/create", params)
@@ -472,12 +512,13 @@ class BybitTrader:
         trail_dist = mark * (trail_pct / 100.0)
         trail_str = self._fmt(self._round_price(trail_dist, info["tick_size"]), info["tick_size"])
 
+        await self.ensure_position_mode()
         params = {
             "category": "linear",
             "symbol": symbol,
             "trailingStop": trail_str,
             "tpslMode": "Full",
-            "positionIdx": 0,
+            "positionIdx": self.position_idx_for("Buy"),
         }
         # Снять фиксированный TP, чтобы трейлинг вёл сам
         params["takeProfit"] = "0"

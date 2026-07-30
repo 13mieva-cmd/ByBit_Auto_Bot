@@ -45,17 +45,17 @@ PULLBACK_EMA_DISTANCE_PCT = float(os.getenv("PULLBACK_EMA_DISTANCE_PCT", "2.0"))
 PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "8.0"))
 PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "-1.0"))
 
-# ---------- BB SQUEEZE signal ----------
+# ---------- BB SQUEEZE signal (15m timeframe) ----------
 ENABLE_BB_SQUEEZE = os.getenv("ENABLE_BB_SQUEEZE", "true").lower() == "true"
-BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))          # BB period on 15m
 BB_MULT = float(os.getenv("BB_MULT", "2.0"))
-# Squeeze: bandwidth in lower percentile of lookback OR below absolute max
-BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 1h bars
+# Squeeze on 15m: bandwidth in lower percentile of lookback OR below absolute max
+BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 48×15m ≈ 12h
 BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "20"))  # bottom 20%
-BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "3.5"))  # % hard cap
-# After squeeze: close above upper band, then small pullback entry
-BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.8"))
-BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "62"))
+BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "4.0"))  # % hard cap (15m often wider)
+# After squeeze: close above upper band on 15m, then small pullback entry
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.5"))
+BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "65"))  # RSI 15m
 BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "5.0"))
 
 # ---------- EMA filter ----------
