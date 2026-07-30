@@ -59,6 +59,7 @@ from storage import PositionStore, IgnoreStore, StatsStore, AutoStateStore
 from trader import BybitTrader
 from auto_trade import AutoTrader, check_btc_health
 from indicators import calculate_rsi, calculate_ema, calculate_bollinger
+from backtest import backtest_symbol, top_symbols, format_result, format_summary
 from visuals import progress_bar, sparkline, position_progress
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -952,7 +953,9 @@ async def cmd_start(msg: types.Message):
         "⚠️ OI watchdog: при падении OI бот алертит — выходи руками\n"
         "💚 Smart hold: при растущем OI бот скажет «держи»\n\n"
         "<b>Команды:</b>\n"
-        "/scan /settings /positions /stats\n"
+        "/scan — ручной скан\n"
+        "/backtest — бэктест BB_SQUEEZE\n"
+        "/settings /positions /stats\n"
         "/top_oi /active /ignored /unignore SYM\n"
         "/add SYM PRICE /remove SYM\n\n"
         "<b>🤖 Авто-торговля:</b>\n"
@@ -1017,6 +1020,76 @@ async def cmd_settings(msg: types.Message):
         f"• Тайм-стоп: {POSITION_TIMEOUT_HOURS}ч\n\n"
         f"<b>Авто-торговля:</b> /auto"
     )
+
+
+@dp.message(Command("backtest"))
+async def cmd_backtest(msg: types.Message):
+    """Usage: /backtest [SYMBOL|TOP] [days]
+    Examples: /backtest PRL 14   |   /backtest TOP 7   |   /backtest ARB
+    """
+    parts = (msg.text or "").split()
+    days = 14
+    mode = "symbol"
+    symbol = None
+    top_n = 10
+
+    if len(parts) >= 2:
+        arg = parts[1].upper()
+        if arg in ("TOP", "TOP10", "ALL"):
+            mode = "top"
+            if arg.startswith("TOP") and arg[3:].isdigit():
+                top_n = int(arg[3:])
+            elif len(parts) >= 3 and parts[2].isdigit():
+                # /backtest TOP 15 — ambiguous; if parts[2] is days for TOP default
+                pass
+        else:
+            symbol = arg if arg.endswith("USDT") else arg + "USDT"
+
+    # days: last numeric token
+    for p_ in parts[1:]:
+        if p_.isdigit():
+            days = max(3, min(int(p_), 60))
+            break
+    if len(parts) >= 3 and parts[1].upper() in ("TOP", "ALL") and parts[2].isdigit():
+        # /backtest TOP 15 → 15 coins if no other number; treat as top_n if <=30 and days default
+        n = int(parts[2])
+        if n <= 30:
+            top_n = n
+            days = 14
+    if len(parts) >= 4 and parts[1].upper() == "TOP" and parts[2].isdigit() and parts[3].isdigit():
+        top_n = int(parts[2])
+        days = max(3, min(int(parts[3]), 60))
+
+    await msg.answer(
+        f"⏳ Backtest BB_SQUEEZE "
+        f"{'TOP' + str(top_n) if mode == 'top' else symbol} "
+        f"за {days}д… это может занять 1–3 мин."
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            if mode == "top":
+                syms = await top_symbols(session, top_n)
+                if not syms:
+                    await msg.answer("Не удалось получить список монет.")
+                    return
+                results = []
+                for s in syms:
+                    results.append(await backtest_symbol(session, s, days, use_oi=True))
+                await msg.answer(format_summary(results))
+            else:
+                if not symbol:
+                    await msg.answer(
+                        "Использование:\n"
+                        "<code>/backtest PRL 14</code> — одна монета\n"
+                        "<code>/backtest TOP 10 14</code> — топ монет\n"
+                        "<code>/backtest TOP</code> — топ-10 за 14д"
+                    )
+                    return
+                r = await backtest_symbol(session, symbol, days, use_oi=True)
+                await msg.answer(format_result(r))
+    except Exception as e:
+        log.exception("backtest")
+        await msg.answer(f"❌ Backtest error: <code>{e}</code>")
 
 
 @dp.message(Command("top_oi"))
