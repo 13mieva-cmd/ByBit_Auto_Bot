@@ -27,6 +27,7 @@ from config import (
     BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
     BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
     BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
+    BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
     USE_EMA_FILTER, EMA_PERIOD,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
     POSITION_SIZE_USD, MIN_VOLUME_USD_24H, BLACKLIST,
@@ -199,6 +200,38 @@ async def _fetch_oi_1h(
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
+
+def _oi_change_hours_at(oi_series: list[tuple[int, float]], ts_ms: int, hours: int) -> Optional[float]:
+    """OI change vs ~hours earlier at or before ts_ms."""
+    if len(oi_series) < 2:
+        return None
+    cur = None
+    for i in range(len(oi_series) - 1, -1, -1):
+        if oi_series[i][0] <= ts_ms:
+            cur = i
+            break
+    if cur is None:
+        return None
+    target = ts_ms - hours * 3600 * 1000
+    prev = None
+    for i in range(cur, -1, -1):
+        if oi_series[i][0] <= target:
+            prev = i
+            break
+    if prev is None:
+        # approximate by bar count (1h series)
+        step = max(1, hours)
+        if cur >= step:
+            prev = cur - step
+        else:
+            return None
+    oi_now = oi_series[cur][1]
+    oi_old = oi_series[prev][1]
+    if oi_old <= 0:
+        return None
+    return (oi_now - oi_old) / oi_old * 100
+
+
 def _oi_change_24h_at(oi_series: list[tuple[int, float]], ts_ms: int) -> Optional[float]:
     """Approx OI change vs ~24h earlier at or before ts_ms."""
     if len(oi_series) < 2:
@@ -280,11 +313,15 @@ def _signal_at(
     else:
         ema50 = None
 
-    # OI filter
+    # OI filter: 24h + 4h (устойчивый приток)
     oi_chg = None
+    oi_4h = None
     if use_oi and oi_series:
-        oi_chg = _oi_change_24h_at(oi_series, ts_15[i])
+        oi_chg = _oi_change_hours_at(oi_series, ts_15[i], 24)
+        oi_4h = _oi_change_hours_at(oi_series, ts_15[i], 4)
         if oi_chg is None or oi_chg < BB_OI_24H_MIN:
+            return None
+        if oi_4h is None or oi_4h < BB_OI_4H_MIN:
             return None
     elif use_oi:
         return None  # requested OI but no data
@@ -340,8 +377,19 @@ def _signal_at(
     if vol_spike < BB_BREAKOUT_VOL_MIN:
         return None
 
+    # Anti-parabolic spike over last ~30m
+    if len(window) >= 3:
+        local_low = min(window[-3], window[-2], window[-1])
+        if local_low > 0:
+            spike_pct = (window[-1] - local_low) / local_low * 100
+            if spike_pct > BB_PARABOLIC_MAX_PCT:
+                return None
+
     pullback_pct = (breakout_high - price) / breakout_high * 100 if breakout_high > 0 else 0
     if pullback_pct < 0.15 or pullback_pct > BB_PULLBACK_MAX_PCT:
+        return None
+
+    if BB_REQUIRE_ABOVE_MID and price < bb["middle"]:
         return None
 
     rsi_15 = calculate_rsi(window, 14)

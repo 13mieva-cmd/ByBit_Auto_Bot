@@ -61,6 +61,12 @@ BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.3"))
 BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.2"))
 BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "60"))  # RSI 15m
 BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "6.0"))
+# Доп. подтверждение притока (не только 24h-всплеск / short cover)
+BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "2.5"))
+# Анти-параболика: макс. рост цены за последние 2×15m от локального low
+BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "4.5"))
+# Откат должен удерживаться выше mid BB (поддержка после пробоя)
+BB_REQUIRE_ABOVE_MID = os.getenv("BB_REQUIRE_ABOVE_MID", "true").lower() == "true"
 
 # ---------- EMA filter ----------
 USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"

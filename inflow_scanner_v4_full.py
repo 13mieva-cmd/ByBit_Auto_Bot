@@ -36,6 +36,7 @@ from config import (
     BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
     BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
     BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
+    BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
     USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
     BTC_MIN_1H_CHANGE,
     TP1_PCT, TP2_PCT, HARD_SL_PCT, OI_DROP_WARNING_PCT,
@@ -460,12 +461,13 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 
 def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     """
-    BB Squeeze on 15m (strict) → breakout upper → small pullback entry.
-    1) Fresh squeeze (OR): relative percentile of this coin OR absolute MAX_BW, within FRESH_BARS
-    2) Breakout: recent 15m close above upper band
-    3) Volume: 15m vol spike >= BB_BREAKOUT_VOL_MIN on/near breakout
-    4) Pullback: 0.15%..BB_PULLBACK_MAX_PCT from breakout high
-    5) Filters: EMA50 1h, OI 24h, RSI 15m not overbought
+    BB Squeeze on 15m → breakout upper → small pullback entry.
+    1) Fresh squeeze (OR): relative percentile OR absolute MAX_BW, within FRESH_BARS
+    2) Breakout upper 15m + volume
+    3) Pullback 0.15..MAX%, price holds above mid BB
+    4) OI 24h + OI 4h (устойчивый приток, меньше short-cover вспышек)
+    5) Anti-parabolic: не входить после вертикального шипа 15–30m
+    6) EMA50 1h, RSI 15m
     """
     if d.get("bb_upper") is None or d.get("bb_bandwidth") is None:
         return None
@@ -473,23 +475,21 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
         return None
     if USE_EMA_FILTER and d["ema50_1h"] is not None and d["price"] < d["ema50_1h"]:
         return None
+
+    # Устойчивый приток: 24h и 4h (не только краткий squeeze шортов)
     if d["oi_change_24h"] < BB_OI_24H_MIN:
+        return None
+    if d.get("oi_change_4h", 0) < BB_OI_4H_MIN:
         return None
 
     bw = d["bb_bandwidth"]
     hist = d.get("bb_history_bw") or []
     # hist[0] = current bar bandwidth, hist[1] = previous, ...
 
-    # Свежий минимум bandwidth за последние FRESH_BARS
     fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
     recent = hist[:fresh_n] if hist else [bw]
     min_recent = min(recent)
 
-    # Настоящее ИЛИ (не min-порог):
-    # 1) относительно истории ЭТОЙ монеты: min_recent в нижних PERCENTILE%
-    # 2) абсолютный cap: min_recent <= MAX_BW
-    # Раньше threshold=min(MAX, pct) + OR MAX делал перцентиль мёртвым;
-    # потом min-only лишал относительную ветку для монет с широкими полосами.
     percentile_ok = False
     if hist and len(hist) >= 10:
         sorted_bw = sorted(hist)
@@ -499,15 +499,12 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     if not (percentile_ok or cap_ok):
         return None
 
-    # Не входим, если полосы уже сильно расширились после squeeze
-    # (относительно свежего минимума — работает и для «широких» монет)
     if min_recent > 0 and bw > min_recent * 1.8 and bw > BB_SQUEEZE_MAX_BW * 1.5:
         return None
 
     # Breakout above upper on 15m (current or last 1-2 bars)
     broke = False
     breakout_high = d["price"]
-    breakout_bar = 0
     look = min(3, len(closes_15m))
     for i in range(1, look + 1):
         c = closes_15m[-i]
@@ -515,7 +512,6 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
             broke = True
             if c >= breakout_high:
                 breakout_high = c
-                breakout_bar = i
     if not broke:
         return None
 
@@ -524,11 +520,24 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     if vol15 < BB_BREAKOUT_VOL_MIN:
         return None
 
+    # Anti-parabolic: резкий шип за 2×15m без «нормального» отката — чаще short cover
+    if len(closes_15m) >= 3:
+        local_low = min(closes_15m[-3], closes_15m[-2], closes_15m[-1])
+        if local_low > 0:
+            spike_pct = (closes_15m[-1] - local_low) / local_low * 100
+            if spike_pct > BB_PARABOLIC_MAX_PCT:
+                return None
+
     # Small pullback from breakout high
     pullback_pct = (breakout_high - d["price"]) / breakout_high * 100 if breakout_high > 0 else 0
     if pullback_pct < 0.15:
         return None
     if pullback_pct > BB_PULLBACK_MAX_PCT:
+        return None
+
+    # Удержание mid BB как поддержки после пробоя (откат «в полосу», не под mid)
+    mid = d.get("bb_middle")
+    if BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
         return None
 
     rsi_15 = d.get("rsi_15m")
@@ -542,8 +551,18 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     stars = 1
     if d["oi_change_24h"] >= BB_OI_24H_MIN * 1.5 and vol15 >= BB_BREAKOUT_VOL_MIN * 1.3:
         stars = 2
-    if stars == 2 and d["btc_1h"] >= -0.3 and min_recent <= BB_SQUEEZE_MAX_BW * 0.75:
+    if (
+        stars == 2
+        and d.get("oi_change_4h", 0) >= BB_OI_4H_MIN * 1.6
+        and d["btc_1h"] >= -0.3
+        and min_recent <= BB_SQUEEZE_MAX_BW * 0.75
+    ):
         stars = 3
+    # Бонус качества: откат близко к mid (не висит у upper)
+    if stars >= 2 and mid and d["price"] <= mid * 1.008:
+        stars = min(3, stars + 0)  # already capped; keep structure clear
+        if stars == 2:
+            stars = 3
 
     return {
         **d,
@@ -1011,8 +1030,9 @@ async def cmd_settings(msg: types.Message):
         f"• Свежее сужение 15m за {BB_SQUEEZE_FRESH_BARS} баров:\n"
         f"  bw ≤{BB_SQUEEZE_MAX_BW}% <b>или</b> нижние {BB_SQUEEZE_PERCENTILE:.0f}% истории монеты\n"
         f"• Пробой upper 15m + объём ×{BB_BREAKOUT_VOL_MIN}\n"
-        f"• Вход на откате 0.15…{BB_PULLBACK_MAX_PCT}% от high пробоя\n"
-        f"• RSI 15м ≤{BB_PULLBACK_RSI_MAX}, OI 24ч ≥+{BB_OI_24H_MIN}%\n"
+        f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}% и цена ≥ mid BB\n"
+        f"• OI 24ч ≥+{BB_OI_24H_MIN}% и OI 4ч ≥+{BB_OI_4H_MIN}%\n"
+        f"• Анти-шип ≤{BB_PARABOLIC_MAX_PCT}% за 30м; RSI 15м ≤{BB_PULLBACK_RSI_MAX}\n"
         f"• Авто: TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%\n\n"
         f"<b>Ручная сделка (трекер):</b>\n"
         f"• TP1: +{TP1_PCT}% / TP2: +{TP2_PCT}%\n"
