@@ -23,16 +23,16 @@ import aiohttp
 
 from config import (
     BYBIT_BASE_URL,
-    BB_PERIOD, BB_MULT,
-    BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
-    BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
-    BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
+    BB_PERIOD, BB_MULT, BB_TIMEFRAME,
+    KC_ATR_PERIOD, KC_MULT,
+    BB_SQUEEZE_FRESH_BARS, BB_BW_EXPANSION_MIN, BB_BREAKOUT_VOL_MIN,
+    BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
     BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
     USE_EMA_FILTER, EMA_PERIOD,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
     POSITION_SIZE_USD, MIN_VOLUME_USD_24H, BLACKLIST,
 )
-from indicators import calculate_rsi, calculate_ema, calculate_bollinger
+from indicators import calculate_rsi, calculate_ema, calculate_bollinger, calculate_keltner
 
 log = logging.getLogger("backtest")
 
@@ -289,21 +289,27 @@ def _simulate_exit(
 def _signal_at(
     i: int,
     closes_15: list[float],
+    highs_15: list[float],
+    lows_15: list[float],
     vols_15: list[float],
     closes_1h: list[float],
     ts_15: list[int],
     oi_series: Optional[list[tuple[int, float]]],
     use_oi: bool,
 ) -> Optional[dict]:
-    """Evaluate BB_SQUEEZE at bar i using only data available up to i (no look-ahead)."""
-    need = BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5
+    """Evaluate BB_SQUEEZE at bar i using only data available up to i (no look-ahead).
+    Mirrors scanner.py's _bb_squeeze_eval() exactly — same gates, same order."""
+    min_len = max(BB_PERIOD, KC_ATR_PERIOD) + 1
+    need = min_len + BB_SQUEEZE_FRESH_BARS + 5
     if i < need or i < 3:
         return None
 
     window = closes_15[: i + 1]
+    highs_w = highs_15[: i + 1]
+    lows_w = lows_15[: i + 1]
     price = window[-1]
 
-    # EMA50 on 1h — map 15m ts to latest 1h close
+    # EMA50 on 1h — map 15m ts to latest FULLY CLOSED 1h close
     if USE_EMA_FILTER:
         if len(closes_1h) < EMA_PERIOD:
             return None
@@ -313,48 +319,46 @@ def _signal_at(
     else:
         ema50 = None
 
-    # OI filter: 24h + 4h (устойчивый приток)
+    # OI filter: 24h ИЛИ 4h (раньше требовалось оба одновременно)
     oi_chg = None
     oi_4h = None
     if use_oi and oi_series:
         oi_chg = _oi_change_hours_at(oi_series, ts_15[i], 24)
         oi_4h = _oi_change_hours_at(oi_series, ts_15[i], 4)
-        if oi_chg is None or oi_chg < BB_OI_24H_MIN:
-            return None
-        if oi_4h is None or oi_4h < BB_OI_4H_MIN:
+        oi24_ok = oi_chg is not None and oi_chg >= BB_OI_24H_MIN
+        oi4_ok = oi_4h is not None and oi_4h >= BB_OI_4H_MIN
+        if not (oi24_ok or oi4_ok):
             return None
     elif use_oi:
         return None  # requested OI but no data
 
     bb = calculate_bollinger(window, BB_PERIOD, BB_MULT)
-    if not bb:
+    kc = calculate_keltner(highs_w, lows_w, window, KC_ATR_PERIOD, KC_MULT)
+    if not bb or not kc:
         return None
 
-    # bandwidth history (newest first, same as live bot)
-    hist = []
-    for k in range(BB_SQUEEZE_LOOKBACK):
+    # Squeeze/bandwidth history (newest first, same construction as the live bot)
+    squeeze_hist, bw_hist = [], []
+    n_needed = BB_SQUEEZE_FRESH_BARS + 3
+    for k in range(n_needed):
         end = len(window) - k
-        if end < BB_PERIOD:
+        if end < min_len:
             break
-        b = calculate_bollinger(window[:end], BB_PERIOD, BB_MULT)
-        if b:
-            hist.append(b["bandwidth"])
+        bb_k = calculate_bollinger(window[:end], BB_PERIOD, BB_MULT)
+        kc_k = calculate_keltner(highs_w[:end], lows_w[:end], window[:end], KC_ATR_PERIOD, KC_MULT)
+        if not bb_k or not kc_k:
+            break
+        squeeze_hist.append(bb_k["upper"] < kc_k["upper"] and bb_k["lower"] > kc_k["lower"])
+        bw_hist.append(bb_k["bandwidth"])
 
     bw = bb["bandwidth"]
-    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
-    recent = hist[:fresh_n] if hist else [bw]
-    min_recent = min(recent)
-
-    percentile_ok = False
-    if hist and len(hist) >= 10:
-        sorted_bw = sorted(hist)
-        pidx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
-        percentile_ok = min_recent <= sorted_bw[pidx]
-    cap_ok = min_recent <= BB_SQUEEZE_MAX_BW
-    if not (percentile_ok or cap_ok):
+    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(squeeze_hist) if squeeze_hist else 1))
+    if not (any(squeeze_hist[:fresh_n]) if squeeze_hist else False):
         return None
 
-    if min_recent > 0 and bw > min_recent * 1.8 and bw > BB_SQUEEZE_MAX_BW * 1.5:
+    bw_ref = min(bw_hist[:fresh_n]) if bw_hist else bw
+    expansion = (bw / bw_ref) if bw_ref and bw_ref > 0 else 1.0
+    if expansion < BB_BW_EXPANSION_MIN:
         return None
 
     # breakout
@@ -369,7 +373,7 @@ def _signal_at(
     if not broke:
         return None
 
-    # volume spike 15m
+    # volume spike
     if i < 20:
         return None
     avg_v = sum(vols_15[i - 20 : i]) / 20
@@ -377,7 +381,7 @@ def _signal_at(
     if vol_spike < BB_BREAKOUT_VOL_MIN:
         return None
 
-    # Anti-parabolic spike over last ~30m
+    # Anti-parabolic spike over the last few bars
     if len(window) >= 3:
         local_low = min(window[-3], window[-2], window[-1])
         if local_low > 0:
@@ -385,9 +389,9 @@ def _signal_at(
             if spike_pct > BB_PARABOLIC_MAX_PCT:
                 return None
 
+    # Pullback % is informational only — not gated (removed: on a fast TF with
+    # discrete bars, a narrow retracement window is essentially never hit)
     pullback_pct = (breakout_high - price) / breakout_high * 100 if breakout_high > 0 else 0
-    if pullback_pct < 0.15 or pullback_pct > BB_PULLBACK_MAX_PCT:
-        return None
 
     if BB_REQUIRE_ABOVE_MID and price < bb["middle"]:
         return None
@@ -402,9 +406,11 @@ def _signal_at(
     return {
         "price": price,
         "bw": bw,
+        "expansion": expansion,
         "pullback": pullback_pct,
         "vol_spike": vol_spike,
         "oi_chg": oi_chg,
+        "oi_4h": oi_4h,
         "ema50": ema50,
     }
 
@@ -417,15 +423,22 @@ async def backtest_symbol(
 ) -> BacktestResult:
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - days * 86400 * 1000
-    # warm-up for indicators
-    warm_ms = start_ms - (BB_PERIOD + BB_SQUEEZE_LOOKBACK + 50) * 15 * 60 * 1000
+    # Warm-up must cover BOTH: the BB/Keltner squeeze window, AND the 1h EMA50
+    # filter (EMA_PERIOD hours of 1h candles). The Keltner-based squeeze needs
+    # far less history than the old percentile approach (no more 48-bar
+    # lookback) — just enough bars for BB/ATR + the freshness window.
+    min_len = max(BB_PERIOD, KC_ATR_PERIOD) + 1
+    bb_timeframe_min = int(BB_TIMEFRAME) if BB_TIMEFRAME.isdigit() else 15
+    warm_15m_ms = (min_len + BB_SQUEEZE_FRESH_BARS + 50) * bb_timeframe_min * 60 * 1000
+    warm_1h_ms = (EMA_PERIOD + 10) * 3600 * 1000  # +10h buffer
+    warm_ms = start_ms - max(warm_15m_ms, warm_1h_ms)
 
-    kl_15 = await _fetch_klines(session, symbol, "15", warm_ms, end_ms)
+    kl_15 = await _fetch_klines(session, symbol, BB_TIMEFRAME, warm_ms, end_ms)
     kl_1h = await _fetch_klines(session, symbol, "60", warm_ms, end_ms)
 
     result = BacktestResult(symbol=symbol, days=days, bars=len(kl_15), use_oi=use_oi)
-    if len(kl_15) < BB_PERIOD + BB_SQUEEZE_LOOKBACK + 10:
-        log.warning(f"{symbol}: not enough 15m bars ({len(kl_15)})")
+    if len(kl_15) < min_len + BB_SQUEEZE_FRESH_BARS + 10:
+        log.warning(f"{symbol}: not enough {BB_TIMEFRAME}m bars ({len(kl_15)})")
         return result
 
     ts_15 = [int(k[0]) for k in kl_15]
@@ -443,11 +456,19 @@ async def backtest_symbol(
         if len(oi_series) < 10:
             log.warning(f"{symbol}: OI history thin ({len(oi_series)}), OI filter may block all")
 
-    # Prebuild 1h close series available at each 15m bar (no look-ahead)
+    # Prebuild 1h close series available at each 15m bar (no look-ahead).
+    # A 1h candle's timestamp marks its OPEN, not its close — so a candle that
+    # merely *started* before ts may still be live (its close in the fetched
+    # history is the value it settles at up to an hour later, i.e. from the
+    # future relative to ts). Only candles that have FULLY closed by ts
+    # (open_ts + 1h <= ts) are safe to use; this mirrors what the live bot
+    # actually sees on completed 1h candles.
+    ONE_HOUR_MS = 3_600_000
+
     def closes_1h_at(ts: int) -> list[float]:
         out = []
         for t, c in zip(ts_1h, closes_1h_all):
-            if t <= ts:
+            if t + ONE_HOUR_MS <= ts:
                 out.append(c)
             else:
                 break
@@ -458,14 +479,14 @@ async def backtest_symbol(
     while start_i < len(ts_15) and ts_15[start_i] < start_ms:
         start_i += 1
 
-    i = max(start_i, BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5)
+    i = max(start_i, min_len + BB_SQUEEZE_FRESH_BARS + 5)
     while i < len(closes) - 2:
         if i <= cooldown_until:
             i += 1
             continue
 
         c1h = closes_1h_at(ts_15[i])
-        sig = _signal_at(i, closes, vols, c1h, ts_15, oi_series, use_oi)
+        sig = _signal_at(i, closes, highs, lows, vols, c1h, ts_15, oi_series, use_oi)
         if not sig:
             i += 1
             continue

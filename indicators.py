@@ -51,6 +51,47 @@ def calculate_bollinger(
     }
 
 
+def calculate_atr(
+    highs: list[float], lows: list[float], closes: list[float], period: int = 20
+) -> Optional[float]:
+    """Average True Range (Wilder smoothing)."""
+    if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def calculate_keltner(
+    highs: list[float], lows: list[float], closes: list[float],
+    period: int = 20, mult: float = 1.5
+) -> Optional[dict]:
+    """Keltner Channel: EMA(period) basis ± mult × ATR(period)."""
+    if len(closes) < period:
+        return None
+    basis = calculate_ema(closes, period)
+    atr = calculate_atr(highs, lows, closes, period)
+    if basis is None or atr is None:
+        return None
+    return {
+        "upper": basis + mult * atr,
+        "mid": basis,
+        "lower": basis - mult * atr,
+        "atr": atr,
+    }
+
+
 def sparkline(values: list[float], width: int = 10) -> str:
     """ASCII sparkline of N most recent values."""
     if not values or len(values) < 2:

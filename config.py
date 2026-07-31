@@ -47,25 +47,37 @@ PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "-1.0"))
 
 # ---------- BB SQUEEZE signal (15m, strict preset) ----------
 ENABLE_BB_SQUEEZE = os.getenv("ENABLE_BB_SQUEEZE", "true").lower() == "true"
+# Log the exact reason each coin got rejected (INFO level) — turn on when tuning
+BB_DEBUG_LOG = os.getenv("BB_DEBUG_LOG", "false").lower() == "true"
 BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))          # BB period on 15m
 BB_MULT = float(os.getenv("BB_MULT", "2.0"))
-# Squeeze on 15m: bandwidth in lower percentile of lookback OR below absolute max
-BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 48×15m ≈ 12h
-BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "15"))  # bottom 15%
-BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "3.2"))  # % hard cap — stricter
-# Squeeze must have been present in the last N bars (fresh, not stale)
+# Timeframe for the squeeze itself (Bybit interval string: "15", "60", "240"...)
+BB_TIMEFRAME = os.getenv("BB_TIMEFRAME", "15")
+# Squeeze = Bollinger Bands fully inside Keltner Channel (John Carter / TTM Squeeze
+# definition — self-adaptive to each coin's own volatility, no hand-tuned % thresholds)
+KC_ATR_PERIOD = int(os.getenv("KC_ATR_PERIOD", "20"))
+KC_MULT = float(os.getenv("KC_MULT", "1.5"))
+# Squeeze must have been ON at some point in the last N bars (fresh, not stale)
 BB_SQUEEZE_FRESH_BARS = int(os.getenv("BB_SQUEEZE_FRESH_BARS", "6"))  # 6×15m ≈ 1.5h
-# Breakout volume: current 15m vol vs avg of prior 20 bars
+# Confirm the breakout is a real expansion, not a one-bar poke: current bandwidth
+# must be at least this many times the tightest bandwidth seen during the fresh
+# squeeze window ("полосы резко расходятся")
+BB_BW_EXPANSION_MIN = float(os.getenv("BB_BW_EXPANSION_MIN", "1.15"))
+# Breakout volume: current bar vol vs avg of prior 20 bars
 BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.3"))
-# After squeeze: close above upper band on 15m, then small pullback entry
-BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.2"))
-BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "60"))  # RSI 15m
+# No pullback-window gate anymore (removed — it was the main reason zero signals
+# ever fired: a 0.15–1.2% retracement window is almost never caught by a 10-min
+# scan on 15m bars). Pullback % is still computed and shown in the alert, just
+# not used to accept/reject the signal.
+BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "60"))  # RSI on BB_TIMEFRAME
 BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "6.0"))
-# Доп. подтверждение притока (не только 24h-всплеск / short cover)
+# Устойчивый приток: раньше требовалось 24h И 4h одновременно (слишком редко
+# совпадает) — теперь любого из двух окон достаточно
 BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "2.5"))
-# Анти-параболика: макс. рост цены за последние 2×15m от локального low
+# Анти-параболика: макс. рост цены за последние 2 бара от локального low
 BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "4.5"))
-# Откат должен удерживаться выше mid BB (поддержка после пробоя)
+# Откат должен удерживаться выше mid BB (поддержка после пробоя).
+# Поставьте false в переменных окружения, чтобы временно отключить.
 BB_REQUIRE_ABOVE_MID = os.getenv("BB_REQUIRE_ABOVE_MID", "true").lower() == "true"
 
 # ---------- EMA filter ----------
