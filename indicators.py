@@ -75,21 +75,29 @@ def calculate_atr(
 
 def calculate_keltner(
     highs: list[float], lows: list[float], closes: list[float],
-    period: int = 20, mult: float = 1.5
+    ema_period: int = 20, atr_period: int = 10, mult: float = 1.5
 ) -> Optional[dict]:
-    """Keltner Channel: EMA(period) basis ± mult × ATR(period)."""
-    if len(closes) < period:
+    """Keltner Channel: EMA(ema_period) basis ± mult × ATR(atr_period)."""
+    if len(closes) < ema_period:
         return None
-    basis = calculate_ema(closes, period)
-    atr = calculate_atr(highs, lows, closes, period)
+    basis = calculate_ema(closes, ema_period)
+    atr = calculate_atr(highs, lows, closes, atr_period)
     if basis is None or atr is None:
         return None
     return {
         "upper": basis + mult * atr,
-        "mid": basis,
+        "middle": basis,
         "lower": basis - mult * atr,
         "atr": atr,
     }
+
+
+def bb_inside_keltner(bb: dict, kc: dict) -> bool:
+    """True if Bollinger Bands are fully inside the Keltner Channel (TTM-style squeeze)."""
+    if not bb or not kc:
+        return False
+    return bb["upper"] < kc["upper"] and bb["lower"] > kc["lower"]
+
 
 
 def sparkline(values: list[float], width: int = 10) -> str:

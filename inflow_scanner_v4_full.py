@@ -32,10 +32,17 @@ from config import (
     SURGE_OI_1H_MIN, SURGE_OI_24H_MIN, SURGE_RSI_1H_MAX,
     ENABLE_PULLBACK, PULLBACK_RSI_1H_MIN, PULLBACK_RSI_1H_MAX,
     PULLBACK_EMA_DISTANCE_PCT, PULLBACK_OI_24H_MIN, PULLBACK_OI_1H_MIN,
-    ENABLE_BB_SQUEEZE, BB_DEBUG_LOG, BB_PERIOD, BB_MULT, BB_TIMEFRAME,
-    KC_ATR_PERIOD, KC_MULT, BB_SQUEEZE_FRESH_BARS, BB_BW_EXPANSION_MIN,
-    BB_BREAKOUT_VOL_MIN, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
+    ENABLE_BB_SQUEEZE, BB_PERIOD, BB_MULT,
+    BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
+    BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
+    BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
     BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
+    BB_REQUIRE_EXPANSION, BB_REJECT_FALSE_BREAKOUT,
+    KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
+    BB_REQUIRE_KC_SQUEEZE, BB_KC_SQUEEZE_BARS, BB_REQUIRE_KC_BREAKOUT,
+    ENABLE_BB_LOWER, BB_LOWER_TREND_24H_MIN,
+    BB_LOWER_RSI_MAX, BB_LOWER_RSI_MIN, BB_LOWER_MAX_BREAK_PCT,
+    AUTO_BB_LOWER_TP_PCT, AUTO_BB_LOWER_SL_PCT,
     USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
     BTC_MIN_1H_CHANGE,
     TP1_PCT, TP2_PCT, HARD_SL_PCT, OI_DROP_WARNING_PCT,
@@ -58,7 +65,10 @@ from config import (
 from storage import PositionStore, IgnoreStore, StatsStore, AutoStateStore
 from trader import BybitTrader
 from auto_trade import AutoTrader, check_btc_health
-from indicators import calculate_rsi, calculate_ema, calculate_bollinger, calculate_keltner
+from indicators import (
+    calculate_rsi, calculate_ema, calculate_bollinger,
+    calculate_keltner, bb_inside_keltner,
+)
 from backtest import backtest_symbol, top_symbols, format_result, format_summary
 from visuals import progress_bar, sparkline, position_progress
 
@@ -171,13 +181,11 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         closes_1h = [float(k[4]) for k in klines_1h]
         current_price = closes_1h[-1]
 
-        # Fetch klines for BB Squeeze (compression + breakout) on BB_TIMEFRAME
+        # Fetch 15m klines for BB Squeeze (compression + breakout on 15m)
         klines_15m = await get_klines(
-            session, symbol, BB_TIMEFRAME, max(KC_ATR_PERIOD + BB_SQUEEZE_FRESH_BARS + 15, 60)
+            session, symbol, "15", max(BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5, 80)
         )
         closes_15m = [float(k[4]) for k in klines_15m] if klines_15m else []
-        highs_15m = [float(k[2]) for k in klines_15m] if klines_15m else []
-        lows_15m = [float(k[3]) for k in klines_15m] if klines_15m else []
 
         # EMA50 on 1h
         ema50 = calculate_ema(closes_1h, EMA_PERIOD)
@@ -258,41 +266,60 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
 
     # 24h local high (excluding the latest candle — we want to check if NOW broke previous 24h max)
     local_high_24h = 0.0
+    price_change_24h = 0.0
     if len(klines_1h) >= 25:
         prior_highs = [float(k[2]) for k in klines_1h[-25:-1]]
         if prior_highs:
             local_high_24h = max(prior_highs)
+        # close now vs close ~24h ago (24 bars of 1h)
+        try:
+            c_now = float(klines_1h[-1][4])
+            c_24 = float(klines_1h[-25][4])
+            if c_24 > 0:
+                price_change_24h = (c_now - c_24) / c_24 * 100
+        except (IndexError, TypeError, ValueError):
+            price_change_24h = 0.0
 
     # RSI 1h
     rsi_1h = calculate_rsi(closes_1h, 14)
     if rsi_1h is None:
         return None
 
-    # Bollinger + Keltner on the signal timeframe: squeeze = BB fully inside KC
-    # (John Carter / TTM Squeeze definition — self-adaptive per coin, no % tuning)
+    # Bollinger + Keltner on 15m (TTM-style: BB inside KC = squeeze)
+    highs_15m = [float(k[2]) for k in klines_15m] if klines_15m else []
+    lows_15m = [float(k[3]) for k in klines_15m] if klines_15m else []
     bb = calculate_bollinger(closes_15m, BB_PERIOD, BB_MULT) if closes_15m else None
-    kc = calculate_keltner(highs_15m, lows_15m, closes_15m, KC_ATR_PERIOD, KC_MULT) if closes_15m else None
-
-    squeeze_hist: list[bool] = []
-    bw_hist: list[float] = []
-    n_needed = BB_SQUEEZE_FRESH_BARS + 3
-    min_len = max(BB_PERIOD, KC_ATR_PERIOD) + 1
-    if len(closes_15m) >= min_len:
-        for i in range(n_needed):
+    kc = (
+        calculate_keltner(
+            highs_15m, lows_15m, closes_15m,
+            KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
+        )
+        if highs_15m and lows_15m and closes_15m
+        else None
+    )
+    bb_history_bw = []
+    kc_squeeze_hist = []  # True if BB was inside KC at that bar (newest first)
+    need = BB_PERIOD + BB_SQUEEZE_LOOKBACK
+    atr_need = max(KC_EMA_PERIOD, KC_ATR_PERIOD) + 1
+    if len(closes_15m) >= need and len(highs_15m) >= need:
+        for i in range(BB_SQUEEZE_LOOKBACK):
             end = len(closes_15m) - i
-            if end < min_len:
+            if end < max(BB_PERIOD, atr_need):
                 break
-            bb_i = calculate_bollinger(closes_15m[:end], BB_PERIOD, BB_MULT)
-            kc_i = calculate_keltner(highs_15m[:end], lows_15m[:end], closes_15m[:end], KC_ATR_PERIOD, KC_MULT)
-            if not bb_i or not kc_i:
-                break
-            squeeze_hist.append(bb_i["upper"] < kc_i["upper"] and bb_i["lower"] > kc_i["lower"])
-            bw_hist.append(bb_i["bandwidth"])
+            b = calculate_bollinger(closes_15m[:end], BB_PERIOD, BB_MULT)
+            k = calculate_keltner(
+                highs_15m[:end], lows_15m[:end], closes_15m[:end],
+                KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
+            )
+            if b:
+                bb_history_bw.append(b["bandwidth"])
+            if b and k:
+                kc_squeeze_hist.append(bb_inside_keltner(b, k))
 
-    # RSI on the signal timeframe — for BB pullback entry (not overbought)
+    # RSI 15m — for BB pullback entry (not overbought on the signal TF)
     rsi_15m = calculate_rsi(closes_15m, 14) if len(closes_15m) >= 15 else None
 
-    # Volume spike (breakout confirmation): current bar vs avg of prior 20 bars
+    # Volume spike 15m (breakout confirmation)
     vol_spike_15m = 0.0
     if klines_15m and len(klines_15m) >= 21:
         try:
@@ -308,9 +335,10 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "price": current_price,
         "price_change_4h": price_change_4h,
         "price_change_1h": price_change_1h,
-        "oi_change_4h": oi_change_4h if oi_change_4h is not None else 0,
-        "oi_change_24h": oi_change_24h if oi_change_24h is not None else 0,
-        "oi_change_1h": oi_change_1h if oi_change_1h is not None else 0,
+        "price_change_24h": price_change_24h,
+        "oi_change_4h": oi_change_4h,
+        "oi_change_24h": oi_change_24h,
+        "oi_change_1h": oi_change_1h,
         "vol_spike_4h": vol_spike_4h,
         "vol_spike_1h": vol_spike_1h,
         "vol_24h": c["volume_24h"],
@@ -327,10 +355,12 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "bb_middle": bb["middle"] if bb else None,
         "bb_lower": bb["lower"] if bb else None,
         "bb_bandwidth": bb["bandwidth"] if bb else None,
+        "bb_history_bw": bb_history_bw,
         "kc_upper": kc["upper"] if kc else None,
+        "kc_middle": kc["middle"] if kc else None,
         "kc_lower": kc["lower"] if kc else None,
-        "bb_squeeze_hist": squeeze_hist,
-        "bb_history_bw": bw_hist,
+        "kc_squeeze_now": bb_inside_keltner(bb, kc) if (bb and kc) else False,
+        "kc_squeeze_hist": kc_squeeze_hist,
         "rsi_15m": rsi_15m,
         "vol_spike_15m": vol_spike_15m,
     }
@@ -358,6 +388,11 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         if bb_sig:
             return bb_sig
 
+    if ENABLE_BB_LOWER:
+        bb_low = try_bb_lower(base_data, closes_15m)
+        if bb_low:
+            return bb_low
+
     return None
 
 
@@ -370,11 +405,12 @@ def try_standard(d: dict) -> Optional[dict]:
         return None
     if USE_EMA_FILTER and d["ema50_1h"] is not None and d["price"] < d["ema50_1h"]:
         return None
-    if d["oi_change_4h"] < OI_CHANGE_4H_MIN:
+    oi4 = d.get("oi_change_4h")
+    if oi4 is None or oi4 < OI_CHANGE_4H_MIN:
         return None
 
     stars = 1
-    if d["oi_change_24h"] >= OI_CHANGE_24H_2STAR and d["vol_spike_4h"] >= VOLUME_SPIKE_2STAR:
+    if (d.get("oi_change_24h") or 0) >= OI_CHANGE_24H_2STAR and d["vol_spike_4h"] >= VOLUME_SPIKE_2STAR:
         stars = 2
     # 3★: ⭐⭐ + breakout of 24h high + BTC not falling
     if stars == 2:
@@ -392,13 +428,13 @@ def try_surge(d: dict) -> Optional[dict]:
     Требуем рост OI и на 4h, и уверенное положение выше EMA50 (не squeeze у сопротивления)."""
     if d["price_change_1h"] < SURGE_PRICE_1H_MIN or d["price_change_1h"] > SURGE_PRICE_1H_MAX:
         return None
-    if d["oi_change_1h"] < SURGE_OI_1H_MIN:
+    if d.get("oi_change_1h") is None or d["oi_change_1h"] < SURGE_OI_1H_MIN:
         return None
-    if d["oi_change_24h"] < SURGE_OI_24H_MIN:
+    if d.get("oi_change_24h") is None or d["oi_change_24h"] < SURGE_OI_24H_MIN:
         return None
 
     # === ФИЛЬТРЫ ПРОТИВ SQUEEZE ===
-    if d["oi_change_4h"] is None or d["oi_change_4h"] < 4.0:
+    if d.get("oi_change_4h") is None or d["oi_change_4h"] < 4.0:
         return None
     # цена уверенно выше EMA50 (запас 0.5%), а не упирается в неё
     if USE_EMA_FILTER and d["ema50_1h"] is not None and d["price"] < d["ema50_1h"] * 1.005:
@@ -407,7 +443,7 @@ def try_surge(d: dict) -> Optional[dict]:
         return None
 
     stars = 1
-    if d["oi_change_1h"] >= SURGE_OI_1H_MIN * 1.8 and d["oi_change_4h"] >= 8.0:
+    if (d.get("oi_change_1h") or 0) >= SURGE_OI_1H_MIN * 1.8 and (d.get("oi_change_4h") or 0) >= 8.0:
         stars = 2
     if stars == 2:
         vol4h_strong = d["vol_spike_4h"] >= 1.6
@@ -444,9 +480,9 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
         return None
 
     # OI подтверждение
-    if d["oi_change_24h"] < PULLBACK_OI_24H_MIN:
+    if (d.get("oi_change_24h") is None) or d["oi_change_24h"] < PULLBACK_OI_24H_MIN:
         return None
-    if d["oi_change_1h"] < PULLBACK_OI_1H_MIN:
+    if (d.get("oi_change_1h") is None) or d["oi_change_1h"] < PULLBACK_OI_1H_MIN:
         return None
 
     # Две зелёные 1h свечи подряд
@@ -471,136 +507,225 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
 
 
 
-def _bb_squeeze_eval(d: dict, closes_15m: list[float]) -> tuple[Optional[dict], list[str]]:
-    """Core BB_SQUEEZE evaluation, shared by try_bb_squeeze() and /bb_debug.
-    Returns (signal_or_None, trace) — trace is a human-readable pass/fail log
-    of every stage, in order, so a rejection's exact cause is never a guess.
-
-    1) Сжатие = полосы Боллинджера внутри канала Кельтнера (John Carter / TTM
-       Squeeze) — самоадаптивно под волатильность конкретной монеты, без
-       ручных % порогов. Свежее — если было в последних FRESH_BARS барах.
-    2) Расширение: текущий bandwidth ≥ ×BB_BW_EXPANSION_MIN от самого узкого
-       значения за то же окно — «полосы реально расходятся», а не просто
-       разовый прокол.
-    3) Пробой upper + подтверждение объёмом.
-    4) Анти-параболика.
-    5) OI: 24h ИЛИ 4h (раньше требовалось оба одновременно — совпадало
-       слишком редко).
-    6) EMA50 (1h), RSI, моментум, удержание выше mid BB.
-    Окно отката (раньше 0.15–1.2%) убрано как гейт — на 15m баре и скане раз
-    в 10 минут это окно почти никогда не совпадало по времени. Значение
-    отката по-прежнему считается и показывается в алерте, просто не решает
-    судьбу сигнала.
+def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
     """
-    trace: list[str] = []
-
-    def fail(stage: str, detail: str = "") -> tuple[None, list[str]]:
-        trace.append(f"❌ {stage}" + (f" — {detail}" if detail else ""))
-        return None, trace
-
-    def ok(stage: str, detail: str = "") -> None:
-        trace.append(f"✅ {stage}" + (f" — {detail}" if detail else ""))
-
-    if d.get("bb_upper") is None or d.get("bb_bandwidth") is None or d.get("kc_upper") is None:
-        return fail("данные BB/KC", "недостаточно истории")
+    Классика Bollinger (Length=20, Dev=2.0) на 15m:
+    1) Сужение BB Width до минимума за lookback (перцентиль ИЛИ cap)
+    2) Истинный пробой: close выше upper + полосы начинают расходиться
+    3) Не ложный пробой: цена не закрылась обратно внутрь канала
+    4) Небольшой откат, удержание mid, OI/объём, EMA50 1h
+    """
+    if d.get("bb_upper") is None or d.get("bb_bandwidth") is None:
+        return None
     if not closes_15m or len(closes_15m) < BB_PERIOD + 3:
-        return fail("история цены", f"{len(closes_15m)} баров")
-
+        return None
     if USE_EMA_FILTER and d["ema50_1h"] is not None and d["price"] < d["ema50_1h"]:
-        return fail("EMA50 (1h)", f"price {d['price']:.6g} < EMA50 {d['ema50_1h']:.6g}")
-    ok("EMA50 (1h)")
+        return None
 
-    oi24 = d["oi_change_24h"]
-    oi4 = d.get("oi_change_4h", 0)
-    if oi24 < BB_OI_24H_MIN and oi4 < BB_OI_4H_MIN:
-        return fail("OI приток", f"24h={oi24:+.1f}% (нужно ≥{BB_OI_24H_MIN}) И 4h={oi4:+.1f}% (нужно ≥{BB_OI_4H_MIN})")
-    ok("OI приток", f"24h={oi24:+.1f}% 4h={oi4:+.1f}%")
+    oi24 = d.get("oi_change_24h")
+    oi4 = d.get("oi_change_4h")
+    if oi24 is None or oi24 < BB_OI_24H_MIN:
+        return None
+    if oi4 is None or oi4 < BB_OI_4H_MIN:
+        return None
 
     bw = d["bb_bandwidth"]
-    squeeze_hist = d.get("bb_squeeze_hist") or []
-    bw_hist = d.get("bb_history_bw") or []
-    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(squeeze_hist) if squeeze_hist else 1))
+    hist = d.get("bb_history_bw") or []
+    # hist[0]=текущий bar, hist[1]=предыдущий, ...
 
-    was_squeezed = any(squeeze_hist[:fresh_n]) if squeeze_hist else False
-    if not was_squeezed:
-        return fail("сжатие (BB внутри KC)", f"не было в последних {fresh_n} барах")
-    ok("сжатие (BB внутри KC)", f"да, в последних {fresh_n} барах")
+    fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
+    recent = hist[:fresh_n] if hist else [bw]
+    min_recent = min(recent)
 
-    bw_ref = min(bw_hist[:fresh_n]) if bw_hist else bw
-    expansion = (bw / bw_ref) if bw_ref and bw_ref > 0 else 1.0
-    if expansion < BB_BW_EXPANSION_MIN:
-        return fail("расширение полос", f"×{expansion:.2f} (нужно ≥×{BB_BW_EXPANSION_MIN})")
-    ok("расширение полос", f"×{expansion:.2f}")
+    # Сужение: Width в минимумах за период (как BB Width на графике)
+    percentile_ok = False
+    if hist and len(hist) >= 10:
+        sorted_bw = sorted(hist)
+        pidx = max(0, int(len(sorted_bw) * BB_SQUEEZE_PERCENTILE / 100) - 1)
+        percentile_ok = min_recent <= sorted_bw[pidx]
+    cap_ok = min_recent <= BB_SQUEEZE_MAX_BW
+    if not (percentile_ok or cap_ok):
+        return None
 
-    # Breakout above upper (current or last 1-2 bars)
+    # TTM-style: BB был внутри Keltner недавно (подтверждённый squeeze)
+    if BB_REQUIRE_KC_SQUEEZE:
+        hist_kc = d.get("kc_squeeze_hist") or []
+        n = max(1, min(BB_KC_SQUEEZE_BARS, len(hist_kc) if hist_kc else 1))
+        recent_kc = hist_kc[:n] if hist_kc else [d.get("kc_squeeze_now")]
+        if not any(recent_kc):
+            return None
+
+    # Истинный пробой: после сжатия Width начинает расти (полосы расходятся)
+    if BB_REQUIRE_EXPANSION and len(hist) >= 3:
+        # минимум сжатия был недавно, сейчас bw выше этого минимума
+        if bw < min_recent * 1.02 and bw <= (hist[1] if len(hist) > 1 else bw):
+            return None  # ещё не разошлись
+
+    upper = d["bb_upper"]
+    mid = d.get("bb_middle")
+    lower = d.get("bb_lower")
+
+    # Пробой upper: среди последних 1–3 свечей был close выше upper
     broke = False
     breakout_high = d["price"]
+    broke_idx = None  # 1 = last bar, 2 = prev, ...
     look = min(3, len(closes_15m))
     for i in range(1, look + 1):
-        cbar = closes_15m[-i]
-        if cbar > d["bb_upper"]:
+        c = closes_15m[-i]
+        if c > upper:
             broke = True
-            if cbar >= breakout_high:
-                breakout_high = cbar
+            if c >= breakout_high:
+                breakout_high = c
+                broke_idx = i
     if not broke:
-        return fail("пробой upper", f"upper={d['bb_upper']:.6g}")
-    ok("пробой upper", f"high={breakout_high:.6g}")
+        return None
 
+    # Опционально: пробой также выше верхней Keltner (сильный импульс)
+    if BB_REQUIRE_KC_BREAKOUT:
+        kc_up = d.get("kc_upper")
+        if kc_up is None:
+            return None
+        if not any(closes_15m[-i] > kc_up for i in range(1, look + 1)):
+            return None
+
+    # Ложный пробой (классика): после close выше upper цена позже
+    # закрылась НИЖЕ mid (SMA20) — импульс умер, часто ход к lower.
+    # Откат внутрь полос при удержании mid — нормален (наш вход).
+    if BB_REJECT_FALSE_BREAKOUT and mid is not None:
+        n = len(closes_15m)
+        for i in range(max(0, n - 5), n):
+            if closes_15m[i] > upper:
+                for j in range(i + 1, n):
+                    if closes_15m[j] < mid:
+                        return None
+                break
+
+    # Текущая/последняя: для лонга хотим закрепление вне/у границы, не глубоко внутри
+    # (после отката close всё ещё >= mid)
     vol15 = d.get("vol_spike_15m") or 0.0
     if vol15 < BB_BREAKOUT_VOL_MIN:
-        return fail("объём", f"×{vol15:.2f} (нужно ≥×{BB_BREAKOUT_VOL_MIN})")
-    ok("объём", f"×{vol15:.2f}")
+        return None
 
+    # Анти-параболика
     if len(closes_15m) >= 3:
         local_low = min(closes_15m[-3], closes_15m[-2], closes_15m[-1])
         if local_low > 0:
             spike_pct = (closes_15m[-1] - local_low) / local_low * 100
             if spike_pct > BB_PARABOLIC_MAX_PCT:
-                return fail("анти-параболика", f"{spike_pct:.2f}% > {BB_PARABOLIC_MAX_PCT}%")
-    ok("анти-параболика")
+                return None
 
     pullback_pct = (breakout_high - d["price"]) / breakout_high * 100 if breakout_high > 0 else 0
+    if pullback_pct < 0.15:
+        return None
+    if pullback_pct > BB_PULLBACK_MAX_PCT:
+        return None
 
-    mid = d.get("bb_middle")
+    # Mid BB — поддержка после истинного пробоя
     if BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
-        return fail("выше mid BB", f"price {d['price']:.6g} < mid {mid:.6g}")
-    ok("выше mid BB")
+        return None
 
     rsi_15 = d.get("rsi_15m")
     if rsi_15 is not None and rsi_15 > BB_PULLBACK_RSI_MAX:
-        return fail("RSI", f"{rsi_15:.0f} > {BB_PULLBACK_RSI_MAX}")
-    ok("RSI", f"{rsi_15:.0f}" if rsi_15 is not None else "n/a")
+        return None
 
     if len(closes_15m) < 3 or closes_15m[-1] <= closes_15m[-3]:
-        return fail("моментум", "цена не выше уровня 2 бара назад")
-    ok("моментум")
+        return None
 
     stars = 1
-    strong_oi = oi24 >= BB_OI_24H_MIN * 1.5 or oi4 >= BB_OI_4H_MIN * 1.5
-    if strong_oi and vol15 >= BB_BREAKOUT_VOL_MIN * 1.3:
+    if (oi24 or 0) >= BB_OI_24H_MIN * 1.5 and vol15 >= BB_BREAKOUT_VOL_MIN * 1.3:
         stars = 2
-    if stars == 2 and d["btc_1h"] >= -0.3 and expansion >= BB_BW_EXPANSION_MIN * 1.5:
+    if (
+        stars == 2
+        and (oi4 or 0) >= BB_OI_4H_MIN * 1.6
+        and d["btc_1h"] >= -0.3
+        and min_recent <= BB_SQUEEZE_MAX_BW * 0.75
+    ):
         stars = 3
-    if stars == 2 and mid and d["price"] <= mid * 1.008:
+    # сильное расхождение полос после squeeze / выход из KC
+    if stars >= 2 and len(hist) >= 2 and bw >= min_recent * 1.15:
+        stars = 3
+    if stars >= 2 and d.get("kc_squeeze_now") is False and any(
+        (d.get("kc_squeeze_hist") or [False])[:BB_KC_SQUEEZE_BARS]
+    ):
         stars = 3
 
-    trace.append(f"🎯 СИГНАЛ ⭐{stars}")
     return {
         **d,
         "stars": stars,
         "signal_type": "BB_SQUEEZE",
         "bb_pullback_pct": round(pullback_pct, 2),
         "bb_bandwidth": round(bw, 2),
-        "bb_expansion": round(expansion, 2),
         "vol_spike_15m": round(vol15, 2),
-    }, trace
+    }
 
 
-def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
-    sig, trace = _bb_squeeze_eval(d, closes_15m)
-    if BB_DEBUG_LOG and not sig:
-        log.info(f"[BB_SQUEEZE] {d.get('symbol', '?')}: " + " | ".join(trace))
-    return sig
+
+def try_bb_lower(d: dict, closes_15m: list[float]) -> Optional[dict]:
+    """
+    Лонг от нижней полосы Bollinger в 24h-аптренде.
+    1) Цена за 24ч растёт (восходящий тренд)
+    2) Close 15m ПРОБИВАЕТ lower BB вниз (не фитиль: close < lower)
+    3) Предыдущий close был >= lower (свежий пробой)
+    4) Прокол не слишком глубокий (иначе слом тренда)
+    5) Выше EMA50 1h (старший тренд жив), RSI 15m в зоне откупа
+    """
+    lower = d.get("bb_lower")
+    upper = d.get("bb_upper")
+    mid = d.get("bb_middle")
+    if lower is None or mid is None:
+        return None
+    if not closes_15m or len(closes_15m) < BB_PERIOD + 2:
+        return None
+
+    # 24h восходящий тренд
+    if (d.get("price_change_24h") or 0) < BB_LOWER_TREND_24H_MIN:
+        return None
+
+    # Старший ТФ: цена всё ещё выше EMA50 1h
+    if USE_EMA_FILTER and d.get("ema50_1h") is not None and d["price"] < d["ema50_1h"]:
+        return None
+
+    close = closes_15m[-1]
+    prev = closes_15m[-2]
+
+    # Реальный пробой: close ниже lower (не закол фитилём)
+    if close >= lower:
+        return None
+    # Свежий пробой: предыдущая свеча ещё была на/над lower
+    if prev < lower:
+        return None
+
+    # Глубина прокола
+    break_pct = (lower - close) / lower * 100 if lower > 0 else 0
+    if break_pct > BB_LOWER_MAX_BREAK_PCT:
+        return None
+
+    rsi_15 = d.get("rsi_15m")
+    if rsi_15 is not None:
+        if rsi_15 > BB_LOWER_RSI_MAX:
+            return None
+        if rsi_15 < BB_LOWER_RSI_MIN:
+            return None
+
+    # Не против BTC-слива (мягко)
+    if d.get("btc_1h", 0) < -1.0:
+        return None
+
+    stars = 1
+    pc24 = d.get("price_change_24h") or 0
+    if pc24 >= BB_LOWER_TREND_24H_MIN * 2 and break_pct <= 0.6:
+        stars = 2
+    if stars == 2 and (d.get("oi_change_24h") or 0) >= 3.0 and d.get("btc_1h", 0) >= -0.3:
+        stars = 3
+
+    return {
+        **d,
+        "stars": stars,
+        "signal_type": "BB_LOWER",
+        "bb_break_pct": round(break_pct, 2),
+        "bb_bandwidth": round(d["bb_bandwidth"], 2) if d.get("bb_bandwidth") is not None else None,
+    }
+
 
 
 def is_blacklisted(symbol: str) -> bool:
@@ -616,7 +741,7 @@ async def scan_once(session) -> list[dict]:
     log.info(f"BTC 1h: {btc_1h:+.2f}%")
 
     if btc_1h < BTC_MIN_1H_CHANGE:
-        log.info(f"BTC dropping ({btc_1h:.2f}%) — skip.")
+        log.info(f"BTC dropping hard ({btc_1h:.2f}% < {BTC_MIN_1H_CHANGE}%) — skip full scan.")
         return []
 
     instruments = await get_instruments(session)
@@ -657,13 +782,13 @@ async def scan_once(session) -> list[dict]:
         if isinstance(r, Exception) or r is None: continue
         if r["stars"] < MIN_STARS_TO_ALERT: continue
         scored.append(r)
-    scored.sort(key=lambda x: (-x["stars"], -x["oi_change_4h"]))
+    scored.sort(key=lambda x: (-x["stars"], -(x.get("oi_change_4h") or 0)))
 
     by_type = defaultdict(int)
     for s in scored:
         by_type[s["signal_type"]] += 1
     log.info(f"=== SCAN END: {len(scored)} alerts | "
-             f"STD:{by_type['STANDARD']} SURGE:{by_type['SURGE']} PB:{by_type['PULLBACK']} BB:{by_type['BB_SQUEEZE']} ===")
+             f"STD:{by_type.get('STANDARD',0)} SURGE:{by_type.get('SURGE',0)} PB:{by_type.get('PULLBACK',0)} BB:{by_type.get('BB_SQUEEZE',0)} BBL:{by_type.get('BB_LOWER',0)} ===")
     return scored
 
 
@@ -693,6 +818,7 @@ SIGNAL_HEADERS = {
     "SURGE":    "⚡ <b>LONG</b> · OI SURGE",
     "PULLBACK": "↩️ <b>LONG</b> · PULLBACK",
     "BB_SQUEEZE": "📉 <b>LONG</b> · BB SQUEEZE",
+    "BB_LOWER": "📗 <b>LONG</b> · BB LOWER",
 }
 
 SIGNAL_LOGIC = {
@@ -700,6 +826,7 @@ SIGNAL_LOGIC = {
     "SURGE":    "Цена↑ 1ч + OI↑ 1ч = очень ранний старт тренда",
     "PULLBACK": "Тренд вверх + откат к EMA21 + OI растёт = вход на ретесте",
     "BB_SQUEEZE": "Сужение Bollinger 15m → пробой upper → вход на небольшом откате",
+    "BB_LOWER": "24h аптренд + close 15m ниже lower BB (не фитиль) → лонг от полосы",
 }
 
 
@@ -725,18 +852,24 @@ def format_alert(s: dict) -> str:
     bb_line = ""
     if s.get("signal_type") == "BB_SQUEEZE":
         bb_line = (
-            f"📉 BB: bw {s.get('bb_bandwidth', 0):.2f}% ×{s.get('bb_expansion', 0):.2f} | "
+            f"📉 BB 15m: bw {s.get('bb_bandwidth', 0):.2f}% | "
             f"откат {s.get('bb_pullback_pct', 0):.2f}% | "
-            f"vol×{s.get('vol_spike_15m', 0):.1f}\n"
+            f"vol×{s.get('vol_spike_15m', 0):.1f}"
+            f"{' | KC-squeeze' if s.get('kc_squeeze_now') or any((s.get('kc_squeeze_hist') or [False])[:3]) else ''}\n"
         )
-
+    elif s.get("signal_type") == "BB_LOWER":
+        bb_line = (
+            f"📗 BB lower: прокол {s.get('bb_break_pct', 0):.2f}% | "
+            f"24h {s.get('price_change_24h', 0):+.1f}%\n"
+        )
+    
     return (
         f"{header} {star_emoji} <b>{star_label}</b> — <b>{base}</b>\n\n"
         f"💵 Цена: <code>${price:.6g}</code>\n"
         f"📈 Цена: 1ч <b>{s['price_change_1h']:+.2f}%</b> | 4ч <b>{s['price_change_4h']:+.2f}%</b>\n"
-        f"💰 OI: 1ч <b>{s['oi_change_1h']:+.1f}%</b> | "
-        f"4ч <b>{s['oi_change_4h']:+.1f}%</b> | "
-        f"24ч <b>{s['oi_change_24h']:+.1f}%</b>\n"
+        f"💰 OI: 1ч <b>{(s.get('oi_change_1h') or 0):+.1f}%</b> | "
+        f"4ч <b>{(s.get('oi_change_4h') or 0):+.1f}%</b> | "
+        f"24ч <b>{(s.get('oi_change_24h') or 0):+.1f}%</b>\n"
         f"📊 Объём: 4ч ×{s['vol_spike_4h']:.1f} | 24ч ${vol_m:.0f}M\n"
         f"📈 RSI: 1h {s['rsi_1h']:.0f} | 4h {s['rsi_4h']:.0f}\n"
         f"{bb_line}"
@@ -967,7 +1100,7 @@ async def daily_report_loop(bot: Bot):
                     f"<b>Типы сигналов (всего):</b>\n"
                     f"  STANDARD: {by_type.get('STANDARD', 0)}\n"
                     f"  SURGE: {by_type.get('SURGE', 0)}\n"
-                    f"  PULLBACK: {by_type.get('PULLBACK', 0)}\n  BB_SQUEEZE: {by_type.get('BB_SQUEEZE', 0)}\n\n"
+                    f"  PULLBACK: {by_type.get('PULLBACK', 0)}\n  BB_SQUEEZE: {by_type.get('BB_SQUEEZE', 0)}\n  BB_LOWER: {by_type.get('BB_LOWER', 0)}\n\n"
                     f"Открытых позиций: <b>{len(positions.data)}</b>\n\n"
                     f"<b>Итого:</b> {stats.data['alerts_total']} алертов, "
                     f"TP1: {stats.data.get('tp1_hits', 0)}, "
@@ -1003,7 +1136,6 @@ async def cmd_start(msg: types.Message):
         "<b>Команды:</b>\n"
         "/scan — ручной скан\n"
         "/backtest — бэктест BB_SQUEEZE\n"
-        "/bb_debug SYMBOL — почему BB_SQUEEZE не сработал по монете\n"
         "/settings /positions /stats\n"
         "/top_oi /active /ignored /unignore SYM\n"
         "/add SYM PRICE /remove SYM\n\n"
@@ -1056,14 +1188,13 @@ async def cmd_settings(msg: types.Message):
         f"• OI 1ч: ≥+{PULLBACK_OI_1H_MIN}% (не падает)\n"
         f"• 2 зелёные свечи подряд на 1h\n"
         f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
-        f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'} (TF: {BB_TIMEFRAME}m)\n"
-        f"• Сжатие: BB({BB_PERIOD},{BB_MULT}) внутри Keltner({KC_ATR_PERIOD},×{KC_MULT}) — "
-        f"свежее за {BB_SQUEEZE_FRESH_BARS} баров\n"
-        f"• Расширение полос ≥×{BB_BW_EXPANSION_MIN} от минимума в окне\n"
-        f"• Пробой upper + объём ×{BB_BREAKOUT_VOL_MIN}\n"
-        f"• Анти-шип ≤{BB_PARABOLIC_MAX_PCT}%; цена ≥ mid BB; RSI ≤{BB_PULLBACK_RSI_MAX}\n"
-        f"• OI 24ч ≥+{BB_OI_24H_MIN}% <b>или</b> OI 4ч ≥+{BB_OI_4H_MIN}%\n"
-        f"• Откат не гейтится, только показывается в алерте\n"
+        f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
+        f"• BB 20/2 + Keltner squeeze (BB inside KC)\n"
+        f"• BB Width 15m (≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
+        f"• Истинный пробой upper + расширение полос + объём ×{BB_BREAKOUT_VOL_MIN}\n"
+        f"• Отсев ложного пробоя (close обратно внутрь канала)\n"
+        f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}%, цена ≥ mid BB\n"
+        f"• OI 24ч ≥+{BB_OI_24H_MIN}% / 4ч ≥+{BB_OI_4H_MIN}%; RSI 15м ≤{BB_PULLBACK_RSI_MAX}\n"
         f"• Авто: TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%\n\n"
         f"<b>Ручная сделка (трекер):</b>\n"
         f"• TP1: +{TP1_PCT}% / TP2: +{TP2_PCT}%\n"
@@ -1112,7 +1243,7 @@ async def cmd_backtest(msg: types.Message):
         days = max(3, min(int(parts[3]), 60))
 
     await msg.answer(
-        f"⏳ Backtest BB_SQUEEZE "
+        f"⏳ Backtest BB_LOWER "
         f"{'TOP' + str(top_n) if mode == 'top' else symbol} "
         f"за {days}д… это может занять 1–3 мин."
     )
@@ -1141,107 +1272,6 @@ async def cmd_backtest(msg: types.Message):
     except Exception as e:
         log.exception("backtest")
         await msg.answer(f"❌ Backtest error: <code>{e}</code>")
-
-
-@dp.message(Command("bb_debug"))
-async def cmd_bb_debug(msg: types.Message):
-    """Usage: /bb_debug SYMBOL — пошагово показывает, на каком именно условии
-    BB_SQUEEZE отваливается конкретная монета прямо сейчас (или что сигнал есть)."""
-    parts = (msg.text or "").split()
-    if len(parts) < 2:
-        await msg.answer("Использование: <code>/bb_debug ARBUSDT</code>")
-        return
-    symbol = parts[1].upper()
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-
-    await msg.answer(f"⏳ Проверяю {symbol}…")
-    try:
-        async with aiohttp.ClientSession() as session:
-            btc_1h = await get_btc_1h_change(session)
-            klines_15m = await get_klines(
-                session, symbol, BB_TIMEFRAME, max(KC_ATR_PERIOD + BB_SQUEEZE_FRESH_BARS + 15, 60)
-            )
-            klines_1h = await get_klines(session, symbol, "60", max(EMA_PERIOD + 5, 30))
-            if len(klines_15m) < BB_PERIOD + 3 or len(klines_1h) < 25:
-                await msg.answer(f"❌ {symbol}: недостаточно истории котировок.")
-                return
-
-            closes_15m = [float(k[4]) for k in klines_15m]
-            highs_15m = [float(k[2]) for k in klines_15m]
-            lows_15m = [float(k[3]) for k in klines_15m]
-            closes_1h = [float(k[4]) for k in klines_1h]
-            current_price = closes_15m[-1]
-            ema50 = calculate_ema(closes_1h, EMA_PERIOD)
-
-            oi_4h_history = await get_oi_history(session, symbol, "4h", 12)
-            oi_change_4h = oi_change_24h = 0.0
-            if len(oi_4h_history) >= 2:
-                try:
-                    oi_now = float(oi_4h_history[-1]["openInterest"])
-                    oi_prev = float(oi_4h_history[-2]["openInterest"])
-                    if oi_prev > 0:
-                        oi_change_4h = (oi_now - oi_prev) / oi_prev * 100
-                    if len(oi_4h_history) >= 7:
-                        oi_24 = float(oi_4h_history[-7]["openInterest"])
-                        if oi_24 > 0:
-                            oi_change_24h = (oi_now - oi_24) / oi_24 * 100
-                except (KeyError, ValueError, TypeError):
-                    pass
-
-            bb = calculate_bollinger(closes_15m, BB_PERIOD, BB_MULT)
-            kc = calculate_keltner(highs_15m, lows_15m, closes_15m, KC_ATR_PERIOD, KC_MULT)
-
-            squeeze_hist, bw_hist = [], []
-            n_needed = BB_SQUEEZE_FRESH_BARS + 3
-            min_len = max(BB_PERIOD, KC_ATR_PERIOD) + 1
-            if len(closes_15m) >= min_len:
-                for i in range(n_needed):
-                    end = len(closes_15m) - i
-                    if end < min_len:
-                        break
-                    bb_i = calculate_bollinger(closes_15m[:end], BB_PERIOD, BB_MULT)
-                    kc_i = calculate_keltner(highs_15m[:end], lows_15m[:end], closes_15m[:end], KC_ATR_PERIOD, KC_MULT)
-                    if not bb_i or not kc_i:
-                        break
-                    squeeze_hist.append(bb_i["upper"] < kc_i["upper"] and bb_i["lower"] > kc_i["lower"])
-                    bw_hist.append(bb_i["bandwidth"])
-
-            rsi_15m = calculate_rsi(closes_15m, 14) if len(closes_15m) >= 15 else None
-
-            vol_spike_15m = 0.0
-            if len(klines_15m) >= 21:
-                vols_15 = [float(k[5]) for k in klines_15m]
-                avg_v = sum(vols_15[-21:-1]) / 20
-                if avg_v > 0:
-                    vol_spike_15m = vols_15[-1] / avg_v
-
-            d = {
-                "symbol": symbol, "price": current_price,
-                "oi_change_4h": oi_change_4h, "oi_change_24h": oi_change_24h,
-                "btc_1h": btc_1h, "ema50_1h": ema50,
-                "bb_upper": bb["upper"] if bb else None,
-                "bb_middle": bb["middle"] if bb else None,
-                "bb_bandwidth": bb["bandwidth"] if bb else None,
-                "kc_upper": kc["upper"] if kc else None,
-                "kc_lower": kc["lower"] if kc else None,
-                "bb_squeeze_hist": squeeze_hist,
-                "bb_history_bw": bw_hist,
-                "rsi_15m": rsi_15m,
-                "vol_spike_15m": vol_spike_15m,
-            }
-
-            _, trace = _bb_squeeze_eval(d, closes_15m)
-            lines = [f"🔍 <b>BB_SQUEEZE debug: {symbol}</b>", ""] + trace
-            if bb:
-                lines.append("")
-                lines.append(f"bw={bb['bandwidth']:.2f}% upper={bb['upper']:.6g} mid={bb['middle']:.6g}")
-            if kc:
-                lines.append(f"KC upper={kc['upper']:.6g} lower={kc['lower']:.6g}")
-            await msg.answer("\n".join(lines))
-    except Exception as e:
-        log.exception("bb_debug")
-        await msg.answer(f"❌ Ошибка: <code>{e}</code>")
 
 
 @dp.message(Command("top_oi"))
@@ -1531,13 +1561,15 @@ async def cmd_auto(msg: types.Message):
 
     # Per-signal-type status
     sig_status_lines = []
-    for sig_type in ["STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE"]:
+    for sig_type in ["STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"]:
         on = auto_state.get_signal_toggle(sig_type)
         emoji = "🟢" if on else "🔴"
         if sig_type == "PULLBACK":
             params = f"TP +{AUTO_PULLBACK_TP_PCT}% / SL −{AUTO_PULLBACK_SL_PCT}%"
         elif sig_type == "BB_SQUEEZE":
             params = f"TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%"
+        elif sig_type == "BB_LOWER":
+            params = f"TP +{AUTO_BB_LOWER_TP_PCT}% / SL −{AUTO_BB_LOWER_SL_PCT}%"
         else:
             params = f"TP +{AUTO_TP_PCT}% / SL −{AUTO_HARD_SL_PCT}%"
         sig_status_lines.append(f"  {emoji} {sig_type}: {params}")
@@ -1575,7 +1607,7 @@ async def cmd_auto(msg: types.Message):
         f"<b>Команды:</b>\n"
         f"/auto_on — включить общий\n"
         f"/auto_off — выключить общий\n"
-        f"/sig_off TYPE — выключить тип (STANDARD/SURGE/PULLBACK/BB_SQUEEZE)\n"
+        f"/sig_off TYPE — выключить тип (STANDARD/SURGE/PULLBACK/BB_SQUEEZE/BB_LOWER)\n"
         f"/sig_on TYPE — включить тип\n"
         f"/btc_filter — статус BTC-фильтра\n"
         f"/cooldown — список монет в кулдауне ({POST_TRADE_COOLDOWN_HOURS}ч)\n"
@@ -1670,12 +1702,12 @@ async def cmd_sig_on(msg: types.Message):
     if len(parts) != 2:
         await msg.answer(
             "Использование: <code>/sig_on TYPE</code>\n"
-            "TYPE: STANDARD, SURGE, PULLBACK или BB_SQUEEZE\n"
+            "TYPE: STANDARD, SURGE, PULLBACK, BB_SQUEEZE или BB_LOWER\n"
             "Пример: <code>/sig_on PULLBACK</code>"
         )
         return
     sig_type = parts[1].upper()
-    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE"):
+    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"):
         await msg.answer("❌ TYPE должен быть STANDARD, SURGE, PULLBACK или BB_SQUEEZE.")
         return
     auto_state.set_signal_toggle(sig_type, True)
@@ -1698,12 +1730,12 @@ async def cmd_sig_off(msg: types.Message):
     if len(parts) != 2:
         await msg.answer(
             "Использование: <code>/sig_off TYPE</code>\n"
-            "TYPE: STANDARD, SURGE, PULLBACK или BB_SQUEEZE\n"
+            "TYPE: STANDARD, SURGE, PULLBACK, BB_SQUEEZE или BB_LOWER\n"
             "Пример: <code>/sig_off PULLBACK</code>"
         )
         return
     sig_type = parts[1].upper()
-    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE"):
+    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"):
         await msg.answer("❌ TYPE должен быть STANDARD, SURGE, PULLBACK или BB_SQUEEZE.")
         return
     auto_state.set_signal_toggle(sig_type, False)

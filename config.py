@@ -10,7 +10,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
 # ---------- Scanner core ----------
-SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "10"))
+SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "1"))  # 1 мин ≈ почти непрерывно
 ALERT_COOLDOWN_HOURS = int(os.getenv("ALERT_COOLDOWN_HOURS", "6"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "6"))
 MIN_STARS_TO_ALERT = int(os.getenv("MIN_STARS_TO_ALERT", "1"))
@@ -22,7 +22,7 @@ MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "3000000"))
 # ---------- STANDARD signal (soft profile: earlier entries) ----------
 PRICE_CHANGE_4H_MIN = float(os.getenv("PRICE_CHANGE_4H_MIN", "2.0"))
 PRICE_CHANGE_4H_MAX = float(os.getenv("PRICE_CHANGE_4H_MAX", "10.0"))
-OI_CHANGE_4H_MIN = float(os.getenv("OI_CHANGE_4H_MIN", "6.0"))
+OI_CHANGE_4H_MIN = float(os.getenv("OI_CHANGE_4H_MIN", "4.0"))
 OI_CHANGE_24H_2STAR = float(os.getenv("OI_CHANGE_24H_2STAR", "15.0"))
 VOLUME_SPIKE_MIN = float(os.getenv("VOLUME_SPIKE_MIN", "1.2"))
 VOLUME_SPIKE_2STAR = float(os.getenv("VOLUME_SPIKE_2STAR", "1.8"))
@@ -42,43 +42,56 @@ ENABLE_PULLBACK = os.getenv("ENABLE_PULLBACK", "true").lower() == "true"
 PULLBACK_RSI_1H_MIN = float(os.getenv("PULLBACK_RSI_1H_MIN", "42"))
 PULLBACK_RSI_1H_MAX = float(os.getenv("PULLBACK_RSI_1H_MAX", "58"))
 PULLBACK_EMA_DISTANCE_PCT = float(os.getenv("PULLBACK_EMA_DISTANCE_PCT", "2.0"))
-PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "8.0"))
+PULLBACK_OI_24H_MIN = float(os.getenv("PULLBACK_OI_24H_MIN", "5.0"))
 PULLBACK_OI_1H_MIN = float(os.getenv("PULLBACK_OI_1H_MIN", "-1.0"))
 
 # ---------- BB SQUEEZE signal (15m, strict preset) ----------
 ENABLE_BB_SQUEEZE = os.getenv("ENABLE_BB_SQUEEZE", "true").lower() == "true"
-# Log the exact reason each coin got rejected (INFO level) — turn on when tuning
-BB_DEBUG_LOG = os.getenv("BB_DEBUG_LOG", "false").lower() == "true"
-BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))          # BB period on 15m
-BB_MULT = float(os.getenv("BB_MULT", "2.0"))
-# Timeframe for the squeeze itself (Bybit interval string: "15", "60", "240"...)
-BB_TIMEFRAME = os.getenv("BB_TIMEFRAME", "15")
-# Squeeze = Bollinger Bands fully inside Keltner Channel (John Carter / TTM Squeeze
-# definition — self-adaptive to each coin's own volatility, no hand-tuned % thresholds)
-KC_ATR_PERIOD = int(os.getenv("KC_ATR_PERIOD", "20"))
-KC_MULT = float(os.getenv("KC_MULT", "1.5"))
-# Squeeze must have been ON at some point in the last N bars (fresh, not stale)
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))          # классика: Length 20
+BB_MULT = float(os.getenv("BB_MULT", "2.0"))            # классика: Deviation 2.0
+# После squeeze полосы должны начать расширяться (истинный пробой, не укол)
+BB_REQUIRE_EXPANSION = os.getenv("BB_REQUIRE_EXPANSION", "true").lower() == "true"
+# Отсев ложного пробоя: close снова внутри полос после укола upper
+BB_REJECT_FALSE_BREAKOUT = os.getenv("BB_REJECT_FALSE_BREAKOUT", "true").lower() == "true"
+# Squeeze on 15m: bandwidth in lower percentile of lookback OR below absolute max
+BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 48×15m ≈ 12h
+BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "20"))  # bottom 20%
+BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "4.5"))  # % hard cap
+# Squeeze must have been present in the last N bars (fresh, not stale)
 BB_SQUEEZE_FRESH_BARS = int(os.getenv("BB_SQUEEZE_FRESH_BARS", "6"))  # 6×15m ≈ 1.5h
-# Confirm the breakout is a real expansion, not a one-bar poke: current bandwidth
-# must be at least this many times the tightest bandwidth seen during the fresh
-# squeeze window ("полосы резко расходятся")
-BB_BW_EXPANSION_MIN = float(os.getenv("BB_BW_EXPANSION_MIN", "1.15"))
-# Breakout volume: current bar vol vs avg of prior 20 bars
-BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.3"))
-# No pullback-window gate anymore (removed — it was the main reason zero signals
-# ever fired: a 0.15–1.2% retracement window is almost never caught by a 10-min
-# scan on 15m bars). Pullback % is still computed and shown in the alert, just
-# not used to accept/reject the signal.
-BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "60"))  # RSI on BB_TIMEFRAME
-BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "6.0"))
-# Устойчивый приток: раньше требовалось 24h И 4h одновременно (слишком редко
-# совпадает) — теперь любого из двух окон достаточно
-BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "2.5"))
-# Анти-параболика: макс. рост цены за последние 2 бара от локального low
-BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "4.5"))
-# Откат должен удерживаться выше mid BB (поддержка после пробоя).
-# Поставьте false в переменных окружения, чтобы временно отключить.
+# Breakout volume: current 15m vol vs avg of prior 20 bars
+BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.15"))
+# After squeeze: close above upper band on 15m, then small pullback entry
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "1.8"))
+BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "65"))  # RSI 15m
+BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "4.0"))
+# Доп. подтверждение притока (не только 24h-всплеск / short cover)
+BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "1.5"))
+# Анти-параболика: макс. рост цены за последние 2×15m от локального low
+BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "6.0"))
+# Откат должен удерживаться выше mid BB (поддержка после пробоя)
 BB_REQUIRE_ABOVE_MID = os.getenv("BB_REQUIRE_ABOVE_MID", "true").lower() == "true"
+# Keltner Channels (TTM-style squeeze filter for BB)
+KC_EMA_PERIOD = int(os.getenv("KC_EMA_PERIOD", "20"))
+KC_ATR_PERIOD = int(os.getenv("KC_ATR_PERIOD", "10"))
+KC_ATR_MULT = float(os.getenv("KC_ATR_MULT", "1.5"))
+# BB inside KC recently = confirmed squeeze
+BB_REQUIRE_KC_SQUEEZE = os.getenv("BB_REQUIRE_KC_SQUEEZE", "true").lower() == "true"
+# Lookback bars for "was inside KC" (fresh squeeze)
+BB_KC_SQUEEZE_BARS = int(os.getenv("BB_KC_SQUEEZE_BARS", "6"))
+# Optional: breakout should clear Keltner upper too
+BB_REQUIRE_KC_BREAKOUT = os.getenv("BB_REQUIRE_KC_BREAKOUT", "false").lower() == "true"
+
+# ---------- BB LOWER: лонг от нижней полосы в 24h-аптренде ----------
+ENABLE_BB_LOWER = os.getenv("ENABLE_BB_LOWER", "true").lower() == "true"
+# Монета в восходящем тренде за 24ч (мин. рост цены %)
+BB_LOWER_TREND_24H_MIN = float(os.getenv("BB_LOWER_TREND_24H_MIN", "2.0"))
+# Пробой нижней BB: close 15m ниже lower (не фитиль)
+# Предыдущий close должен быть >= lower (первый пробой, не давно «под полосой»)
+BB_LOWER_RSI_MAX = float(os.getenv("BB_LOWER_RSI_MAX", "45"))  # 15m не перекуплен
+BB_LOWER_RSI_MIN = float(os.getenv("BB_LOWER_RSI_MIN", "20"))  # не мёртвый дамп
+# Макс. «прокол» ниже lower — слишком глубоко = тренд ломается
+BB_LOWER_MAX_BREAK_PCT = float(os.getenv("BB_LOWER_MAX_BREAK_PCT", "1.5"))
 
 # ---------- EMA filter ----------
 USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"
@@ -86,7 +99,7 @@ EMA_PERIOD = int(os.getenv("EMA_PERIOD", "50"))
 EMA_PULLBACK_PERIOD = int(os.getenv("EMA_PULLBACK_PERIOD", "21"))
 
 # ---------- BTC filter ----------
-BTC_MIN_1H_CHANGE = float(os.getenv("BTC_MIN_1H_CHANGE", "-0.5"))
+BTC_MIN_1H_CHANGE = float(os.getenv("BTC_MIN_1H_CHANGE", "-1.5"))
 
 # ---------- Trade parameters ----------
 TP1_PCT = float(os.getenv("TP1_PCT", "2.0"))
@@ -150,6 +163,9 @@ AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 # BB Squeeze auto trade
 AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.0"))
 AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.2"))
+# BB_LOWER uses same TP/SL as BB by default
+AUTO_BB_LOWER_TP_PCT = float(os.getenv("AUTO_BB_LOWER_TP_PCT", str(AUTO_BB_TP_PCT)))
+AUTO_BB_LOWER_SL_PCT = float(os.getenv("AUTO_BB_LOWER_SL_PCT", str(AUTO_BB_SL_PCT)))
 
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
@@ -158,11 +174,11 @@ CONSECUTIVE_LOSS_BLOCK = int(os.getenv("CONSECUTIVE_LOSS_BLOCK", "3"))
 
 # Which signal types are eligible for auto-trade
 AUTO_TRADE_SIGNAL_TYPES = os.getenv(
-    "AUTO_TRADE_SIGNAL_TYPES", "STANDARD,SURGE,PULLBACK,BB_SQUEEZE"
+    "AUTO_TRADE_SIGNAL_TYPES", "STANDARD,SURGE,PULLBACK,BB_SQUEEZE,BB_LOWER"
 )
 
 # Reconciliation interval (sec)
-RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "30"))
+RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "15"))
 
 # Post-trade cooldown
 POST_TRADE_COOLDOWN_HOURS = int(os.getenv("POST_TRADE_COOLDOWN_HOURS", "48"))
@@ -175,6 +191,18 @@ AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))
 AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
 AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.0"))
 AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.6"))
+AUTO_TP1_TRIGGER_PCT_BB_LOWER = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB_LOWER", str(AUTO_TP1_TRIGGER_PCT_BB)))
+AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_LOWER", str(AUTO_TRAIL_DISTANCE_PCT_BB)))
+
+# Ранний безубыток (BE): после +X% переносим SL на цену входа (+ крошечный буфер)
+AUTO_BE_ENABLED = os.getenv("AUTO_BE_ENABLED", "true").lower() == "true"
+AUTO_BE_TRIGGER_PCT = float(os.getenv("AUTO_BE_TRIGGER_PCT", "0.6"))
+AUTO_BE_BUFFER_PCT = float(os.getenv("AUTO_BE_BUFFER_PCT", "0.05"))  # SL чуть выше entry
+
+# Выход по слому структуры: close ниже EMA50
+STRUCTURE_EXIT_ENABLED = os.getenv("STRUCTURE_EXIT_ENABLED", "true").lower() == "true"
+STRUCTURE_EXIT_EMA_1H = os.getenv("STRUCTURE_EXIT_EMA_1H", "true").lower() == "true"
+STRUCTURE_EXIT_EMA_15M = os.getenv("STRUCTURE_EXIT_EMA_15M", "true").lower() == "true"
 
 # BTC trend filter for auto-entry
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"

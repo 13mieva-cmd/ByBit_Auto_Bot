@@ -14,6 +14,7 @@ from config import (
     POSITION_SIZE_USD, AUTO_TP_PCT, AUTO_HARD_SL_PCT,
     AUTO_PULLBACK_TP_PCT, AUTO_PULLBACK_SL_PCT,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
+    AUTO_BB_LOWER_TP_PCT, AUTO_BB_LOWER_SL_PCT,
     MAX_AUTO_POSITIONS, DAILY_LOSS_LIMIT_USD, CONSECUTIVE_LOSS_BLOCK,
     AUTO_TRADE_SIGNAL_TYPES, RECONCILE_INTERVAL_SEC,
     POST_TRADE_COOLDOWN_HOURS,
@@ -24,7 +25,12 @@ from config import (
     AUTO_TRAIL_ENABLED, AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT,
     AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB,
     AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB,
+    AUTO_TP1_TRIGGER_PCT_BB_LOWER, AUTO_TRAIL_DISTANCE_PCT_BB_LOWER,
+    AUTO_BE_ENABLED, AUTO_BE_TRIGGER_PCT, AUTO_BE_BUFFER_PCT,
+    STRUCTURE_EXIT_ENABLED, STRUCTURE_EXIT_EMA_1H, STRUCTURE_EXIT_EMA_15M,
+    EMA_PERIOD, BYBIT_BASE_URL as _BYBIT_BASE,
 )
+from indicators import calculate_ema
 from trader import BybitTrader
 
 log = logging.getLogger("auto")
@@ -168,6 +174,9 @@ class AutoTrader:
             elif sig_type == "BB_SQUEEZE":
                 tp_pct = AUTO_BB_TP_PCT
                 sl_pct = AUTO_BB_SL_PCT
+            elif sig_type == "BB_LOWER":
+                tp_pct = AUTO_BB_LOWER_TP_PCT
+                sl_pct = AUTO_BB_LOWER_SL_PCT
             else:
                 tp_pct = AUTO_TP_PCT
                 sl_pct = AUTO_HARD_SL_PCT
@@ -267,10 +276,117 @@ class AutoTrader:
         bybit_map = {p["symbol"]: p for p in bybit_positions}
         for symbol in list(self.state.active_positions.keys()):
             if symbol in bybit_map:
+                live = bybit_map[symbol]
+                # 1) Слом структуры → market close
+                if STRUCTURE_EXIT_ENABLED:
+                    closed = await self.maybe_structure_exit(symbol, live)
+                    if closed:
+                        continue
+                # 2) Ранний BE
+                if AUTO_BE_ENABLED:
+                    await self.maybe_move_to_be(symbol, live)
+                # 3) Трейлинг после TP1
                 if AUTO_TRAIL_ENABLED:
-                    await self.maybe_activate_trailing(symbol, bybit_map[symbol])
+                    await self.maybe_activate_trailing(symbol, live)
                 continue
             await self.handle_closed_position(symbol)
+
+
+    async def _fetch_closes(self, symbol: str, interval: str, limit: int) -> list[float]:
+        """Публичные klines Bybit → список close."""
+        try:
+            base = (BYBIT_PUBLIC or "https://api-demo.bybit.com").rstrip("/")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{base}/v5/market/kline",
+                    params={
+                        "category": "linear",
+                        "symbol": symbol,
+                        "interval": interval,
+                        "limit": limit,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as r:
+                    data = await r.json(content_type=None)
+            if not isinstance(data, dict) or data.get("retCode") != 0:
+                return []
+            rows = data.get("result", {}).get("list", [])
+            # newest first → reverse
+            closes = [float(k[4]) for k in reversed(rows)]
+            return closes
+        except Exception as e:
+            log.warning(f"klines {symbol} {interval}: {e}")
+            return []
+
+    async def maybe_move_to_be(self, symbol: str, live_pos: dict) -> None:
+        """После +AUTO_BE_TRIGGER_PCT% перенести SL на entry (+ буфер)."""
+        tracked = self.state.active_positions.get(symbol)
+        if not tracked or tracked.get("be_active") or tracked.get("trailing_active"):
+            return
+        entry = tracked.get("entry_price") or 0
+        mark = live_pos.get("mark_price") or 0
+        if entry <= 0 or mark <= 0:
+            return
+        gain_pct = (mark - entry) / entry * 100
+        if gain_pct < AUTO_BE_TRIGGER_PCT:
+            return
+        sl_price = entry * (1 + AUTO_BE_BUFFER_PCT / 100)
+        # Не ставить SL выше рынка
+        if sl_price >= mark:
+            sl_price = entry
+        res = await self.trader.set_stop_loss(symbol, sl_price)
+        base = symbol.replace("USDT", "")
+        if res.get("ok"):
+            tracked["be_active"] = True
+            tracked["sl_price"] = res.get("sl_price", sl_price)
+            self.state._save()
+            await self.notify(
+                f"🛡 <b>{base}</b>: +{gain_pct:.2f}% — SL в <b>безубыток</b>\n"
+                f"Стоп ≈ <code>{tracked['sl_price']:.6g}</code> (entry +{AUTO_BE_BUFFER_PCT}%)\n"
+                f"<i>Дальше риск по позиции ≈ 0, ждём TP / трейлинг / структуру.</i>"
+            )
+        else:
+            log.warning(f"BE failed {symbol}: {res}")
+
+    async def maybe_structure_exit(self, symbol: str, live_pos: dict) -> bool:
+        """True если позицию закрыли по слому EMA50 (1h и/или 15m)."""
+        tracked = self.state.active_positions.get(symbol)
+        if not tracked:
+            return False
+        reasons = []
+        if STRUCTURE_EXIT_EMA_1H:
+            closes_1h = await self._fetch_closes(symbol, "60", EMA_PERIOD + 5)
+            if len(closes_1h) >= EMA_PERIOD:
+                ema = calculate_ema(closes_1h, EMA_PERIOD)
+                last = closes_1h[-1]
+                if ema is not None and last < ema:
+                    reasons.append(f"1h close {last:.6g} < EMA50 {ema:.6g}")
+        if STRUCTURE_EXIT_EMA_15M:
+            closes_15 = await self._fetch_closes(symbol, "15", EMA_PERIOD + 5)
+            if len(closes_15) >= EMA_PERIOD:
+                ema = calculate_ema(closes_15, EMA_PERIOD)
+                last = closes_15[-1]
+                if ema is not None and last < ema:
+                    reasons.append(f"15m close {last:.6g} < EMA50 {ema:.6g}")
+        if not reasons:
+            return False
+        base = symbol.replace("USDT", "")
+        res = await self.trader.close_position_market(symbol)
+        reason = "; ".join(reasons)
+        if res.get("ok"):
+            await self.notify(
+                f"📉 <b>{base}</b> — выход по <b>слому структуры</b>\n"
+                f"{reason}\n"
+                f"<i>Close ниже EMA50 — тренд развернулся, не ждём полный SL.</i>"
+            )
+            # let next reconcile / closed handler book PnL
+            await self.handle_closed_position(symbol)
+            return True
+        log.warning(f"structure exit failed {symbol}: {res}")
+        await self.notify(
+            f"⚠️ <b>{base}</b>: слом структуры ({reason}), но close не прошёл: {res.get('error')}"
+        )
+        return False
 
     async def maybe_activate_trailing(self, symbol: str, live_pos: dict):
         """Когда цена прошла TP1-триггер — снять фиксированный TP и включить
@@ -287,6 +403,8 @@ class AutoTrader:
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB
         elif tracked.get("signal_type") == "BB_SQUEEZE":
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB
+        elif tracked.get("signal_type") == "BB_LOWER":
+            trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_BB_LOWER, AUTO_TRAIL_DISTANCE_PCT_BB_LOWER
         else:
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT
         if gain_pct < trigger:

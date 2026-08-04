@@ -492,6 +492,30 @@ class BybitTrader:
         return isinstance(resp, dict) and resp.get("retCode") == 0
 
 
+
+    async def set_stop_loss(self, symbol: str, sl_price: float) -> dict:
+        """Поставить/перенести только Stop Loss на абсолютную цену (для BE)."""
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": "no instrument info"}
+        await self.ensure_position_mode()
+        sl = self._round_price(sl_price, info["tick_size"])
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "stopLoss": self._fmt(sl, info["tick_size"]),
+            "tpslMode": "Full",
+            "slTriggerBy": "LastPrice",
+            "positionIdx": self.position_idx_for("Buy"),
+        }
+        resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
+        if not isinstance(resp, dict):
+            return {"ok": False, "error": f"invalid response: {resp!r}"}
+        if resp.get("retCode") not in (0, 34040):
+            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
+        return {"ok": True, "sl_price": sl}
+
     async def set_trailing_stop(self, symbol: str, trail_pct: float) -> dict:
         """Включить биржевой трейлинг-стоп. trail_pct — дистанция в % от цены.
         Снимает фиксированный TP, оставляет SL как трейлинг."""
