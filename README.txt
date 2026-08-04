@@ -71,3 +71,38 @@ Known caveats (unchanged):
 
 NOTE: inflow_scanner_v4_full.py, if still present anywhere as a separate stale
 file in the repo, should be deleted — the real file is scanner.py per Procfile.
+
+=== Follow-up audit: full logic/math re-check ===
+
+Bugs found and fixed this pass:
+  - try_pullback() (scanner.py): the "EMA50 must be rising" guard computed a
+    50-period EMA on a 10-bar slice (closes_1h[-15:-5]) — calculate_ema always
+    returns None when given fewer than `period` values, so this check could
+    never actually reject anything. It's been silently dead since before this
+    conversation started. Fixed to use closes_1h[:-5] (enough history for a
+    real EMA_PERIOD-length calculation), giving a legitimate "EMA50 as of 5
+    bars ago" to compare against. Verified: a genuinely declining EMA50 now
+    correctly blocks the signal; a genuinely rising one still passes.
+  - storage.py: default alerts_by_type / signal_toggles dicts didn't list
+    BB_LOWER (only mattered cosmetically — every read path already used
+    .get(key, default), so nothing crashed, but a fresh deployment wouldn't
+    show "BB_LOWER: 0" until the first one ever fired). Added for consistency.
+
+Math finding fixed:
+  - AUTO_BE_BUFFER_PCT was 0.05%, but round-trip taker fees (~0.055% x2 =
+    0.11%) exceed that — the "breakeven" stop was actually locking in a small
+    net loss (~$0.15 on a $250 position) whenever it triggered, not a true
+    breakeven. Raised default to 0.15% (covers fees + a small real margin).
+
+Verified clean (re-checked, no issues found):
+  - Risk math across all 5 signal types (STANDARD/SURGE, PULLBACK, BB_SQUEEZE,
+    BB_LOWER): R:R ratios, breakeven win rates, liquidation buffers (5-8.3x),
+    daily-loss-limit buffer (5-8.3 stops) — all internally consistent.
+  - BE-stop trigger (0.6%) fires before the trailing-stop trigger for every
+    signal type, confirmed no ordering conflict.
+  - periodic_scanner's loop is sequential (scan, then sleep) — cannot overlap
+    even at SCAN_INTERVAL_MIN=1; a slow scan just pushes the next one later,
+    doesn't stack. Not a bug.
+  - try_standard, try_surge unchanged and logically sound.
+  - Full cross-import check (config.py <-> scanner.py/auto_trade.py/
+    backtest.py): 0 missing names. Full compile: all 8 files clean.

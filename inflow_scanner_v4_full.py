@@ -465,8 +465,10 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
         return None
 
     # EMA50 должна РАСТИ — иначе тренд выдыхается
-    if len(closes_1h) >= 15:
-        ema50_old = calculate_ema(closes_1h[-15:-5], EMA_PERIOD)
+    # (было: считали EMA50 на срезе из 10 баров — calculate_ema всегда возвращал
+    # None на менее чем `period` значениях, проверка никогда не срабатывала)
+    if len(closes_1h) >= EMA_PERIOD + 5:
+        ema50_old = calculate_ema(closes_1h[:-5], EMA_PERIOD)
         if ema50_old is not None and d["ema50_1h"] <= ema50_old * 1.002:
             return None
 

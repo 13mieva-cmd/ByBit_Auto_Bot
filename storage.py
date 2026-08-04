@@ -137,7 +137,7 @@ class StatsStore(JsonStore):
             "timeouts": 0,
             "last_reset_day": "",
             "alerts_by_star": {"1": 0, "2": 0, "3": 0},
-            "alerts_by_type": {"STANDARD": 0, "SURGE": 0, "PULLBACK": 0, "BB_SQUEEZE": 0},
+            "alerts_by_type": {"STANDARD": 0, "SURGE": 0, "PULLBACK": 0, "BB_SQUEEZE": 0, "BB_LOWER": 0},
         })
 
     def reset_daily_if_needed(self, today: str):
@@ -175,6 +175,7 @@ class AutoStateStore(JsonStore):
                 "SURGE": True,
                 "PULLBACK": True,
                 "BB_SQUEEZE": True,
+                "BB_LOWER": True,
             },
             "post_trade_cooldown": {},  # symbol -> expiration timestamp
             "btc_filter_enabled": True,
