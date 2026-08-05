@@ -1,4 +1,4 @@
-"""Indicators: RSI, EMA, Bollinger Bands, sparkline."""
+"""Indicators: RSI, EMA, Bollinger, Keltner, ATR, sparkline."""
 import math
 from typing import Optional
 
@@ -52,13 +52,17 @@ def calculate_bollinger(
 
 
 def calculate_atr(
-    highs: list[float], lows: list[float], closes: list[float], period: int = 20
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    period: int = 10,
 ) -> Optional[float]:
-    """Average True Range (Wilder smoothing)."""
-    if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+    """Wilder ATR on the last bar."""
+    n = len(closes)
+    if n < period + 1 or len(highs) != n or len(lows) != n:
         return None
     trs = []
-    for i in range(1, len(closes)):
+    for i in range(1, n):
         tr = max(
             highs[i] - lows[i],
             abs(highs[i] - closes[i - 1]),
@@ -74,30 +78,33 @@ def calculate_atr(
 
 
 def calculate_keltner(
-    highs: list[float], lows: list[float], closes: list[float],
-    ema_period: int = 20, atr_period: int = 10, mult: float = 1.5
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    ema_period: int = 20,
+    atr_period: int = 10,
+    atr_mult: float = 1.5,
 ) -> Optional[dict]:
-    """Keltner Channel: EMA(ema_period) basis ± mult × ATR(atr_period)."""
-    if len(closes) < ema_period:
+    """Keltner Channels: EMA ± ATR * mult."""
+    if len(closes) < max(ema_period, atr_period) + 1:
         return None
-    basis = calculate_ema(closes, ema_period)
+    mid = calculate_ema(closes, ema_period)
     atr = calculate_atr(highs, lows, closes, atr_period)
-    if basis is None or atr is None:
+    if mid is None or atr is None:
         return None
     return {
-        "upper": basis + mult * atr,
-        "middle": basis,
-        "lower": basis - mult * atr,
+        "upper": mid + atr_mult * atr,
+        "middle": mid,
+        "lower": mid - atr_mult * atr,
         "atr": atr,
     }
 
 
 def bb_inside_keltner(bb: dict, kc: dict) -> bool:
-    """True if Bollinger Bands are fully inside the Keltner Channel (TTM-style squeeze)."""
+    """TTM-style squeeze: entire Bollinger band inside Keltner channel."""
     if not bb or not kc:
         return False
-    return bb["upper"] < kc["upper"] and bb["lower"] > kc["lower"]
-
+    return bb["upper"] <= kc["upper"] and bb["lower"] >= kc["lower"]
 
 
 def sparkline(values: list[float], width: int = 10) -> str:

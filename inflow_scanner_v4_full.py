@@ -369,7 +369,7 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) ->
         except (ValueError, TypeError, IndexError):
             vol_spike_15m = 0.0
 
-    funding_rate = c.get("funding_rate")
+    funding_rate = await get_funding_rate(session, symbol)
 
     base_data = {
         "symbol": symbol,
@@ -510,11 +510,8 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
         return None
 
     # EMA50 должна РАСТИ — иначе тренд выдыхается
-    # (calculate_ema на срезе короче period всегда возвращает None — проверка
-    # на closes_1h[-15:-5] с EMA_PERIOD=50 никогда не срабатывала, т.к. срез
-    # всего 10 баров < 50. Нужно достаточно истории для честного расчёта.)
-    if len(closes_1h) >= EMA_PERIOD + 5:
-        ema50_old = calculate_ema(closes_1h[:-5], EMA_PERIOD)
+    if len(closes_1h) >= 15:
+        ema50_old = calculate_ema(closes_1h[-15:-5], EMA_PERIOD)
         if ema50_old is not None and d["ema50_1h"] <= ema50_old * 1.002:
             return None
 
@@ -936,17 +933,11 @@ async def scan_once(session) -> list[dict]:
         if (time.time() - last_alert.get(symbol, 0)) < ALERT_COOLDOWN_HOURS * 3600:
             continue
 
-        try:
-            funding_rate = float(tk.get("fundingRate")) if tk.get("fundingRate") is not None else None
-        except (ValueError, TypeError):
-            funding_rate = None
-
         candidates.append({
             "symbol": symbol,
             "volume_24h": turnover,
             "age_days": (now_ms - launch_time) // 86_400_000,
             "ticker_pc24": pc24,
-            "funding_rate": funding_rate,
         })
 
     # Самые активные по обороту — в работу первые MAX_SCAN_SYMBOLS
@@ -1318,7 +1309,7 @@ async def cmd_start(msg: types.Message):
         "💚 Smart hold: при растущем OI бот скажет «держи»\n\n"
         "<b>Команды:</b>\n"
         "/scan — ручной скан\n"
-        "/backtest — бэктест BB_SQUEEZE\n"
+        "/backtest — бэктест BB_LOWER v2\n"
         "/settings /positions /stats\n"
         "/top_oi /active /ignored /unignore SYM\n"
         "/add SYM PRICE /remove SYM\n\n"
@@ -1426,7 +1417,7 @@ async def cmd_backtest(msg: types.Message):
         days = max(3, min(int(parts[3]), 60))
 
     await msg.answer(
-        f"⏳ Backtest BB_LOWER "
+        f"⏳ Backtest BB_LOWER v2 "
         f"{'TOP' + str(top_n) if mode == 'top' else symbol} "
         f"за {days}д… это может занять 1–3 мин."
     )

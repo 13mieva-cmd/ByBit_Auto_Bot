@@ -141,7 +141,7 @@ class AutoTrader:
                     )
                     return
 
-            # BB_LOWER: вход только если close 15m ниже lower BB
+            # BB_LOWER: сигнал валиден (reclaim / close-ok флаг из сканера)
             if sig_type == "BB_LOWER":
                 if not signal.get("bb_lower_close_ok"):
                     log.info(f"{signal['symbol']}: BB_LOWER without close<lower flag, skip")
@@ -237,14 +237,20 @@ class AutoTrader:
             # что использовалась при расчёте TP/SL до входа. Переставляем на бирже.
             adjust_result = await self.trader.set_tpsl_from_fill(symbol, tp_pct, sl_pct)
             if sig_type == "BB_LOWER" and signal.get("tp_price_abs") and signal.get("sl_price_abs"):
-                abs_res = await self.trader.set_tpsl_prices(
-                    symbol,
-                    float(signal["tp_price_abs"]),
-                    float(signal["sl_price_abs"]),
-                )
+                # Сдвинуть уровни BB на дельту fill vs signal price (проскальзывание)
+                sig_px = float(signal.get("price") or 0) or float(pos["entry_price"])
+                fill_px = float(pos["entry_price"])
+                delta = fill_px - sig_px
+                tp_abs = float(signal["tp_price_abs"]) + delta
+                sl_abs = float(signal["sl_price_abs"]) + delta
+                if sl_abs >= fill_px:
+                    sl_abs = fill_px * (1 - float(signal.get("sl_pct") or AUTO_BB_LOWER_SL_PCT) / 100)
+                if tp_abs <= fill_px:
+                    tp_abs = fill_px * (1 + float(signal.get("tp_pct") or AUTO_BB_LOWER_TP_PCT) / 100)
+                abs_res = await self.trader.set_tpsl_prices(symbol, tp_abs, sl_abs)
                 if abs_res.get("ok"):
                     adjust_result = abs_res
-                    log.info(f"{symbol}: BB_LOWER structure TP/SL applied")
+                    log.info(f"{symbol}: BB_LOWER structure TP/SL applied (delta={delta:.6g})")
                 else:
                     log.warning(f"{symbol}: structure TPSL failed {abs_res}")
             if adjust_result.get("ok"):
@@ -391,7 +397,8 @@ class AutoTrader:
                 last = closes_1h[-1]
                 if ema is not None and last < ema:
                     reasons.append(f"1h close {last:.6g} < EMA50 {ema:.6g}")
-        if STRUCTURE_EXIT_EMA_15M:
+        # 15m EMA50 exit: skip for BB_LOWER (entry near lower band often already < EMA50 15m)
+        if STRUCTURE_EXIT_EMA_15M and tracked.get("signal_type") != "BB_LOWER":
             closes_15 = await self._fetch_closes(symbol, "15", EMA_PERIOD + 5)
             if len(closes_15) >= EMA_PERIOD:
                 ema = calculate_ema(closes_15, EMA_PERIOD)

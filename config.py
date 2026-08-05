@@ -225,12 +225,12 @@ AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_L
 # Ранний безубыток (BE): после +X% переносим SL на цену входа (+ крошечный буфер)
 AUTO_BE_ENABLED = os.getenv("AUTO_BE_ENABLED", "true").lower() == "true"
 AUTO_BE_TRIGGER_PCT = float(os.getenv("AUTO_BE_TRIGGER_PCT", "0.6"))
-AUTO_BE_BUFFER_PCT = float(os.getenv("AUTO_BE_BUFFER_PCT", "0.05"))  # SL чуть выше entry
+AUTO_BE_BUFFER_PCT = float(os.getenv("AUTO_BE_BUFFER_PCT", "0.15"))  # ≥ round-trip fee ~0.11%
 
 # Выход по слому структуры: close ниже EMA50
 STRUCTURE_EXIT_ENABLED = os.getenv("STRUCTURE_EXIT_ENABLED", "true").lower() == "true"
 STRUCTURE_EXIT_EMA_1H = os.getenv("STRUCTURE_EXIT_EMA_1H", "true").lower() == "true"
-STRUCTURE_EXIT_EMA_15M = os.getenv("STRUCTURE_EXIT_EMA_15M", "true").lower() == "true"
+STRUCTURE_EXIT_EMA_15M = os.getenv("STRUCTURE_EXIT_EMA_15M", "false").lower() == "true"  # false: BB_LOWER entry near lower often < EMA50 15m
 
 # BTC trend filter for auto-entry
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
