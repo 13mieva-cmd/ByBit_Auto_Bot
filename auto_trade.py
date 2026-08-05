@@ -194,8 +194,8 @@ class AutoTrader:
                 tp_pct = AUTO_BB_TP_PCT
                 sl_pct = AUTO_BB_SL_PCT
             elif sig_type == "BB_LOWER":
-                tp_pct = AUTO_BB_LOWER_TP_PCT
-                sl_pct = AUTO_BB_LOWER_SL_PCT
+                tp_pct = float(signal.get("tp_pct") or AUTO_BB_LOWER_TP_PCT)
+                sl_pct = float(signal.get("sl_pct") or AUTO_BB_LOWER_SL_PCT)
             else:
                 tp_pct = AUTO_TP_PCT
                 sl_pct = AUTO_HARD_SL_PCT
@@ -236,6 +236,17 @@ class AutoTrader:
             # Ордер маркетный — реальная цена исполнения отличается от той,
             # что использовалась при расчёте TP/SL до входа. Переставляем на бирже.
             adjust_result = await self.trader.set_tpsl_from_fill(symbol, tp_pct, sl_pct)
+            if sig_type == "BB_LOWER" and signal.get("tp_price_abs") and signal.get("sl_price_abs"):
+                abs_res = await self.trader.set_tpsl_prices(
+                    symbol,
+                    float(signal["tp_price_abs"]),
+                    float(signal["sl_price_abs"]),
+                )
+                if abs_res.get("ok"):
+                    adjust_result = abs_res
+                    log.info(f"{symbol}: BB_LOWER structure TP/SL applied")
+                else:
+                    log.warning(f"{symbol}: structure TPSL failed {abs_res}")
             if adjust_result.get("ok"):
                 result["tp_price"] = adjust_result["tp_price"]
                 result["sl_price"] = adjust_result["sl_price"]

@@ -493,6 +493,33 @@ class BybitTrader:
 
 
 
+
+    async def set_tpsl_prices(self, symbol: str, tp_price: float, sl_price: float) -> dict:
+        """Поставить TP и SL по абсолютным ценам (mid/upper BB, low свечи)."""
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": "no instrument info"}
+        await self.ensure_position_mode()
+        tp = self._round_price(tp_price, info["tick_size"])
+        sl = self._round_price(sl_price, info["tick_size"])
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "takeProfit": self._fmt(tp, info["tick_size"]),
+            "stopLoss": self._fmt(sl, info["tick_size"]),
+            "tpslMode": "Full",
+            "tpTriggerBy": "LastPrice",
+            "slTriggerBy": "LastPrice",
+            "positionIdx": self.position_idx_for("Buy"),
+        }
+        resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
+        if not isinstance(resp, dict):
+            return {"ok": False, "error": f"invalid response: {resp!r}"}
+        if resp.get("retCode") not in (0, 34040):
+            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
+        return {"ok": True, "tp_price": tp, "sl_price": sl}
+
     async def set_stop_loss(self, symbol: str, sl_price: float) -> dict:
         """Поставить/перенести только Stop Loss на абсолютную цену (для BE)."""
         instruments = await self.get_instruments_cached()

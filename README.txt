@@ -206,6 +206,72 @@ Verified after this round: full compile + cross-import clean, try_bb_lower
 positive/negative regression re-confirmed (absorption candle fires, free-fall
 and downtrend correctly block), R:R back to 1:1.
 
+=== Follow-up: BB_LOWER v2 (reclaim entry + structural TP/SL) ===
+
+Significant, well-engineered redesign of BB_LOWER's entry/exit logic — kept
+as-is, this is a genuine improvement, not a regression:
+
+  - Entry changed from "close breaks below lower band" to "close dipped below
+    lower, THEN reclaimed back above it" (BB_LOWER_RECLAIM=true, toggle to
+    fall back to the old immediate-break entry). Waits for confirmation the
+    dip found support instead of buying mid-fall.
+  - New chop filter (BB_LOWER_MAX_CHOP_PIERCES): counts how many of the last
+    16 bars pierced their own lower band; rejects choppy/ranging conditions.
+    Verified: a deliberately sawtooth series with 4 pierces (> max 3) is
+    correctly rejected.
+  - SL is now structural: min(candle lows of the dip+reclaim bars, lower band
+    at both points) minus a small buffer — a real support-based stop instead
+    of a flat %. Capped at AUTO_BB_LOWER_SL_PCT (now 2.5%, down from the
+    10% we set two rounds ago) so it can never be wider than that regardless
+    of how far the structural level sits. This meaningfully improves the
+    liquidation buffer we flagged before: at a typical sub-2.5% structural
+    stop, buffer is well over the ~1.0x we had at SL=10%.
+  - TP now targets the middle Bollinger Band (mean-reversion target) as TP1,
+    upper band as a secondary TP2 reference, with a % fallback
+    (BB_LOWER_FALLBACK_TP_PCT=3.5%, capped at the upper band) if mid is too
+    close to be worth trading (< BB_LOWER_MIN_TP_PCT away).
+  - New confirmations: OI 24h/4h floors, funding-rate band (reject if too
+    positive/overheated or too negative), volume spike on the reclaim candle,
+    BTC 15m pause filter (separate from the existing BTC 1h filter).
+  - trader.py: new set_tpsl_prices(symbol, tp_price, sl_price) — sets TP/SL
+    by absolute price instead of %, tick-size rounded, hedge-mode aware,
+    same retCode-34040-is-ok pattern as the rest of the file. Clean.
+  - auto_trade.py: after placing the position with the existing %-based
+    flow (now using signal-provided tp_pct/sl_pct when present, falling back
+    to the flat config % otherwise), immediately re-applies the more precise
+    tp_price_abs/sl_price_abs via the new trader method if the signal
+    provided them. Correctly checked and logged either way.
+
+Fixed while merging this in:
+  - get_funding_rate() was being called as a fresh per-symbol API request
+    inside analyze_coin() for every candidate, every scan — but the bulk
+    get_tickers() call (already made once per scan) already includes
+    fundingRate for every symbol. At MAX_SCAN_SYMBOLS=80 and
+    SCAN_INTERVAL_MIN=1 this was up to 80 avoidable extra API calls/minute.
+    Now the funding rate is read from the ticker data already fetched during
+    pre-filtering and threaded through the candidate dict; get_funding_rate()
+    is no longer called (left defined, unused, in case it's wanted later).
+  - The same two regressions reappeared a FOURTH time (EMA50-rising dead
+    check, /backtest mislabeled as BB_SQUEEZE) — re-applied again. (The
+    third recurring one, the unreachable "close >= mid" check, no longer
+    applies since try_bb_lower was fully rewritten.)
+
+Known gap (not fixed, flagging clearly): backtest.py has its own independent
+_signal_at() that mirrors the OLD try_bb_lower (plain break-below entry, no
+reclaim, no chop/OI/funding/volume filters, no structural TP/SL) — it does
+NOT call the real try_bb_lower from scanner.py. Backtest results no longer
+represent what's actually trading live. Rewriting backtest.py's signal
+reconstruction to mirror BB_LOWER v2 would need its own pass — flag if you
+want that done next.
+
+Verified after this round: full compile + cross-import clean across all 8
+files. try_bb_lower v2 tested end-to-end: positive (reclaim) case fires with
+correct structural TP (mid band) and SL (tighter than the 2.5% cap in this
+case); all 10 individual negative gates confirmed blocking (no-reclaim,
+downtrend, EMA, BTC 15m/1h weakness, weak OI, funding too high/low, RSI too
+high, low volume) plus the chop-pierce filter tested separately and
+confirmed rejecting a deliberately choppy series.
+
 === Follow-up: BB_LOWER-only mode + wider SL/TP (explicit request) ===
 
   - BB_LOWER_TREND_24H_MIN: 2.0% -> 5.0%. The old 2% threshold barely

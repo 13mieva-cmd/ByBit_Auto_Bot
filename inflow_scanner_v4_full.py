@@ -43,7 +43,11 @@ from config import (
     KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
     BB_REQUIRE_KC_SQUEEZE, BB_KC_SQUEEZE_BARS, BB_REQUIRE_KC_BREAKOUT,
     ENABLE_BB_LOWER, BB_LOWER_TREND_24H_MIN,
-    BB_LOWER_RSI_MAX, BB_LOWER_RSI_MIN, BB_LOWER_MAX_BREAK_PCT,
+    BB_LOWER_RSI_MAX, BB_LOWER_RSI_MIN,
+    BB_LOWER_RECLAIM, BB_LOWER_OI_24H_MIN, BB_LOWER_OI_4H_MIN,
+    BB_LOWER_FUNDING_MAX, BB_LOWER_FUNDING_MIN, BB_LOWER_VOL_MIN,
+    BB_LOWER_BTC_15M_MIN, BB_LOWER_MAX_CHOP_PIERCES,
+    BB_LOWER_SL_BUFFER_PCT, BB_LOWER_MIN_TP_PCT, BB_LOWER_FALLBACK_TP_PCT,
     AUTO_BB_LOWER_TP_PCT, AUTO_BB_LOWER_SL_PCT,
     USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
     BTC_MIN_1H_CHANGE,
@@ -152,6 +156,39 @@ async def get_current_price(session, symbol):
         return None
 
 
+
+async def get_btc_15m_change(session) -> float:
+    """BTCUSDT % change on latest 15m bar."""
+    try:
+        kl = await get_klines(session, "BTCUSDT", "15", 3)
+        if not kl or len(kl) < 2:
+            return 0.0
+        rows = sorted(kl, key=lambda x: int(x[0]))
+        c0 = float(rows[-2][4])
+        c1 = float(rows[-1][4])
+        if c0 <= 0:
+            return 0.0
+        return (c1 - c0) / c0 * 100
+    except Exception:
+        return 0.0
+
+
+async def get_funding_rate(session, symbol: str) -> Optional[float]:
+    """Funding rate from ticker (decimal, e.g. 0.0001)."""
+    try:
+        data = await fetch_json(
+            session, f"{BYBIT_BASE}/v5/market/tickers",
+            {"category": "linear", "symbol": symbol},
+        )
+        lst = data.get("result", {}).get("list", [])
+        if not lst:
+            return None
+        fr = lst[0].get("fundingRate")
+        return float(fr) if fr is not None else None
+    except Exception:
+        return None
+
+
 async def get_btc_1h_change(session):
     klines = await get_klines(session, "BTCUSDT", "60", 1)
     if not klines:
@@ -162,7 +199,7 @@ async def get_btc_1h_change(session):
 
 # ---------- Analysis ----------
 
-async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
+async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) -> Optional[dict]:
     """Try all three signal types. Returns best match or None."""
     symbol = c["symbol"]
 
@@ -332,6 +369,8 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         except (ValueError, TypeError, IndexError):
             vol_spike_15m = 0.0
 
+    funding_rate = c.get("funding_rate")
+
     base_data = {
         "symbol": symbol,
         "price": current_price,
@@ -347,6 +386,7 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "rsi_4h": rsi_4h,
         "rsi_1h": rsi_1h,
         "btc_1h": btc_1h,
+        "btc_15m": btc_15m,
         "age_days": c["age_days"],
         "ema50_1h": ema50,
         "ema21_1h": ema21,
@@ -365,11 +405,13 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "kc_squeeze_hist": kc_squeeze_hist,
         "rsi_15m": rsi_15m,
         "vol_spike_15m": vol_spike_15m,
+        "funding_rate": funding_rate,
     }
 
     # ========== BB_LOWER first: 24h uptrend + close 15m < lower BB ==========
     if ENABLE_BB_LOWER:
-        bb_low = try_bb_lower(base_data, closes_15m, highs_15m, lows_15m)
+        vols_15 = [float(k[5]) for k in klines_15m] if klines_15m else []
+        bb_low = try_bb_lower(base_data, closes_15m, highs_15m, lows_15m, vols_15)
         if bb_low:
             return bb_low
 
@@ -666,96 +708,156 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
 
 
 
+
 def try_bb_lower(
     d: dict,
     closes_15m: list[float],
     highs_15m: list[float] | None = None,
     lows_15m: list[float] | None = None,
+    vols_15m: list[float] | None = None,
 ) -> Optional[dict]:
     """
-    Стратегия: 24h long-тренд → цена ушла под lower BB → ждём close 15m →
-    если тренд жив и нет блокеров → вход в лонг (оптимально у нижней полосы).
-
-    1) 24h цена в плюсе (long trend)
-    2) Close 15m < lower BB (остановка свечи ПОД полосой, не фитиль)
-    3) Свежий заход: prev close ещё был >= lower
-    4) Тренд не сломан: last/1h всё ещё у EMA50, BTC не в дампе
-    5) Оптимальный вход: свеча-отбой (не свободное падение) + RSI в зоне откупа
+    BB_LOWER v2:
+    24h long -> dip under lower -> reclaim close above lower ->
+    OI/funding/vol OK, BTC 15m OK, not choppy -> long
+    TP1=mid BB, TP2=upper, SL under low/lower.
     """
-    lower = d.get("bb_lower")
-    mid = d.get("bb_middle")
-    if lower is None or mid is None:
-        return None
-    if not closes_15m or len(closes_15m) < BB_PERIOD + 2:
+    if not closes_15m or len(closes_15m) < BB_PERIOD + 4:
         return None
 
-    # --- 1) Long trend 24h ---
     pc24 = d.get("price_change_24h") or 0
     if pc24 < BB_LOWER_TREND_24H_MIN:
         return None
 
-    # --- 2) Старший тренд жив (EMA50 1h) ---
-    # Сравниваем с 1h-контекстом; 15m может быть ниже lower, но структура 1h — long
     if USE_EMA_FILTER and d.get("ema50_1h") is not None:
-        ref = d.get("price")  # 1h close из base_data
+        ref = d.get("price")
         if ref is not None and ref < d["ema50_1h"]:
             return None
 
-    close = closes_15m[-1]
-    prev = closes_15m[-2]
-
-    # --- 3) Close 15m ниже lower BB (именно закрытие, не закол) ---
-    if close >= lower:
+    if (d.get("btc_15m") or 0) < BB_LOWER_BTC_15M_MIN:
         return None
-    if prev < lower:
-        return None  # уже давно под полосой — не первая остановка
 
-    break_pct = (lower - close) / lower * 100 if lower > 0 else 0
-    if break_pct > BB_LOWER_MAX_BREAK_PCT:
-        return None  # слишком глубоко = возможный слом, не «отбой от полосы»
+    oi24 = d.get("oi_change_24h")
+    oi4 = d.get("oi_change_4h")
+    if oi24 is None or oi24 < BB_LOWER_OI_24H_MIN:
+        return None
+    if oi4 is not None and oi4 < BB_LOWER_OI_4H_MIN:
+        return None
 
-    # --- 4) Оптимальный вход: свеча не в свободном падении ---
-    # Ищем отбой: close ближе к high свечи, чем к low (поглощение / остановка)
-    if highs_15m and lows_15m and len(highs_15m) >= 1 and len(lows_15m) >= 1:
-        hi = highs_15m[-1]
-        lo = lows_15m[-1]
-        rng = hi - lo
-        if rng > 0:
-            close_pos = (close - lo) / rng  # 0=на low, 1=на high
-            # Свободное падение: закрылись у минимумов
-            if close_pos < 0.25:
-                return None
+    fr = d.get("funding_rate")
+    if fr is not None:
+        if fr > BB_LOWER_FUNDING_MAX or fr < BB_LOWER_FUNDING_MIN:
+            return None
+
+    i = len(closes_15m) - 1
+    bb_now = calculate_bollinger(closes_15m[: i + 1], BB_PERIOD, BB_MULT)
+    bb_prev = calculate_bollinger(closes_15m[:i], BB_PERIOD, BB_MULT)
+    if not bb_now or not bb_prev:
+        return None
+
+    close = closes_15m[i]
+    prev = closes_15m[i - 1]
+    lower_now = bb_now["lower"]
+    lower_prev = bb_prev["lower"]
+    mid = bb_now["middle"]
+    upper = bb_now["upper"]
+
+    if BB_LOWER_RECLAIM:
+        if prev >= lower_prev:
+            return None
+        if close < lower_now:
+            return None
+    else:
+        if close >= lower_now:
+            return None
+
+    # Chop filter: pierces of lower in last ~4h (16 bars)
+    pierces = 0
+    look = min(16, i - BB_PERIOD)
+    for k in range(look):
+        end = i - k
+        if end < BB_PERIOD:
+            break
+        b = calculate_bollinger(closes_15m[: end + 1], BB_PERIOD, BB_MULT)
+        if b and closes_15m[end] < b["lower"]:
+            pierces += 1
+    if pierces > BB_LOWER_MAX_CHOP_PIERCES:
+        return None
+
+    vol_spike = 0.0
+    if vols_15m and len(vols_15m) >= 21:
+        avg_v = sum(vols_15m[i - 20 : i]) / 20
+        vol_spike = (vols_15m[i] / avg_v) if avg_v > 0 else 0.0
+        if vol_spike < BB_LOWER_VOL_MIN:
+            return None
+    else:
+        vol_spike = float(d.get("vol_spike_15m") or 0.0)
+        if vol_spike and vol_spike < BB_LOWER_VOL_MIN:
+            return None
 
     rsi_15 = d.get("rsi_15m")
     if rsi_15 is not None:
-        if rsi_15 > BB_LOWER_RSI_MAX:
-            return None
-        if rsi_15 < BB_LOWER_RSI_MIN:
+        if rsi_15 > BB_LOWER_RSI_MAX or rsi_15 < BB_LOWER_RSI_MIN:
             return None
 
-    # --- 5) Ничего не мешает long ---
-    if d.get("btc_1h", 0) < -1.0:
+    if (d.get("btc_1h") or 0) < -1.0:
         return None
 
+    # SL under min(lows, lower) - buffer
+    candle_low = prev
+    if lows_15m and len(lows_15m) > i - 1:
+        candle_low = min(candle_low, lows_15m[i - 1])
+    if lows_15m and len(lows_15m) > i:
+        candle_low = min(candle_low, lows_15m[i])
+    sl_raw = min(candle_low, lower_prev, lower_now)
+    sl_price = sl_raw * (1 - BB_LOWER_SL_BUFFER_PCT / 100)
+
+    entry = close
+    tp1, tp2 = mid, upper
+    tp1_pct = (tp1 - entry) / entry * 100 if entry > 0 else 0.0
+    if tp1_pct < BB_LOWER_MIN_TP_PCT:
+        tp_price = entry * (1 + BB_LOWER_FALLBACK_TP_PCT / 100)
+        if upper > entry:
+            tp_price = min(tp_price, upper)
+    else:
+        tp_price = tp1
+
+    max_sl = entry * (1 - AUTO_BB_LOWER_SL_PCT / 100)
+    if sl_price < max_sl:
+        sl_price = max_sl
+    if sl_price >= entry:
+        sl_price = entry * (1 - 0.5 / 100)
+
+    sl_pct = (entry - sl_price) / entry * 100 if entry > 0 else AUTO_BB_LOWER_SL_PCT
+    tp_pct = (tp_price - entry) / entry * 100 if entry > 0 else BB_LOWER_FALLBACK_TP_PCT
+
     stars = 1
-    if pc24 >= BB_LOWER_TREND_24H_MIN * 2 and break_pct <= 0.6:
+    if pc24 >= BB_LOWER_TREND_24H_MIN * 2 and (oi24 or 0) >= BB_LOWER_OI_24H_MIN * 1.5:
         stars = 2
-    if stars == 2 and (d.get("oi_change_24h") or 0) >= 3.0 and d.get("btc_1h", 0) >= -0.3:
+    if stars == 2 and (oi4 or 0) >= 1.5 and (d.get("btc_1h") or 0) >= -0.3:
         stars = 3
 
     return {
         **d,
-        "price": close,  # точка входа = close 15m под lower
+        "price": entry,
         "stars": stars,
         "signal_type": "BB_LOWER",
-        "bb_break_pct": round(break_pct, 2),
-        "bb_bandwidth": round(d["bb_bandwidth"], 2) if d.get("bb_bandwidth") is not None else None,
         "bb_lower_close_ok": True,
-        "bb_lower": lower,
+        "bb_lower": lower_now,
+        "bb_middle": mid,
+        "bb_upper": upper,
+        "tp_price_abs": round(tp_price, 8),
+        "tp2_price_abs": round(tp2, 8) if tp2 else None,
+        "sl_price_abs": round(sl_price, 8),
+        "tp_pct": round(tp_pct, 3),
+        "sl_pct": round(sl_pct, 3),
+        "vol_spike_15m": round(vol_spike, 2) if vol_spike else None,
         "price_change_24h": pc24,
-        "entry_note": f"24h {pc24:+.1f}% | close15m {close:.6g} < lower {lower:.6g}",
+        "entry_note": (
+            f"reclaim lower | 24h {pc24:+.1f}% | OI24 {(oi24 or 0):+.1f}% | "
+            f"TP mid/upper | SL {sl_pct:.2f}%"
+        ),
     }
-
 
 
 def is_blacklisted(symbol: str) -> bool:
@@ -768,7 +870,8 @@ def is_blacklisted(symbol: str) -> bool:
 async def scan_once(session) -> list[dict]:
     log.info("=== SCAN START ===")
     btc_1h = await get_btc_1h_change(session)
-    log.info(f"BTC 1h: {btc_1h:+.2f}%")
+    btc_15m = await get_btc_15m_change(session)
+    log.info(f"BTC 1h: {btc_1h:+.2f}% | 15m: {btc_15m:+.2f}%")
 
     if btc_1h < BTC_MIN_1H_CHANGE:
         log.info(f"BTC dropping hard ({btc_1h:.2f}% < {BTC_MIN_1H_CHANGE}%) — skip full scan.")
@@ -833,11 +936,17 @@ async def scan_once(session) -> list[dict]:
         if (time.time() - last_alert.get(symbol, 0)) < ALERT_COOLDOWN_HOURS * 3600:
             continue
 
+        try:
+            funding_rate = float(tk.get("fundingRate")) if tk.get("fundingRate") is not None else None
+        except (ValueError, TypeError):
+            funding_rate = None
+
         candidates.append({
             "symbol": symbol,
             "volume_24h": turnover,
             "age_days": (now_ms - launch_time) // 86_400_000,
             "ticker_pc24": pc24,
+            "funding_rate": funding_rate,
         })
 
     # Самые активные по обороту — в работу первые MAX_SCAN_SYMBOLS
@@ -849,7 +958,7 @@ async def scan_once(session) -> list[dict]:
         f"(min turn ${MIN_VOLUME_USD_24H/1e6:.0f}M, 24h≥+{ACTIVE_MIN_24H_UP_PCT}%={ACTIVE_REQUIRE_24H_UP})"
     )
 
-    tasks = [analyze_coin(session, c, btc_1h) for c in prefiltered]
+    tasks = [analyze_coin(session, c, btc_1h, btc_15m) for c in prefiltered]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     scored = []
     for r in results:
@@ -900,7 +1009,7 @@ SIGNAL_LOGIC = {
     "SURGE":    "Цена↑ 1ч + OI↑ 1ч = очень ранний старт тренда",
     "PULLBACK": "Тренд вверх + откат к EMA21 + OI растёт = вход на ретесте",
     "BB_SQUEEZE": "Сужение Bollinger 15m → пробой upper → вход на небольшом откате",
-    "BB_LOWER": "24h аптренд + close 15m ниже lower BB (не фитиль) → лонг от полосы",
+    "BB_LOWER": "24h long → dip under lower → reclaim 15m → OI/vol → TP mid/upper",
 }
 
 

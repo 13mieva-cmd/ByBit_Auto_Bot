@@ -94,14 +94,29 @@ BB_REQUIRE_KC_BREAKOUT = os.getenv("BB_REQUIRE_KC_BREAKOUT", "false").lower() ==
 
 # ---------- BB LOWER: лонг от нижней полосы в 24h-аптренде ----------
 ENABLE_BB_LOWER = os.getenv("ENABLE_BB_LOWER", "true").lower() == "true"
-# Монета в восходящем тренде за 24ч (мин. рост цены %)
-BB_LOWER_TREND_24H_MIN = float(os.getenv("BB_LOWER_TREND_24H_MIN", "3.0"))  # только явный 24h лонг-тренд
-# Пробой нижней BB: close 15m ниже lower (не фитиль)
-# Предыдущий close должен быть >= lower (первый пробой, не давно «под полосой»)
-BB_LOWER_RSI_MAX = float(os.getenv("BB_LOWER_RSI_MAX", "45"))  # 15m не перекуплен
-BB_LOWER_RSI_MIN = float(os.getenv("BB_LOWER_RSI_MIN", "20"))  # не мёртвый дамп
-# Макс. «прокол» ниже lower — слишком глубоко = тренд ломается
-BB_LOWER_MAX_BREAK_PCT = float(os.getenv("BB_LOWER_MAX_BREAK_PCT", "1.5"))
+# 24h long-тренд
+BB_LOWER_TREND_24H_MIN = float(os.getenv("BB_LOWER_TREND_24H_MIN", "3.0"))
+BB_LOWER_RSI_MAX = float(os.getenv("BB_LOWER_RSI_MAX", "50"))
+BB_LOWER_RSI_MIN = float(os.getenv("BB_LOWER_RSI_MIN", "18"))
+# Reclaim: close был под lower, затем close обратно НАД lower
+BB_LOWER_RECLAIM = os.getenv("BB_LOWER_RECLAIM", "true").lower() == "true"
+# Живые лонги: OI
+BB_LOWER_OI_24H_MIN = float(os.getenv("BB_LOWER_OI_24H_MIN", "2.0"))
+BB_LOWER_OI_4H_MIN = float(os.getenv("BB_LOWER_OI_4H_MIN", "0.0"))
+# Funding: не слишком отрицательный (перегрев лонгов наоборот — режем сильно (+) funding)
+BB_LOWER_FUNDING_MAX = float(os.getenv("BB_LOWER_FUNDING_MAX", "0.0008"))  # +0.08%/8h
+BB_LOWER_FUNDING_MIN = float(os.getenv("BB_LOWER_FUNDING_MIN", "-0.0015"))  # не глубоко отриц.
+# Объём на свече reclaim ≥ avg * mult
+BB_LOWER_VOL_MIN = float(os.getenv("BB_LOWER_VOL_MIN", "1.1"))
+# BTC 15m: пауза если слив
+BB_LOWER_BTC_15M_MIN = float(os.getenv("BB_LOWER_BTC_15M_MIN", "-0.5"))
+# Пила 4h: макс. число проколов lower за 16×15m
+BB_LOWER_MAX_CHOP_PIERCES = int(os.getenv("BB_LOWER_MAX_CHOP_PIERCES", "3"))
+# SL буфер ниже min(low свечи, lower) в %
+BB_LOWER_SL_BUFFER_PCT = float(os.getenv("BB_LOWER_SL_BUFFER_PCT", "0.15"))
+# Мин. дистанция до TP1 (mid), иначе берём % fallback
+BB_LOWER_MIN_TP_PCT = float(os.getenv("BB_LOWER_MIN_TP_PCT", "1.0"))
+BB_LOWER_FALLBACK_TP_PCT = float(os.getenv("BB_LOWER_FALLBACK_TP_PCT", "3.5"))
 
 # ---------- EMA filter ----------
 USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "true").lower() == "true"
@@ -173,9 +188,9 @@ AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 # BB Squeeze auto trade
 AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.0"))
 AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.2"))
-# BB_LOWER: TP как у BB, SL 10% по запросу (осторожно при плече 10x)
-AUTO_BB_LOWER_TP_PCT = float(os.getenv("AUTO_BB_LOWER_TP_PCT", "10.0"))  # держим 1:1 с SL=10% — см. README
-AUTO_BB_LOWER_SL_PCT = float(os.getenv("AUTO_BB_LOWER_SL_PCT", "10.0"))  # ВНИМАНИЕ: буфер до ликвидации ~1.0x при 10x плече
+# BB_LOWER: fallback %, если mid/upper слишком близко; основной TP/SL — уровни BB
+AUTO_BB_LOWER_TP_PCT = float(os.getenv("AUTO_BB_LOWER_TP_PCT", "3.5"))
+AUTO_BB_LOWER_SL_PCT = float(os.getenv("AUTO_BB_LOWER_SL_PCT", "2.5"))
 
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
@@ -204,8 +219,8 @@ AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))
 AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
 AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.0"))
 AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.6"))
-AUTO_TP1_TRIGGER_PCT_BB_LOWER = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB_LOWER", "3.0"))
-AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_LOWER", "2.0"))
+AUTO_TP1_TRIGGER_PCT_BB_LOWER = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB_LOWER", str(AUTO_TP1_TRIGGER_PCT_BB)))
+AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_LOWER", str(AUTO_TRAIL_DISTANCE_PCT_BB)))
 
 # Ранний безубыток (BE): после +X% переносим SL на цену входа (+ крошечный буфер)
 AUTO_BE_ENABLED = os.getenv("AUTO_BE_ENABLED", "true").lower() == "true"
