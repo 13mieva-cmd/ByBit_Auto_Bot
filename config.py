@@ -85,7 +85,7 @@ BB_REQUIRE_KC_BREAKOUT = os.getenv("BB_REQUIRE_KC_BREAKOUT", "false").lower() ==
 # ---------- BB LOWER: лонг от нижней полосы в 24h-аптренде ----------
 ENABLE_BB_LOWER = os.getenv("ENABLE_BB_LOWER", "true").lower() == "true"
 # Монета в восходящем тренде за 24ч (мин. рост цены %)
-BB_LOWER_TREND_24H_MIN = float(os.getenv("BB_LOWER_TREND_24H_MIN", "2.0"))
+BB_LOWER_TREND_24H_MIN = float(os.getenv("BB_LOWER_TREND_24H_MIN", "3.0"))  # только явный 24h лонг-тренд
 # Пробой нижней BB: close 15m ниже lower (не фитиль)
 # Предыдущий close должен быть >= lower (первый пробой, не давно «под полосой»)
 BB_LOWER_RSI_MAX = float(os.getenv("BB_LOWER_RSI_MAX", "45"))  # 15m не перекуплен
@@ -163,9 +163,9 @@ AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 # BB Squeeze auto trade
 AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.0"))
 AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.2"))
-# BB_LOWER uses same TP/SL as BB by default
-AUTO_BB_LOWER_TP_PCT = float(os.getenv("AUTO_BB_LOWER_TP_PCT", str(AUTO_BB_TP_PCT)))
-AUTO_BB_LOWER_SL_PCT = float(os.getenv("AUTO_BB_LOWER_SL_PCT", str(AUTO_BB_SL_PCT)))
+# BB_LOWER: TP как у BB, SL 10% по запросу (осторожно при плече 10x)
+AUTO_BB_LOWER_TP_PCT = float(os.getenv("AUTO_BB_LOWER_TP_PCT", "2.0"))
+AUTO_BB_LOWER_SL_PCT = float(os.getenv("AUTO_BB_LOWER_SL_PCT", "10.0"))
 
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
@@ -174,8 +174,11 @@ CONSECUTIVE_LOSS_BLOCK = int(os.getenv("CONSECUTIVE_LOSS_BLOCK", "3"))
 
 # Which signal types are eligible for auto-trade
 AUTO_TRADE_SIGNAL_TYPES = os.getenv(
-    "AUTO_TRADE_SIGNAL_TYPES", "STANDARD,SURGE,PULLBACK,BB_SQUEEZE,BB_LOWER"
+    "AUTO_TRADE_SIGNAL_TYPES", "BB_LOWER"
 )
+# Авто только если монета в плюсе за 24ч (дубль-фильтр на всякий случай)
+AUTO_REQUIRE_24H_UPTREND = os.getenv("AUTO_REQUIRE_24H_UPTREND", "true").lower() == "true"
+AUTO_MIN_24H_CHANGE_PCT = float(os.getenv("AUTO_MIN_24H_CHANGE_PCT", "3.0"))
 
 # Reconciliation interval (sec)
 RECONCILE_INTERVAL_SEC = int(os.getenv("RECONCILE_INTERVAL_SEC", "15"))
@@ -197,7 +200,7 @@ AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_L
 # Ранний безубыток (BE): после +X% переносим SL на цену входа (+ крошечный буфер)
 AUTO_BE_ENABLED = os.getenv("AUTO_BE_ENABLED", "true").lower() == "true"
 AUTO_BE_TRIGGER_PCT = float(os.getenv("AUTO_BE_TRIGGER_PCT", "0.6"))
-AUTO_BE_BUFFER_PCT = float(os.getenv("AUTO_BE_BUFFER_PCT", "0.15"))  # SL выше entry — покрывает round-trip комиссию (~0.11%) + запас
+AUTO_BE_BUFFER_PCT = float(os.getenv("AUTO_BE_BUFFER_PCT", "0.05"))  # SL чуть выше entry
 
 # Выход по слому структуры: close ниже EMA50
 STRUCTURE_EXIT_ENABLED = os.getenv("STRUCTURE_EXIT_ENABLED", "true").lower() == "true"

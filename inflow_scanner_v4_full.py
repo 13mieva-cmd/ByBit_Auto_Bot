@@ -365,6 +365,12 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         "vol_spike_15m": vol_spike_15m,
     }
 
+    # ========== BB_LOWER first: 24h uptrend + close 15m < lower BB ==========
+    if ENABLE_BB_LOWER:
+        bb_low = try_bb_lower(base_data, closes_15m)
+        if bb_low:
+            return bb_low
+
     # ========== Try STANDARD signal ==========
     standard = try_standard(base_data)
     if standard:
@@ -387,11 +393,6 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
         bb_sig = try_bb_squeeze(base_data, closes_15m)
         if bb_sig:
             return bb_sig
-
-    if ENABLE_BB_LOWER:
-        bb_low = try_bb_lower(base_data, closes_15m)
-        if bb_low:
-            return bb_low
 
     return None
 
@@ -465,10 +466,8 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
         return None
 
     # EMA50 должна РАСТИ — иначе тренд выдыхается
-    # (было: считали EMA50 на срезе из 10 баров — calculate_ema всегда возвращал
-    # None на менее чем `period` значениях, проверка никогда не срабатывала)
-    if len(closes_1h) >= EMA_PERIOD + 5:
-        ema50_old = calculate_ema(closes_1h[:-5], EMA_PERIOD)
+    if len(closes_1h) >= 15:
+        ema50_old = calculate_ema(closes_1h[-15:-5], EMA_PERIOD)
         if ema50_old is not None and d["ema50_1h"] <= ema50_old * 1.002:
             return None
 
@@ -720,12 +719,17 @@ def try_bb_lower(d: dict, closes_15m: list[float]) -> Optional[dict]:
     if stars == 2 and (d.get("oi_change_24h") or 0) >= 3.0 and d.get("btc_1h", 0) >= -0.3:
         stars = 3
 
+    # Цена сигнала = close 15m (точка входа ниже lower BB)
     return {
         **d,
+        "price": close,
         "stars": stars,
         "signal_type": "BB_LOWER",
         "bb_break_pct": round(break_pct, 2),
         "bb_bandwidth": round(d["bb_bandwidth"], 2) if d.get("bb_bandwidth") is not None else None,
+        "bb_lower_close_ok": True,
+        "bb_lower": lower,
+        "entry_note": f"close15m {close:.6g} < lower {lower:.6g}",
     }
 
 
@@ -1165,7 +1169,7 @@ async def cmd_scan(msg: types.Message):
 async def cmd_settings(msg: types.Message):
     await msg.answer(
         f"<b>Сканер:</b>\n"
-        f"• Интервал: {SCAN_INTERVAL_MIN} мин\n"
+        f"• Интервал скана: {SCAN_INTERVAL_MIN} мин\n"
         f"• Кулдаун: {ALERT_COOLDOWN_HOURS}ч\n"
         f"• Возраст: ≥{MIN_AGE_DAYS}д\n"
         f"• Объём 24ч: ≥${MIN_VOLUME_USD_24H/1e6:.0f}M\n\n"
@@ -1245,7 +1249,7 @@ async def cmd_backtest(msg: types.Message):
         days = max(3, min(int(parts[3]), 60))
 
     await msg.answer(
-        f"⏳ Backtest BB_LOWER "
+        f"⏳ Backtest BB_SQUEEZE "
         f"{'TOP' + str(top_n) if mode == 'top' else symbol} "
         f"за {days}д… это может занять 1–3 мин."
     )

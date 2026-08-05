@@ -17,6 +17,7 @@ from config import (
     AUTO_BB_LOWER_TP_PCT, AUTO_BB_LOWER_SL_PCT,
     MAX_AUTO_POSITIONS, DAILY_LOSS_LIMIT_USD, CONSECUTIVE_LOSS_BLOCK,
     AUTO_TRADE_SIGNAL_TYPES, RECONCILE_INTERVAL_SEC,
+    AUTO_REQUIRE_24H_UPTREND, AUTO_MIN_24H_CHANGE_PCT,
     POST_TRADE_COOLDOWN_HOURS,
     BTC_FILTER_ENABLED, BTC_FILTER_15M_DROP_MAX,
     BTC_FILTER_15M_PUMP_MAX, BTC_FILTER_1H_VOLATILITY_MAX,
@@ -127,6 +128,24 @@ class AutoTrader:
             if not self.state.get_signal_toggle(sig_type):
                 log.info(f"Signal type {sig_type} disabled, skip {signal['symbol']}")
                 return
+
+            # Только монеты в 24h лонг-тренде
+            if AUTO_REQUIRE_24H_UPTREND:
+                pc24 = signal.get("price_change_24h")
+                if pc24 is None:
+                    log.info(f"{signal['symbol']}: no 24h change data, skip auto")
+                    return
+                if pc24 < AUTO_MIN_24H_CHANGE_PCT:
+                    log.info(
+                        f"{signal['symbol']}: 24h {pc24:+.2f}% < {AUTO_MIN_24H_CHANGE_PCT}% — not uptrend, skip"
+                    )
+                    return
+
+            # BB_LOWER: вход только если close 15m ниже lower BB
+            if sig_type == "BB_LOWER":
+                if not signal.get("bb_lower_close_ok"):
+                    log.info(f"{signal['symbol']}: BB_LOWER without close<lower flag, skip")
+                    return
 
             # Post-trade cooldown check
             if self.state.is_in_post_trade_cooldown(signal['symbol']):
@@ -374,12 +393,14 @@ class AutoTrader:
         res = await self.trader.close_position_market(symbol)
         reason = "; ".join(reasons)
         if res.get("ok"):
+            tracked["exit_reason"] = "STRUCTURE"
+            tracked["exit_detail"] = reason
+            self.state._save()
             await self.notify(
                 f"📉 <b>{base}</b> — выход по <b>слому структуры</b>\n"
                 f"{reason}\n"
                 f"<i>Close ниже EMA50 — тренд развернулся, не ждём полный SL.</i>"
             )
-            # let next reconcile / closed handler book PnL
             await self.handle_closed_position(symbol)
             return True
         log.warning(f"structure exit failed {symbol}: {res}")
@@ -430,29 +451,102 @@ class AutoTrader:
         if not tracked:
             return
 
-        # Lookup closed PnL
-        closed = await self.trader.get_closed_pnl(symbol, 5)
+        entry = float(tracked.get("entry_price") or 0)
+        tp_price = float(tracked.get("tp_price") or 0)
+        sl_price = float(tracked.get("sl_price") or 0)
+        opened_at = float(tracked.get("opened_at") or 0)
+
+        # Reason set by bot (structure / panic)
+        close_reason = tracked.get("exit_reason") or None
+        exit_detail = tracked.get("exit_detail") or ""
+
+        # closed-pnl from exchange (retry once on empty)
+        closed = await self.trader.get_closed_pnl(symbol, 10)
+        if not closed:
+            await asyncio.sleep(1.5)
+            closed = await self.trader.get_closed_pnl(symbol, 10)
+
         pnl_usd = None
-        close_reason = "UNKNOWN"
         exit_price = None
+        order_type = ""
+        best = None
         for cp in closed:
             try:
-                updated_ts = int(cp.get("updatedTime", 0)) / 1000
-                if updated_ts > tracked["opened_at"] - 5:
-                    pnl_usd = float(cp.get("closedPnl", 0))
-                    exit_price = float(cp.get("avgExitPrice", 0))
-                    if exit_price > 0:
-                        tp_dist = abs(exit_price - tracked["tp_price"]) / tracked["tp_price"]
-                        sl_dist = abs(exit_price - tracked["sl_price"]) / tracked["sl_price"]
-                        if tp_dist < 0.005:
-                            close_reason = "TP"
-                        elif sl_dist < 0.01:
-                            close_reason = "SL"
-                        else:
-                            close_reason = "MANUAL"
-                    break
+                updated_ts = int(cp.get("updatedTime", 0) or 0) / 1000
+                if updated_ts and updated_ts < opened_at - 30:
+                    continue
+                best = cp
+                break
             except (KeyError, ValueError, TypeError):
                 continue
+        if best is None and closed:
+            best = closed[0]
+
+        if best:
+            try:
+                pnl_usd = float(best.get("closedPnl") or 0)
+            except (TypeError, ValueError):
+                pnl_usd = None
+            try:
+                ep = float(best.get("avgExitPrice") or 0)
+                exit_price = ep if ep > 0 else None
+            except (TypeError, ValueError):
+                exit_price = None
+            order_type = str(best.get("orderType") or "")
+
+        # Infer reason from price / flags if bot did not tag it
+        if not close_reason and exit_price and entry > 0:
+            gain_pct = (exit_price - entry) / entry * 100
+            if tracked.get("be_active") and abs(gain_pct) <= 0.35:
+                close_reason = "BE"
+            elif tp_price > 0 and abs(exit_price - tp_price) / tp_price < 0.012:
+                close_reason = "TP"
+            elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1e-12) < 0.015:
+                close_reason = "SL"
+            elif tracked.get("trailing_active"):
+                close_reason = "TRAILING"
+            elif gain_pct >= float(tracked.get("tp_pct") or AUTO_BB_TP_PCT) * 0.85:
+                close_reason = "TP"
+            elif gain_pct <= -0.5:
+                close_reason = "SL"
+            elif "Market" in order_type and abs(gain_pct) < 0.4:
+                close_reason = "BE" if tracked.get("be_active") else "MANUAL"
+            else:
+                close_reason = "MANUAL"
+
+        if not close_reason:
+            if tracked.get("trailing_active"):
+                close_reason = "TRAILING"
+            elif tracked.get("be_active"):
+                close_reason = "BE"
+            elif pnl_usd is not None:
+                close_reason = "TP" if pnl_usd > 0 else ("SL" if pnl_usd < 0 else "MANUAL")
+            else:
+                close_reason = "UNKNOWN"
+
+        reason_ru = {
+            "TP": "Take Profit",
+            "SL": "Stop Loss",
+            "BE": "Breakeven (BE)",
+            "TRAILING": "Trailing stop",
+            "STRUCTURE": "Structure break (EMA50)",
+            "MANUAL": "Manual / market close",
+            "PANIC": "Panic close",
+            "UNKNOWN": "not determined",
+        }.get(close_reason, close_reason)
+
+        # Russian labels
+        reason_ru_map = {
+            "TP": "Take Profit",
+            "SL": "Stop Loss",
+            "BE": "Безубыток (BE)",
+            "TRAILING": "Трейлинг-стоп",
+            "STRUCTURE": "Слом структуры (EMA50)",
+            "MANUAL": "Ручное / market close",
+            "PANIC": "Panic close",
+            "UNKNOWN": "не определена",
+        }
+        reason_ru = reason_ru_map.get(close_reason, close_reason)
 
         if pnl_usd is not None:
             self.state.add_pnl(pnl_usd)
@@ -462,18 +556,20 @@ class AutoTrader:
                 self.state.reset_consecutive_loss()
 
         self.state.remove_position(symbol)
-
-        # Set post-trade cooldown: don't auto-trade this symbol again for N hours
         self.state.add_post_trade_cooldown(symbol, POST_TRADE_COOLDOWN_HOURS)
 
         base = symbol.replace("USDT", "")
-        emoji = {"TP": "✅", "SL": "🛑", "MANUAL": "✋", "UNKNOWN": "❓"}.get(close_reason, "❓")
+        emoji = {
+            "TP": "✅", "SL": "🛑", "BE": "🛡️", "TRAILING": "📈",
+            "STRUCTURE": "📉", "MANUAL": "✋", "PANIC": "🚨", "UNKNOWN": "❓",
+        }.get(close_reason, "❓")
         pnl_str = f"${pnl_usd:+.2f}" if pnl_usd is not None else "?"
         exit_str = f"<code>${exit_price:.6g}</code>" if exit_price else "?"
+        detail = f"\n<i>{exit_detail}</i>" if exit_detail else ""
 
         msg = (
             f"{emoji} <b>{base}</b> закрыта\n\n"
-            f"Причина: <b>{close_reason}</b>\n"
+            f"Причина: <b>{reason_ru}</b>{detail}\n"
             f"Выход: {exit_str}\n"
             f"P&L: <b>{pnl_str}</b>\n"
             f"Дневной P&L: <b>${self.state.daily_pnl:+.2f}</b>\n"
@@ -506,6 +602,9 @@ class AutoTrader:
                 await self.trader.cancel_all_orders(symbol)
                 result = await self.trader.close_position_market(symbol)
                 if result.get("ok"):
+                    pos = self.state.active_positions.get(symbol)
+                    if pos:
+                        pos["exit_reason"] = "PANIC"
                     self.state.remove_position(symbol)
                     ok += 1
                 else:
