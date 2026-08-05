@@ -24,6 +24,8 @@ from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     SCAN_INTERVAL_MIN, ALERT_COOLDOWN_HOURS, MAX_ALERTS_PER_SCAN, MIN_STARS_TO_ALERT,
     MIN_AGE_DAYS, MIN_VOLUME_USD_24H,
+    MIN_ABS_CHANGE_24H_PCT, ACTIVE_REQUIRE_24H_UP, ACTIVE_MIN_24H_UP_PCT,
+    MAX_SPREAD_PCT, MAX_SCAN_SYMBOLS,
     PRICE_CHANGE_4H_MIN, PRICE_CHANGE_4H_MAX,
     OI_CHANGE_4H_MIN, OI_CHANGE_24H_2STAR,
     VOLUME_SPIKE_MIN, VOLUME_SPIKE_2STAR,
@@ -466,8 +468,11 @@ def try_pullback(d: dict, closes_1h: list[float]) -> Optional[dict]:
         return None
 
     # EMA50 должна РАСТИ — иначе тренд выдыхается
-    if len(closes_1h) >= 15:
-        ema50_old = calculate_ema(closes_1h[-15:-5], EMA_PERIOD)
+    # (calculate_ema на срезе короче period всегда возвращает None — проверка
+    # на closes_1h[-15:-5] с EMA_PERIOD=50 никогда не срабатывала, т.к. срез
+    # всего 10 баров < 50. Нужно достаточно истории для честного расчёта.)
+    if len(closes_1h) >= EMA_PERIOD + 5:
+        ema50_old = calculate_ema(closes_1h[:-5], EMA_PERIOD)
         if ema50_old is not None and d["ema50_1h"] <= ema50_old * 1.002:
             return None
 
@@ -720,9 +725,6 @@ def try_bb_lower(
             # Свободное падение: закрылись у минимумов
             if close_pos < 0.25:
                 return None
-        # Доп.: mid BB всё ещё выше close (полоса «над головой» — место для отскока к mid)
-        if mid is not None and close >= mid:
-            return None
 
     rsi_15 = d.get("rsi_15m")
     if rsi_15 is not None:
@@ -776,32 +778,76 @@ async def scan_once(session) -> list[dict]:
     tickers = await get_tickers(session)
     now_ms = int(time.time() * 1000)
     min_age_ms = MIN_AGE_DAYS * 86_400_000
-    prefiltered = []
+    candidates = []
 
     for inst in instruments:
         symbol = inst.get("symbol", "")
-        if not symbol.endswith("USDT"): continue
-        if inst.get("contractType") != "LinearPerpetual": continue
-        if inst.get("status") != "Trading": continue
-        if is_blacklisted(symbol): continue
-        if ignore.is_ignored(symbol): continue
+        if not symbol.endswith("USDT"):
+            continue
+        if inst.get("contractType") != "LinearPerpetual":
+            continue
+        if inst.get("status") != "Trading":
+            continue
+        if is_blacklisted(symbol):
+            continue
+        if ignore.is_ignored(symbol):
+            continue
         launch_time = int(inst.get("launchTime", 0) or 0)
-        if launch_time == 0 or (now_ms - launch_time) < min_age_ms: continue
-        t = tickers.get(symbol)
-        if not t: continue
+        if launch_time == 0 or (now_ms - launch_time) < min_age_ms:
+            continue
+
+        tk = tickers.get(symbol)
+        if not tk:
+            continue
         try:
-            turnover = float(t.get("turnover24h", 0))
+            turnover = float(tk.get("turnover24h", 0) or 0)
         except (ValueError, TypeError):
             continue
-        if turnover < MIN_VOLUME_USD_24H: continue
-        if (time.time() - last_alert.get(symbol, 0)) < ALERT_COOLDOWN_HOURS * 3600: continue
-        prefiltered.append({
+        if turnover < MIN_VOLUME_USD_24H:
+            continue
+
+        # Активность по цене 24ч (Bybit: price24hPcnt в долях, напр. 0.05 = +5%)
+        try:
+            raw_pc = tk.get("price24hPcnt")
+            pc24 = float(raw_pc) * 100 if raw_pc is not None else 0.0
+        except (ValueError, TypeError):
+            pc24 = 0.0
+
+        if abs(pc24) < MIN_ABS_CHANGE_24H_PCT:
+            continue  # стоит на месте — не активна
+        if ACTIVE_REQUIRE_24H_UP and pc24 < ACTIVE_MIN_24H_UP_PCT:
+            continue  # нужен long-тренд 24ч
+
+        # Спред bid/ask — отсев неликвида
+        try:
+            bid = float(tk.get("bid1Price") or 0)
+            ask = float(tk.get("ask1Price") or 0)
+            last = float(tk.get("lastPrice") or 0)
+            if bid > 0 and ask > 0 and last > 0:
+                spread_pct = (ask - bid) / last * 100
+                if spread_pct > MAX_SPREAD_PCT:
+                    continue
+        except (ValueError, TypeError):
+            pass
+
+        if (time.time() - last_alert.get(symbol, 0)) < ALERT_COOLDOWN_HOURS * 3600:
+            continue
+
+        candidates.append({
             "symbol": symbol,
             "volume_24h": turnover,
             "age_days": (now_ms - launch_time) // 86_400_000,
+            "ticker_pc24": pc24,
         })
 
-    log.info(f"Pre-filtered: {len(prefiltered)}")
+    # Самые активные по обороту — в работу первые MAX_SCAN_SYMBOLS
+    candidates.sort(key=lambda x: x["volume_24h"], reverse=True)
+    prefiltered = candidates[:MAX_SCAN_SYMBOLS]
+
+    log.info(
+        f"Pre-filtered active: {len(prefiltered)}/{len(candidates)} "
+        f"(min turn ${MIN_VOLUME_USD_24H/1e6:.0f}M, 24h≥+{ACTIVE_MIN_24H_UP_PCT}%={ACTIVE_REQUIRE_24H_UP})"
+    )
 
     tasks = [analyze_coin(session, c, btc_1h) for c in prefiltered]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1194,7 +1240,7 @@ async def cmd_settings(msg: types.Message):
         f"• Интервал скана: {SCAN_INTERVAL_MIN} мин\n"
         f"• Кулдаун: {ALERT_COOLDOWN_HOURS}ч\n"
         f"• Возраст: ≥{MIN_AGE_DAYS}д\n"
-        f"• Объём 24ч: ≥${MIN_VOLUME_USD_24H/1e6:.0f}M\n\n"
+        f"• Активные: оборот ≥${MIN_VOLUME_USD_24H/1e6:.0f}M, топ-{MAX_SCAN_SYMBOLS}\n"f"• 24h long ≥+{ACTIVE_MIN_24H_UP_PCT}% | спред ≤{MAX_SPREAD_PCT}%\n\n"
         f"<b>🟢 STANDARD:</b>\n"
         f"• Цена 4ч: +{PRICE_CHANGE_4H_MIN}…+{PRICE_CHANGE_4H_MAX}%\n"
         f"• OI 4ч: ≥+{OI_CHANGE_4H_MIN}%\n"
@@ -1271,7 +1317,7 @@ async def cmd_backtest(msg: types.Message):
         days = max(3, min(int(parts[3]), 60))
 
     await msg.answer(
-        f"⏳ Backtest BB_SQUEEZE "
+        f"⏳ Backtest BB_LOWER "
         f"{'TOP' + str(top_n) if mode == 'top' else symbol} "
         f"за {days}д… это может занять 1–3 мин."
     )

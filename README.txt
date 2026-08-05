@@ -106,3 +106,136 @@ Verified clean (re-checked, no issues found):
   - try_standard, try_surge unchanged and logically sound.
   - Full cross-import check (config.py <-> scanner.py/auto_trade.py/
     backtest.py): 0 missing names. Full compile: all 8 files clean.
+
+=== Follow-up: comparing a parallel-edited upload against this baseline ===
+
+Good additions kept from that upload (all verified working):
+  - auto_trade.py: AUTO_REQUIRE_24H_UPTREND / AUTO_MIN_24H_CHANGE_PCT — a
+    second, independent 24h-uptrend check at the auto-trade execution layer
+    (on top of BB_LOWER's own signal-level check) — genuine defense in depth.
+  - scanner.py: try_bb_lower() gained a price-action quality filter — rejects
+    if the 15m candle closed in the bottom 25% of its own high-low range
+    ("still free-falling, no rejection shown yet"), and now correctly sets
+    the returned signal's "price" to the actual 15m breakout close instead of
+    inheriting the 1h reference price from base_data (base_data's "price" is
+    closes_1h[-1] — a different value than the 15m close that triggered the
+    signal).
+  - scanner.py: added bb_lower_close_ok flag on the signal dict, checked by
+    auto_trade.py before entering — another defense-in-depth pairing.
+  - auto_trade.py: handle_closed_position() rewritten — much more reliable
+    close-reason detection (widened the closed-PnL timestamp match window,
+    added a retry on empty response, and — most importantly — now reads the
+    reason the bot itself already knows when IT initiated the close
+    (STRUCTURE/PANIC) instead of only ever trying to reverse-engineer it from
+    price proximity to tp/sl). Before this, every BE-stop, trailing-stop, or
+    structure-exit close would have been misreported as MANUAL/UNKNOWN in the
+    closing notification — a real gap from when BE-stop/structure-exit were
+    first added, now closed. Also added proper BE/TRAILING/STRUCTURE/PANIC
+    labels and emojis instead of just TP/SL/MANUAL/UNKNOWN.
+
+Regressions found and re-fixed (this upload was edited in parallel and lost
+some earlier fixes):
+  - try_pullback()'s "EMA50 must be rising" check had reverted to the original
+    dead-code version (10-bar slice against period=50 -> calculate_ema always
+    None -> check never fires). Re-applied the closes_1h[:-5] fix.
+  - The /backtest command's confirmation message had reverted to saying
+    "Backtest BB_SQUEEZE" again, despite backtest.py actually testing BB_LOWER
+    (its own docstring and report headers correctly say BB_LOWER throughout —
+    only the scanner.py confirmation message regressed). Re-fixed.
+  - AUTO_BB_LOWER_TP_PCT had reverted to 2.0% while AUTO_BB_LOWER_SL_PCT
+    stayed at the requested 10.0% — recreating the exact 0.2:1 R:R / 83%
+    breakeven-win-rate problem we identified and fixed together last round.
+    Re-applied TP=10.0% (clean 1:1 R:R / 50% breakeven WR). Also re-widened
+    AUTO_TP1_TRIGGER_PCT_BB_LOWER / AUTO_TRAIL_DISTANCE_PCT_BB_LOWER to
+    3.0%/2.0% (were back to the tight 1.0%/0.6% BB_SQUEEZE-inherited values,
+    which would have locked in profit almost immediately on any winner,
+    making the wider TP unreachable in practice).
+
+Minor cleanup:
+  - try_bb_lower() had a structurally-unreachable check ("close >= mid ->
+    reject") a few lines after already confirming close < lower — since
+    lower < mid always by definition, close < lower already guarantees
+    close < mid. Harmless (never blocked anything that should've passed) but
+    dead code; removed.
+
+Verified after this pass: try_bb_lower fires correctly on an "absorption"
+candle (rejection from the lows) and correctly blocks a genuine free-fall
+candle (close at its own low) — the new price-action filter works as
+intended. bb_lower_close_ok and the corrected "price" field both confirmed
+present on the returned signal. EMA-rising fix re-verified (real value
+instead of always-None). R:R confirmed back to 1:1. Full compile +
+cross-import re-checked clean across all 8 files.
+
+=== Follow-up: new active-coin pre-filter, same 3 regressions AGAIN ===
+
+Good new addition (verified wired up correctly, not dangling config):
+  - scan_once() pre-filter now also requires: |24h change| >= 
+    MIN_ABS_CHANGE_24H_PCT (skip flat/dead coins), 24h change >= 
+    ACTIVE_MIN_24H_UP_PCT when ACTIVE_REQUIRE_24H_UP is on, bid/ask spread
+    <= MAX_SPREAD_PCT (skip illiquid), and caps the candidate list to the
+    top MAX_SCAN_SYMBOLS (80) by turnover after filtering. MIN_VOLUME_USD_24H
+    raised 3M -> 8M. This uses the ticker's price24hPcnt for a cheap
+    pre-filter pass — separate from and complementary to the more precise
+    price_change_24h that analyze_coin/try_bb_lower independently recompute
+    from actual 1h candle closes. Checked this doesn't break the data flow:
+    confirmed try_bb_lower still reads a correctly-populated
+    price_change_24h, not the pre-filter's ticker_pc24 field (different
+    variables, both correct, no key-rename regression).
+  - This also helps the SCAN_INTERVAL_MIN=1 rate-limit concern noted earlier
+    — scanning is now capped to the top 80 liquid/active symbols instead of
+    the whole market.
+
+Same 3 regressions reappeared a THIRD time in this upload (from the same
+earlier, pre-fix baseline each time, it seems) — re-applied again:
+  - try_pullback()'s EMA50-rising dead-code bug (closes_1h[-15:-5] against
+    period=50 -> always None -> never fires). Fixed to closes_1h[:-5].
+  - /backtest confirmation message said "BB_SQUEEZE" again; it runs BB_LOWER.
+  - AUTO_BB_LOWER_TP_PCT back to 2.0% (with SL still at the requested 10.0%)
+    -> 0.2:1 R:R / 83% breakeven win rate again. Re-widened to 10.0% (1:1).
+    AUTO_TP1_TRIGGER_PCT_BB_LOWER / AUTO_TRAIL_DISTANCE_PCT_BB_LOWER had also
+    reverted to inherit BB_SQUEEZE's tight 1.0%/0.6% — re-widened to 3.0%/2.0%.
+  - (minor, also reappeared) the structurally-unreachable "close >= mid"
+    check in try_bb_lower — removed again.
+
+Heads up: if edits keep coming from an older baseline instead of the last
+delivered file set, these same 3-4 things will likely keep reverting each
+round. Worth starting future edits from whatever this chat delivers instead,
+to stop this loop.
+
+Verified after this round: full compile + cross-import clean, try_bb_lower
+positive/negative regression re-confirmed (absorption candle fires, free-fall
+and downtrend correctly block), R:R back to 1:1.
+
+=== Follow-up: BB_LOWER-only mode + wider SL/TP (explicit request) ===
+
+  - BB_LOWER_TREND_24H_MIN: 2.0% -> 5.0%. The old 2% threshold barely
+    filtered anything — most actively-traded alts swing more than that in
+    24h on an ordinary day regardless of any real trend. 5% is a much more
+    meaningful bar.
+  - AUTO_TRADE_SIGNAL_TYPES: "STANDARD,SURGE,PULLBACK,BB_SQUEEZE,BB_LOWER"
+    -> "BB_LOWER" only. The other 4 signal types still scan and alert in
+    Telegram as before (their ENABLE_* flags are untouched) but can no
+    longer auto-trade — this is a hard gate in auto_trade.py's
+    handle_signal(), independent of the /sig_on /sig_off runtime toggles.
+  - storage.py's default signal_toggles now match: only BB_LOWER defaults
+    to True, so /auto's status display doesn't misleadingly show the other
+    4 as "enabled" when they can never actually trade.
+  - AUTO_BB_LOWER_SL_PCT: 1.2% -> 10.0% (explicit request). IMPORTANT: at
+    10x leverage this puts the stop right at the ~10% liquidation line —
+    buffer is ~1.0x, meaning on a fast move or slippage the exchange could
+    liquidate before the stop order fills. This was flagged explicitly
+    before applying; proceeding was a deliberate choice.
+  - AUTO_BB_LOWER_TP_PCT: 2.0% -> 10.0% (widened to match, per explicit
+    request, R:R now 1:1 / 50% breakeven win rate — was 0.2:1 / 83% before
+    this fix, which would have been an unwinnable setup).
+  - AUTO_TP1_TRIGGER_PCT_BB_LOWER / AUTO_TRAIL_DISTANCE_PCT_BB_LOWER:
+    1.0%/0.6% -> 3.0%/2.0%. These were still sized for the old tight 2% TP
+    (inherited from BB_SQUEEZE) — left as-is, trailing would have activated
+    at +1% and locked in as little as +0.4% on almost every winning trade,
+    making the wider 10% TP essentially unreachable in practice. Scaled up
+    to actually give the position room consistent with the new SL/TP scale.
+
+Verified after this round: BB_LOWER still fires correctly above the new 5%
+trend threshold, correctly blocks below it (tested at 3%, which used to pass
+under the old 2% default). AUTO_TRADE_SIGNAL_TYPES correctly resolves to
+{'BB_LOWER'} only. Full compile + cross-import re-checked clean.

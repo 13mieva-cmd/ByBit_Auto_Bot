@@ -15,9 +15,19 @@ ALERT_COOLDOWN_HOURS = int(os.getenv("ALERT_COOLDOWN_HOURS", "6"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "6"))
 MIN_STARS_TO_ALERT = int(os.getenv("MIN_STARS_TO_ALERT", "1"))
 
-# ---------- Pre-filter ----------
+# ---------- Pre-filter: только АКТИВНЫЕ монеты ----------
 MIN_AGE_DAYS = int(os.getenv("MIN_AGE_DAYS", "30"))
-MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "3000000"))
+# Мин. оборот 24ч (USDT) — отсекает мёртвые пары
+MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "8000000"))
+# Не брать совсем «стоячие» монеты: |изменение цены 24ч| минимум
+MIN_ABS_CHANGE_24H_PCT = float(os.getenv("MIN_ABS_CHANGE_24H_PCT", "1.0"))
+# Для long-стратегии: приоритет / фильтр только растущих за 24ч
+ACTIVE_REQUIRE_24H_UP = os.getenv("ACTIVE_REQUIRE_24H_UP", "true").lower() == "true"
+ACTIVE_MIN_24H_UP_PCT = float(os.getenv("ACTIVE_MIN_24H_UP_PCT", "3.0"))
+# Макс. спред bid/ask %, иначе неликвида
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
+# Не сканировать весь рынок — только топ по обороту
+MAX_SCAN_SYMBOLS = int(os.getenv("MAX_SCAN_SYMBOLS", "80"))
 
 # ---------- STANDARD signal (soft profile: earlier entries) ----------
 PRICE_CHANGE_4H_MIN = float(os.getenv("PRICE_CHANGE_4H_MIN", "2.0"))
@@ -164,8 +174,8 @@ AUTO_PULLBACK_SL_PCT = float(os.getenv("AUTO_PULLBACK_SL_PCT", "1.2"))
 AUTO_BB_TP_PCT = float(os.getenv("AUTO_BB_TP_PCT", "2.0"))
 AUTO_BB_SL_PCT = float(os.getenv("AUTO_BB_SL_PCT", "1.2"))
 # BB_LOWER: TP как у BB, SL 10% по запросу (осторожно при плече 10x)
-AUTO_BB_LOWER_TP_PCT = float(os.getenv("AUTO_BB_LOWER_TP_PCT", "2.0"))
-AUTO_BB_LOWER_SL_PCT = float(os.getenv("AUTO_BB_LOWER_SL_PCT", "10.0"))
+AUTO_BB_LOWER_TP_PCT = float(os.getenv("AUTO_BB_LOWER_TP_PCT", "10.0"))  # держим 1:1 с SL=10% — см. README
+AUTO_BB_LOWER_SL_PCT = float(os.getenv("AUTO_BB_LOWER_SL_PCT", "10.0"))  # ВНИМАНИЕ: буфер до ликвидации ~1.0x при 10x плече
 
 # Limits
 MAX_AUTO_POSITIONS = int(os.getenv("MAX_AUTO_POSITIONS", "2"))
@@ -194,8 +204,8 @@ AUTO_TP1_TRIGGER_PCT_PB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_PB", "0.9"))
 AUTO_TRAIL_DISTANCE_PCT_PB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_PB", "0.6"))
 AUTO_TP1_TRIGGER_PCT_BB = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB", "1.0"))
 AUTO_TRAIL_DISTANCE_PCT_BB = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB", "0.6"))
-AUTO_TP1_TRIGGER_PCT_BB_LOWER = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB_LOWER", str(AUTO_TP1_TRIGGER_PCT_BB)))
-AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_LOWER", str(AUTO_TRAIL_DISTANCE_PCT_BB)))
+AUTO_TP1_TRIGGER_PCT_BB_LOWER = float(os.getenv("AUTO_TP1_TRIGGER_PCT_BB_LOWER", "3.0"))
+AUTO_TRAIL_DISTANCE_PCT_BB_LOWER = float(os.getenv("AUTO_TRAIL_DISTANCE_PCT_BB_LOWER", "2.0"))
 
 # Ранний безубыток (BE): после +X% переносим SL на цену входа (+ крошечный буфер)
 AUTO_BE_ENABLED = os.getenv("AUTO_BE_ENABLED", "true").lower() == "true"
