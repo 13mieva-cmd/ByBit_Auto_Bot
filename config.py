@@ -8,6 +8,8 @@ import os
 # ---------- Telegram ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+# Comma-separated Telegram user ids allowed to use bot commands (empty = only CHAT_ID)
+TELEGRAM_ALLOWED_IDS = os.getenv("TELEGRAM_ALLOWED_IDS", "").strip()
 
 # ---------- Scanner core ----------
 SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "1"))  # 1 мин ≈ почти непрерывно
@@ -176,6 +178,20 @@ DEPOSIT_USD = float(os.getenv("DEPOSIT_USD", "500"))
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "1.5"))
 POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "250"))
+
+# Risk-based sizing: position notional ≈ RISK_USD_PER_TRADE / (sl_pct/100)
+RISK_SIZING_ENABLED = os.getenv("RISK_SIZING_ENABLED", "true").lower() == "true"
+RISK_USD_PER_TRADE = float(os.getenv("RISK_USD_PER_TRADE", "6.25"))  # ~1.25% of $500
+RISK_SIZE_MIN_USD = float(os.getenv("RISK_SIZE_MIN_USD", "50"))
+RISK_SIZE_MAX_USD = float(os.getenv("RISK_SIZE_MAX_USD", "250"))
+
+# SL trigger: MarkPrice reduces wick stop-outs on thin alts
+SL_TRIGGER_BY = os.getenv("SL_TRIGGER_BY", "MarkPrice")  # MarkPrice | LastPrice
+TP_TRIGGER_BY = os.getenv("TP_TRIGGER_BY", "LastPrice")
+
+# Partial TP: close 50% at mid/TP1, trail the rest
+PARTIAL_TP_ENABLED = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
+PARTIAL_TP_PCT = float(os.getenv("PARTIAL_TP_PCT", "50"))  # % of position to close at TP1
 
 # ---------- Auto trade exits ----------
 AUTO_TP_PCT = float(os.getenv("AUTO_TP_PCT", "3.0"))

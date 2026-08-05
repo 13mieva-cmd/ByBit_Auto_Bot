@@ -21,7 +21,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ALLOWED_IDS,
     SCAN_INTERVAL_MIN, ALERT_COOLDOWN_HOURS, MAX_ALERTS_PER_SCAN, MIN_STARS_TO_ALERT,
     MIN_AGE_DAYS, MIN_VOLUME_USD_24H,
     MIN_ABS_CHANGE_24H_PCT, ACTIVE_REQUIRE_24H_UP, ACTIVE_MIN_24H_UP_PCT,
@@ -91,6 +91,31 @@ stats = StatsStore(STATS_FILE)
 auto_state = AutoStateStore(AUTO_STATE_FILE)
 trader: Optional[BybitTrader] = None  # initialized in main if API keys present
 auto_trader: Optional[AutoTrader] = None
+
+
+def _allowed_user_ids() -> set[int]:
+    ids = set()
+    if TELEGRAM_CHAT_ID:
+        ids.add(int(TELEGRAM_CHAT_ID))
+    raw = (TELEGRAM_ALLOWED_IDS or "").strip()
+    if raw:
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit() or (part.startswith("-") and part[1:].isdigit()):
+                ids.add(int(part))
+    return ids
+
+
+def user_allowed(msg) -> bool:
+    """Only allow configured Telegram user/chat ids to run commands."""
+    allowed = _allowed_user_ids()
+    if not allowed:
+        return True  # misconfig: do not lock everyone out
+    uid = getattr(getattr(msg, "from_user", None), "id", None)
+    chat_id = getattr(getattr(msg, "chat", None), "id", None)
+    return (uid in allowed) or (chat_id in allowed)
+
+
 
 
 # ---------- API ----------
@@ -1291,6 +1316,23 @@ async def daily_report_loop(bot: Bot):
 # ---------- Commands ----------
 
 dp = Dispatcher()
+
+
+@dp.message.outer_middleware()
+async def _auth_gate(handler, event, data):
+    """Block commands from non-whitelisted users."""
+    try:
+        if event.text and event.text.startswith("/"):
+            if not user_allowed(event):
+                try:
+                    await event.answer("⛔ Нет доступа. Добавь свой user_id в TELEGRAM_ALLOWED_IDS.")
+                except Exception:
+                    pass
+                return
+    except Exception:
+        pass
+    return await handler(event, data)
+
 
 
 @dp.message(Command("start", "help"))

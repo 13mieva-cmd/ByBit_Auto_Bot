@@ -30,6 +30,8 @@ from config import (
     AUTO_BE_ENABLED, AUTO_BE_TRIGGER_PCT, AUTO_BE_BUFFER_PCT,
     STRUCTURE_EXIT_ENABLED, STRUCTURE_EXIT_EMA_1H, STRUCTURE_EXIT_EMA_15M,
     EMA_PERIOD, BYBIT_BASE_URL as _BYBIT_BASE,
+    RISK_SIZING_ENABLED, RISK_USD_PER_TRADE, RISK_SIZE_MIN_USD, RISK_SIZE_MAX_USD,
+    PARTIAL_TP_ENABLED, PARTIAL_TP_PCT,
 )
 from indicators import calculate_ema
 from trader import BybitTrader
@@ -102,7 +104,17 @@ async def check_btc_health() -> dict:
     return result
 
 
+def calc_position_size_usd(sl_pct: float) -> float:
+    """Risk-based notional: risk_usd / (sl_pct/100), clamped to [min, max]."""
+    if not RISK_SIZING_ENABLED or sl_pct is None or sl_pct <= 0:
+        return float(POSITION_SIZE_USD)
+    size = RISK_USD_PER_TRADE / (sl_pct / 100.0)
+    size = max(RISK_SIZE_MIN_USD, min(RISK_SIZE_MAX_USD, size))
+    return round(size, 2)
+
+
 class AutoTrader:
+
     def __init__(self, bot: Bot, trader: BybitTrader, state_store):
         self.bot = bot
         self.trader = trader
@@ -200,18 +212,20 @@ class AutoTrader:
                 tp_pct = AUTO_TP_PCT
                 sl_pct = AUTO_HARD_SL_PCT
 
+            pos_usd = calc_position_size_usd(sl_pct)
+
             base = symbol.replace("USDT", "")
             stars_str = "⭐" * signal["stars"]
             await self.notify(
                 f"🤖 <b>AUTO-ENTRY</b> — {base}\n"
                 f"Сигнал: {sig_type} {stars_str}\n"
-                f"Размер: ${POSITION_SIZE_USD}\n"
+                f"Размер: ${pos_usd:.0f} (risk-sizing)\n"
                 f"TP +{tp_pct}% / SL −{sl_pct}%\n"
                 f"Открываю позицию..."
             )
 
             result = await self.trader.open_long_with_tpsl(
-                symbol, POSITION_SIZE_USD, tp_pct, sl_pct, leverage=LEVERAGE,
+                symbol, pos_usd, tp_pct, sl_pct, leverage=LEVERAGE,
             )
             if not result["ok"]:
                 err = result.get("error", "unknown")
@@ -288,12 +302,12 @@ class AutoTrader:
             await self.notify(
                 f"✅ <b>{base}</b> позиция открыта ({sig_type})\n\n"
                 f"Вход: <code>${pos['entry_price']:.6g}</code>\n"
-                f"Размер: ${POSITION_SIZE_USD} (qty {pos['size']})\n"
+                f"Размер: ${pos_usd:.0f} (qty {pos['size']})\n"
                 f"Плечо: {result['leverage']:.0f}x\n"
                 f"🎯 TP: <code>${result['tp_price']:.6g}</code> (+{tp_pct}%)\n"
                 f"🛑 SL: <code>${result['sl_price']:.6g}</code> (−{sl_pct}%) "
-                f"≈ −${POSITION_SIZE_USD * sl_pct / 100:.2f} "
-                f"({POSITION_SIZE_USD * sl_pct / 100 / DEPOSIT_USD * 100:.1f}% депозита)\n\n"
+                f"≈ −${pos_usd * sl_pct / 100:.2f} "
+                f"({pos_usd * sl_pct / 100 / DEPOSIT_USD * 100:.1f}% депозита)\n\n"
                 f"Активных позиций: {len(self.state.active_positions)}/{MAX_AUTO_POSITIONS}"
             )
 
@@ -428,8 +442,7 @@ class AutoTrader:
         return False
 
     async def maybe_activate_trailing(self, symbol: str, live_pos: dict):
-        """Когда цена прошла TP1-триггер — снять фиксированный TP и включить
-        биржевой трейлинг-стоп. Один раз на позицию, дальше ведёт Bybit."""
+        """TP1 hit: optional partial close, then exchange trailing stop."""
         tracked = self.state.active_positions.get(symbol)
         if not tracked or tracked.get("trailing_active"):
             return
@@ -448,21 +461,34 @@ class AutoTrader:
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT
         if gain_pct < trigger:
             return
-        res = await self.trader.set_trailing_stop(symbol, trail_dist)
         base = symbol.replace("USDT", "")
+        if PARTIAL_TP_ENABLED and not tracked.get("partial_taken"):
+            part = await self.trader.close_position_partial(symbol, PARTIAL_TP_PCT)
+            if part.get("ok"):
+                tracked["partial_taken"] = True
+                self.state._save()
+                await self.notify(
+                    "💰 <b>{}</b>: +{:.1f}% — закрыто <b>{:.0f}%</b> (TP1)\n"
+                    "<i>Остаток на трейлинг.</i>".format(base, gain_pct, PARTIAL_TP_PCT)
+                )
+            else:
+                log.warning("partial TP %s: %s", symbol, part)
+        res = await self.trader.set_trailing_stop(symbol, trail_dist)
         if res.get("ok"):
             tracked["trailing_active"] = True
             self.state._save()
             await self.notify(
-                f"\U0001F513 <b>{base}</b>: +{gain_pct:.1f}% — TP1 пройден\n"
-                f"Фиксированный TP снят, включён <b>трейлинг {trail_dist}%</b>.\n"
-                f"<i>Стоп идёт за ценой вверх, вниз не двигается. Ведёт Bybit.</i>"
+                "🔓 <b>{}</b>: +{:.1f}% — TP1 пройден\n"
+                "Фиксированный TP снят, трейлинг <b>{}%</b>.\n"
+                "<i>Стоп идёт за ценой вверх. Ведёт Bybit.</i>".format(base, gain_pct, trail_dist)
             )
         else:
             await self.notify(
-                f"\u26A0\uFE0F <b>{base}</b>: трейлинг не включился "
-                f"(<code>{res.get('error')}</code>). Обычные TP/SL остаются."
+                "⚠️ <b>{}</b>: трейлинг не включился (<code>{}</code>). TP/SL остаются.".format(
+                    base, res.get("error")
+                )
             )
+
 
     async def handle_closed_position(self, symbol: str):
         tracked = self.state.active_positions.get(symbol)

@@ -12,6 +12,12 @@ import aiohttp
 
 log = logging.getLogger("trader")
 
+try:
+    from config import SL_TRIGGER_BY, TP_TRIGGER_BY
+except Exception:
+    SL_TRIGGER_BY = "MarkPrice"
+    TP_TRIGGER_BY = "LastPrice"
+
 
 class BybitTrader:
     def __init__(self, api_key: str, api_secret: str,
@@ -354,8 +360,8 @@ class BybitTrader:
             "tpslMode": "Full",
             "tpOrderType": "Market",
             "slOrderType": "Market",
-            "tpTriggerBy": "LastPrice",
-            "slTriggerBy": "LastPrice",
+            "tpTriggerBy": TP_TRIGGER_BY,
+            "slTriggerBy": SL_TRIGGER_BY,
             "positionIdx": pos_idx,
         }
 
@@ -407,8 +413,8 @@ class BybitTrader:
             "takeProfit": self._fmt(tp_price, info["tick_size"]),
             "stopLoss": self._fmt(sl_price, info["tick_size"]),
             "tpslMode": "Full",
-            "tpTriggerBy": "LastPrice",
-            "slTriggerBy": "LastPrice",
+            "tpTriggerBy": TP_TRIGGER_BY,
+            "slTriggerBy": SL_TRIGGER_BY,
             "positionIdx": self.position_idx_for("Buy"),
         }
 
@@ -451,6 +457,38 @@ class BybitTrader:
                 continue
 
         return {"ok": True, "has_stop": None, "no_position": True}
+
+
+    async def close_position_partial(self, symbol: str, pct: float = 50.0) -> dict:
+        """Close pct% of long position by market (reduceOnly)."""
+        positions = await self.get_open_positions(symbol)
+        if not positions:
+            return {"ok": True, "msg": "no position"}
+        pos = positions[0]
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": "no instrument info"}
+        qty = pos["size"] * (pct / 100.0)
+        qty = self._round_qty_down(qty, info["qty_step"])
+        if qty < info["min_qty"]:
+            return {"ok": False, "error": f"partial qty {qty} below min"}
+        await self.ensure_position_mode()
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": "Sell",
+            "orderType": "Market",
+            "qty": self._fmt(qty, info["qty_step"]),
+            "reduceOnly": True,
+            "positionIdx": self.position_idx_for("Buy"),
+        }
+        resp = await self._signed_request("POST", "/v5/order/create", params)
+        if not isinstance(resp, dict):
+            return {"ok": False, "error": f"invalid response: {resp!r}"}
+        if resp.get("retCode") != 0:
+            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
+        return {"ok": True, "qty": qty}
 
     async def close_position_market(self, symbol: str) -> dict:
         positions = await self.get_open_positions(symbol)
@@ -509,8 +547,8 @@ class BybitTrader:
             "takeProfit": self._fmt(tp, info["tick_size"]),
             "stopLoss": self._fmt(sl, info["tick_size"]),
             "tpslMode": "Full",
-            "tpTriggerBy": "LastPrice",
-            "slTriggerBy": "LastPrice",
+            "tpTriggerBy": TP_TRIGGER_BY,
+            "slTriggerBy": SL_TRIGGER_BY,
             "positionIdx": self.position_idx_for("Buy"),
         }
         resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
@@ -533,7 +571,7 @@ class BybitTrader:
             "symbol": symbol,
             "stopLoss": self._fmt(sl, info["tick_size"]),
             "tpslMode": "Full",
-            "slTriggerBy": "LastPrice",
+            "slTriggerBy": SL_TRIGGER_BY,
             "positionIdx": self.position_idx_for("Buy"),
         }
         resp = await self._signed_request("POST", "/v5/position/trading-stop", params)

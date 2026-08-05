@@ -50,6 +50,10 @@ from config import (
     BLACKLIST,
     EMA_PERIOD,
     USE_EMA_FILTER,
+    AUTO_BE_ENABLED, AUTO_BE_TRIGGER_PCT, AUTO_BE_BUFFER_PCT,
+    STRUCTURE_EXIT_ENABLED, STRUCTURE_EXIT_EMA_1H,
+    AUTO_TRAIL_ENABLED, AUTO_TP1_TRIGGER_PCT_BB_LOWER, AUTO_TRAIL_DISTANCE_PCT_BB_LOWER,
+    EMA_PERIOD,
 )
 from indicators import calculate_bollinger, calculate_ema
 
@@ -241,19 +245,62 @@ def _oi_change_24h_at(oi_series, ts_ms):
     return (oi1 - oi0) / oi0 * 100
 
 
-def _simulate_exit(highs, lows, closes, entry_i, tp, sl):
+def _simulate_exit(
+    highs,
+    lows,
+    closes,
+    entry_i,
+    tp,
+    sl,
+    entry_price,
+    closes_1h_at=None,
+):
+    """Intrabar exits: SL before TP; models BE, trailing, structure (approx)."""
     end = min(entry_i + MAX_HOLD_BARS, len(closes) - 1)
+    be_active = False
+    trail_active = False
+    cur_sl = sl
+    peak = entry_price
     for j in range(entry_i + 1, end + 1):
-        lo, hi = lows[j], highs[j]
-        hit_sl = lo <= sl
-        hit_tp = hi >= tp
+        lo, hi, cl = lows[j], highs[j], closes[j]
+        if hi > peak:
+            peak = hi
+        gain = (cl - entry_price) / entry_price * 100 if entry_price > 0 else 0
+
+        # BE
+        if AUTO_BE_ENABLED and not be_active and gain >= AUTO_BE_TRIGGER_PCT:
+            be_active = True
+            cur_sl = max(cur_sl, entry_price * (1 + AUTO_BE_BUFFER_PCT / 100))
+
+        # Trailing after TP1 trigger
+        if AUTO_TRAIL_ENABLED and not trail_active and gain >= AUTO_TP1_TRIGGER_PCT_BB_LOWER:
+            trail_active = True
+        if trail_active:
+            trail_sl = peak * (1 - AUTO_TRAIL_DISTANCE_PCT_BB_LOWER / 100)
+            cur_sl = max(cur_sl, trail_sl)
+
+        # Structure exit approx: close below EMA50 on provided 1h series tip
+        if STRUCTURE_EXIT_ENABLED and STRUCTURE_EXIT_EMA_1H and closes_1h_at is not None:
+            # closes_1h_at is list of 1h closes available at this 15m bar
+            if len(closes_1h_at) >= EMA_PERIOD:
+                ema = calculate_ema(closes_1h_at, EMA_PERIOD)
+                if ema is not None and cl < ema and gain < 0:
+                    return j, cl, "STRUCTURE"
+
+        hit_sl = lo <= cur_sl
+        hit_tp = (not trail_active) and hi >= tp
         if hit_sl and hit_tp:
-            return j, sl, "SL"
+            return j, cur_sl, "BE" if be_active and abs(cur_sl - entry_price) / entry_price < 0.005 else "SL"
         if hit_sl:
-            return j, sl, "SL"
+            if trail_active:
+                return j, cur_sl, "TRAILING"
+            if be_active and abs(cur_sl - entry_price) / max(entry_price, 1e-12) < 0.005:
+                return j, cur_sl, "BE"
+            return j, cur_sl, "SL"
         if hit_tp:
             return j, tp, "TP"
     return end, closes[end], "TIMEOUT"
+
 
 
 def _signal_at(
@@ -410,7 +457,10 @@ async def backtest_symbol(session, symbol, days=30, use_oi=False):
         entry = sig["price"]
         tp = sig["tp"]
         sl = sig["sl"]
-        exit_i, exit_px, reason = _simulate_exit(highs, lows, closes, i, tp, sl)
+        exit_i, exit_px, reason = _simulate_exit(
+            highs, lows, closes, i, tp, sl, entry,
+            closes_1h_at=closes_1h_now,
+        )
 
         pnl_pct = (exit_px - entry) / entry * 100 - 2 * FEE_PCT
         pnl_usd = POSITION_SIZE_USD * pnl_pct / 100

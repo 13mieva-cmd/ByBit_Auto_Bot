@@ -23,11 +23,29 @@ class JsonStore:
             log.error(f"Failed to load {self.path}: {e}")
 
     def _save(self):
+        """Atomic write: temp file + os.replace. Optional flock when available."""
         try:
-            with open(self.path, "w") as f:
+            directory = os.path.dirname(os.path.abspath(self.path)) or "."
+            os.makedirs(directory, exist_ok=True)
+            tmp_path = self.path + ".tmp"
+            # Write to temp
+            with open(tmp_path, "w") as f:
+                try:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
                 json.dump(self.data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.path)
         except Exception as e:
             log.error(f"Failed to save {self.path}: {e}")
+            try:
+                if os.path.exists(self.path + ".tmp"):
+                    os.remove(self.path + ".tmp")
+            except Exception:
+                pass
 
 
 class PositionStore(JsonStore):
