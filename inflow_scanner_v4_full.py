@@ -367,7 +367,7 @@ async def analyze_coin(session, c: dict, btc_1h: float) -> Optional[dict]:
 
     # ========== BB_LOWER first: 24h uptrend + close 15m < lower BB ==========
     if ENABLE_BB_LOWER:
-        bb_low = try_bb_lower(base_data, closes_15m)
+        bb_low = try_bb_lower(base_data, closes_15m, highs_15m, lows_15m)
         if bb_low:
             return bb_low
 
@@ -661,45 +661,68 @@ def try_bb_squeeze(d: dict, closes_15m: list[float]) -> Optional[dict]:
 
 
 
-def try_bb_lower(d: dict, closes_15m: list[float]) -> Optional[dict]:
+def try_bb_lower(
+    d: dict,
+    closes_15m: list[float],
+    highs_15m: list[float] | None = None,
+    lows_15m: list[float] | None = None,
+) -> Optional[dict]:
     """
-    Лонг от нижней полосы Bollinger в 24h-аптренде.
-    1) Цена за 24ч растёт (восходящий тренд)
-    2) Close 15m ПРОБИВАЕТ lower BB вниз (не фитиль: close < lower)
-    3) Предыдущий close был >= lower (свежий пробой)
-    4) Прокол не слишком глубокий (иначе слом тренда)
-    5) Выше EMA50 1h (старший тренд жив), RSI 15m в зоне откупа
+    Стратегия: 24h long-тренд → цена ушла под lower BB → ждём close 15m →
+    если тренд жив и нет блокеров → вход в лонг (оптимально у нижней полосы).
+
+    1) 24h цена в плюсе (long trend)
+    2) Close 15m < lower BB (остановка свечи ПОД полосой, не фитиль)
+    3) Свежий заход: prev close ещё был >= lower
+    4) Тренд не сломан: last/1h всё ещё у EMA50, BTC не в дампе
+    5) Оптимальный вход: свеча-отбой (не свободное падение) + RSI в зоне откупа
     """
     lower = d.get("bb_lower")
-    upper = d.get("bb_upper")
     mid = d.get("bb_middle")
     if lower is None or mid is None:
         return None
     if not closes_15m or len(closes_15m) < BB_PERIOD + 2:
         return None
 
-    # 24h восходящий тренд
-    if (d.get("price_change_24h") or 0) < BB_LOWER_TREND_24H_MIN:
+    # --- 1) Long trend 24h ---
+    pc24 = d.get("price_change_24h") or 0
+    if pc24 < BB_LOWER_TREND_24H_MIN:
         return None
 
-    # Старший ТФ: цена всё ещё выше EMA50 1h
-    if USE_EMA_FILTER and d.get("ema50_1h") is not None and d["price"] < d["ema50_1h"]:
-        return None
+    # --- 2) Старший тренд жив (EMA50 1h) ---
+    # Сравниваем с 1h-контекстом; 15m может быть ниже lower, но структура 1h — long
+    if USE_EMA_FILTER and d.get("ema50_1h") is not None:
+        ref = d.get("price")  # 1h close из base_data
+        if ref is not None and ref < d["ema50_1h"]:
+            return None
 
     close = closes_15m[-1]
     prev = closes_15m[-2]
 
-    # Реальный пробой: close ниже lower (не закол фитилём)
+    # --- 3) Close 15m ниже lower BB (именно закрытие, не закол) ---
     if close >= lower:
         return None
-    # Свежий пробой: предыдущая свеча ещё была на/над lower
     if prev < lower:
-        return None
+        return None  # уже давно под полосой — не первая остановка
 
-    # Глубина прокола
     break_pct = (lower - close) / lower * 100 if lower > 0 else 0
     if break_pct > BB_LOWER_MAX_BREAK_PCT:
-        return None
+        return None  # слишком глубоко = возможный слом, не «отбой от полосы»
+
+    # --- 4) Оптимальный вход: свеча не в свободном падении ---
+    # Ищем отбой: close ближе к high свечи, чем к low (поглощение / остановка)
+    if highs_15m and lows_15m and len(highs_15m) >= 1 and len(lows_15m) >= 1:
+        hi = highs_15m[-1]
+        lo = lows_15m[-1]
+        rng = hi - lo
+        if rng > 0:
+            close_pos = (close - lo) / rng  # 0=на low, 1=на high
+            # Свободное падение: закрылись у минимумов
+            if close_pos < 0.25:
+                return None
+        # Доп.: mid BB всё ещё выше close (полоса «над головой» — место для отскока к mid)
+        if mid is not None and close >= mid:
+            return None
 
     rsi_15 = d.get("rsi_15m")
     if rsi_15 is not None:
@@ -708,28 +731,27 @@ def try_bb_lower(d: dict, closes_15m: list[float]) -> Optional[dict]:
         if rsi_15 < BB_LOWER_RSI_MIN:
             return None
 
-    # Не против BTC-слива (мягко)
+    # --- 5) Ничего не мешает long ---
     if d.get("btc_1h", 0) < -1.0:
         return None
 
     stars = 1
-    pc24 = d.get("price_change_24h") or 0
     if pc24 >= BB_LOWER_TREND_24H_MIN * 2 and break_pct <= 0.6:
         stars = 2
     if stars == 2 and (d.get("oi_change_24h") or 0) >= 3.0 and d.get("btc_1h", 0) >= -0.3:
         stars = 3
 
-    # Цена сигнала = close 15m (точка входа ниже lower BB)
     return {
         **d,
-        "price": close,
+        "price": close,  # точка входа = close 15m под lower
         "stars": stars,
         "signal_type": "BB_LOWER",
         "bb_break_pct": round(break_pct, 2),
         "bb_bandwidth": round(d["bb_bandwidth"], 2) if d.get("bb_bandwidth") is not None else None,
         "bb_lower_close_ok": True,
         "bb_lower": lower,
-        "entry_note": f"close15m {close:.6g} < lower {lower:.6g}",
+        "price_change_24h": pc24,
+        "entry_note": f"24h {pc24:+.1f}% | close15m {close:.6g} < lower {lower:.6g}",
     }
 
 
