@@ -310,7 +310,8 @@ class BybitTrader:
         position_size_usd: float,
         tp_pct: float,
         sl_pct: float,
-        leverage: float = None
+        leverage: float = None,
+        sl_only: bool = False,
     ) -> dict:
         """Открыть лонг с TP/SL на уровне позиции.
 
@@ -355,15 +356,16 @@ class BybitTrader:
             "side": "Buy",
             "orderType": "Market",
             "qty": qty_str,
-            "takeProfit": tp_str,
             "stopLoss": sl_str,
             "tpslMode": "Full",
-            "tpOrderType": "Market",
             "slOrderType": "Market",
-            "tpTriggerBy": TP_TRIGGER_BY,
             "slTriggerBy": SL_TRIGGER_BY,
             "positionIdx": pos_idx,
         }
+        if not sl_only:
+            order_params["takeProfit"] = tp_str
+            order_params["tpOrderType"] = "Market"
+            order_params["tpTriggerBy"] = TP_TRIGGER_BY
 
         resp = await self._signed_request("POST", "/v5/order/create", order_params)
 
@@ -382,9 +384,76 @@ class BybitTrader:
             "order_id": resp.get("result", {}).get("orderId"),
             "qty": qty,
             "entry_price_estimate": current_price,
-            "tp_price": tp_price,
+            "tp_price": None if sl_only else tp_price,
             "sl_price": sl_price,
             "leverage": lev,
+            "sl_only": sl_only,
+        }
+
+
+    async def open_short_with_tpsl(
+        self,
+        symbol: str,
+        position_size_usd: float,
+        tp_pct: float,
+        sl_pct: float,
+        leverage: float = None,
+        sl_only: bool = False,
+    ) -> dict:
+        """Открыть SHORT с SL (и опционально TP)."""
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": f"no instrument info for {symbol}"}
+        current_price = await self.get_last_price(symbol)
+        if current_price is None or current_price <= 0:
+            return {"ok": False, "error": "price fetch failed"}
+        qty_raw = position_size_usd / current_price
+        qty = self._round_qty_down(qty_raw, info["qty_step"])
+        if qty < info["min_qty"]:
+            return {"ok": False, "error": f"qty {qty} below min {info['min_qty']}"}
+        # short: TP below, SL above
+        tp_price = self._round_price(current_price * (1 - tp_pct / 100), info["tick_size"])
+        sl_price = self._round_price(current_price * (1 + sl_pct / 100), info["tick_size"])
+        qty_str = self._fmt(qty, info["qty_step"])
+        tp_str = self._fmt(tp_price, info["tick_size"])
+        sl_str = self._fmt(sl_price, info["tick_size"])
+        lev = leverage if leverage else 10.0
+        lev = min(float(lev), float(info["max_leverage"]))
+        await self.set_leverage(symbol, lev)
+        await self.ensure_position_mode()
+        pos_idx = self.position_idx_for("Sell")
+        order_params = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": "Sell",
+            "orderType": "Market",
+            "qty": qty_str,
+            "stopLoss": sl_str,
+            "tpslMode": "Full",
+            "slOrderType": "Market",
+            "slTriggerBy": SL_TRIGGER_BY,
+            "positionIdx": pos_idx,
+        }
+        if not sl_only:
+            order_params["takeProfit"] = tp_str
+            order_params["tpOrderType"] = "Market"
+            order_params["tpTriggerBy"] = TP_TRIGGER_BY
+        resp = await self._signed_request("POST", "/v5/order/create", order_params)
+        if not isinstance(resp, dict):
+            return {"ok": False, "error": f"invalid response: {resp!r}"}
+        if resp.get("retCode") != 0:
+            return {"ok": False, "error": resp.get("retMsg", "unknown"), "code": resp.get("retCode")}
+        return {
+            "ok": True,
+            "order_id": resp.get("result", {}).get("orderId"),
+            "qty": qty,
+            "entry_price_estimate": current_price,
+            "tp_price": None if sl_only else tp_price,
+            "sl_price": sl_price,
+            "leverage": lev,
+            "sl_only": sl_only,
+            "side": "Sell",
         }
 
     async def set_tpsl_from_fill(self, symbol: str, tp_pct: float, sl_pct: float) -> dict:
@@ -503,15 +572,17 @@ class BybitTrader:
 
         qty_str = self._fmt(pos["size"], info["qty_step"])
         await self.ensure_position_mode()
-        # Закрытие лонга = Sell; в hedge idx лонга = 1
+        pos_side = pos.get("side") or "Buy"  # Buy=long, Sell=short
+        # Close long with Sell, close short with Buy
+        close_side = "Sell" if pos_side == "Buy" else "Buy"
         params = {
             "category": "linear",
             "symbol": symbol,
-            "side": "Sell",
+            "side": close_side,
             "orderType": "Market",
             "qty": qty_str,
             "reduceOnly": True,
-            "positionIdx": self.position_idx_for("Buy"),
+            "positionIdx": self.position_idx_for(pos_side),
         }
 
         resp = await self._signed_request("POST", "/v5/order/create", params)
@@ -531,6 +602,40 @@ class BybitTrader:
 
 
 
+
+
+    async def set_sl_only_from_fill(self, symbol: str, sl_pct: float) -> dict:
+        """Поставить только SL от avgPrice (без TP). Long: SL below; Short: SL above."""
+        positions = await self.get_open_positions(symbol)
+        if not positions:
+            return {"ok": False, "error": "нет позиции"}
+        pos = positions[0]
+        entry = float(pos["entry_price"])
+        side = pos.get("side") or "Buy"
+        instruments = await self.get_instruments_cached()
+        info = instruments.get(symbol)
+        if not info:
+            return {"ok": False, "error": "no instrument info"}
+        if side == "Sell":
+            sl_price = self._round_price(entry * (1 + sl_pct / 100), info["tick_size"])
+        else:
+            sl_price = self._round_price(entry * (1 - sl_pct / 100), info["tick_size"])
+        await self.ensure_position_mode()
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "stopLoss": self._fmt(sl_price, info["tick_size"]),
+            "takeProfit": "0",
+            "tpslMode": "Full",
+            "slTriggerBy": SL_TRIGGER_BY,
+            "positionIdx": self.position_idx_for(side),
+        }
+        resp = await self._signed_request("POST", "/v5/position/trading-stop", params)
+        if not isinstance(resp, dict):
+            return {"ok": False, "error": f"invalid response: {resp!r}"}
+        if resp.get("retCode") not in (0, 34040):
+            return {"ok": False, "error": resp.get("retMsg"), "code": resp.get("retCode")}
+        return {"ok": True, "sl_price": sl_price, "tp_price": None}
 
     async def set_tpsl_prices(self, symbol: str, tp_price: float, sl_price: float) -> dict:
         """Поставить TP и SL по абсолютным ценам (mid/upper BB, low свечи)."""

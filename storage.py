@@ -6,6 +6,21 @@ import time
 
 log = logging.getLogger("storage")
 
+def append_metrics_csv(path: str, row: dict):
+    """Append one trade/signal row to CSV (header auto)."""
+    import csv
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        new_file = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()), extrasaction="ignore")
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:
+        log.warning(f"metrics csv: {e}")
+
+
 
 class JsonStore:
     def __init__(self, path: str, default):
@@ -23,11 +38,29 @@ class JsonStore:
             log.error(f"Failed to load {self.path}: {e}")
 
     def _save(self):
+        """Atomic write: temp file + os.replace. Optional flock when available."""
         try:
-            with open(self.path, "w") as f:
+            directory = os.path.dirname(os.path.abspath(self.path)) or "."
+            os.makedirs(directory, exist_ok=True)
+            tmp_path = self.path + ".tmp"
+            # Write to temp
+            with open(tmp_path, "w") as f:
+                try:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
                 json.dump(self.data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.path)
         except Exception as e:
             log.error(f"Failed to save {self.path}: {e}")
+            try:
+                if os.path.exists(self.path + ".tmp"):
+                    os.remove(self.path + ".tmp")
+            except Exception:
+                pass
 
 
 class PositionStore(JsonStore):
@@ -167,15 +200,17 @@ class AutoStateStore(JsonStore):
             "daily_pnl": 0.0,
             "daily_pnl_date": "",
             "consecutive_losses": 0,
+            "closed_trades": [],  # recent closed for circuit breaker
+
             "blocked_until": 0,
             "blocked_reason": "",
             "active_positions": {},
             "signal_toggles": {
-                "STANDARD": True,
-                "SURGE": True,
-                "PULLBACK": True,
+                "STANDARD": False,
+                "SURGE": False,
+                "PULLBACK": False,
                 "BB_SQUEEZE": True,
-                "BB_LOWER": True,
+                "BB_LOWER": False,
             },
             "post_trade_cooldown": {},  # symbol -> expiration timestamp
             "btc_filter_enabled": True,
@@ -234,6 +269,31 @@ class AutoStateStore(JsonStore):
     @property
     def consecutive_losses(self) -> int:
         return self.data.get("consecutive_losses", 0)
+
+
+    def record_closed_trade(self, trade: dict):
+        """Append closed trade summary (for WR circuit breaker). Keep last 50."""
+        hist = self.data.setdefault("closed_trades", [])
+        hist.append(trade)
+        self.data["closed_trades"] = hist[-50:]
+        self._save()
+
+    def recent_winrate(self, lookback: int = 12) -> tuple:
+        """Return (winrate_pct or None, n_trades)."""
+        hist = self.data.get("closed_trades") or []
+        recent = hist[-lookback:] if lookback else hist
+        if not recent:
+            return None, 0
+        wins = sum(1 for x in recent if float(x.get("pnl_usd") or 0) > 0)
+        n = len(recent)
+        return wins / n * 100.0, n
+
+    def block_circuit(self, wr: float, n: int):
+        self.data["enabled"] = False
+        self.data["blocked"] = True
+        self.data["blocked_reason"] = f"circuit_breaker WR {wr:.1f}% on {n} trades"
+        self._save()
+
 
     def incr_consecutive_loss(self):
         self.data["consecutive_losses"] = self.data.get("consecutive_losses", 0) + 1
