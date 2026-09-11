@@ -14,6 +14,7 @@ from config import (
     POSITION_SIZE_USD, AUTO_TP_PCT, AUTO_HARD_SL_PCT,
     AUTO_PULLBACK_TP_PCT, AUTO_PULLBACK_SL_PCT,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
+    AUTO_BB_LOWER_TP_PCT, AUTO_BB_LOWER_SL_PCT,
     MAX_AUTO_POSITIONS, DAILY_LOSS_LIMIT_USD, CONSECUTIVE_LOSS_BLOCK,
     AUTO_TRADE_SIGNAL_TYPES, RECONCILE_INTERVAL_SEC,
     POST_TRADE_COOLDOWN_HOURS,
@@ -24,7 +25,7 @@ from config import (
     AUTO_TRAIL_ENABLED, AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT,
     AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB,
     AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB,
-    MAX_ENTRY_DEVIATION_PCT,
+    AUTO_TP1_TRIGGER_PCT_BB_LOWER, AUTO_TRAIL_DISTANCE_PCT_BB_LOWER,
 )
 from trader import BybitTrader
 
@@ -156,14 +157,6 @@ class AutoTrader:
             if symbol in self.state.active_positions:
                 return
 
-            signal_price = float(signal.get("price") or 0)
-            live_price = await self.trader.get_last_price(symbol)
-            if signal_price <= 0 or live_price is None or live_price <= 0:
-                return
-            if abs(live_price - signal_price) / signal_price * 100 > MAX_ENTRY_DEVIATION_PCT:
-                log.info(f"{symbol}: stale signal; auto-entry skipped")
-                return
-
             # Also check Bybit-side: is there really no position? (sync safety)
             bybit_positions = await self.trader.get_open_positions(symbol)
             if bybit_positions:
@@ -177,6 +170,9 @@ class AutoTrader:
             elif sig_type == "BB_SQUEEZE":
                 tp_pct = AUTO_BB_TP_PCT
                 sl_pct = AUTO_BB_SL_PCT
+            elif sig_type == "BB_LOWER":
+                tp_pct = AUTO_BB_LOWER_TP_PCT
+                sl_pct = AUTO_BB_LOWER_SL_PCT
             else:
                 tp_pct = AUTO_TP_PCT
                 sl_pct = AUTO_HARD_SL_PCT
@@ -203,15 +199,13 @@ class AutoTrader:
                 )
                 return
 
-            positions = []
-            for _ in range(5):
-                await asyncio.sleep(1)
-                positions = await self.trader.get_open_positions(symbol)
-                if positions:
-                    break
+            await asyncio.sleep(2)
+            positions = await self.trader.get_open_positions(symbol)
             if not positions:
-                await self.trader.cancel_all_orders(symbol)
-                await self.notify(f"⚠️ <b>{base}</b>: позиция не подтверждена; ожидающие ордера отменены.")
+                await self.notify(
+                    f"⚠️ <b>{base}</b>: ордер отправлен, "
+                    f"но позиция не подтверждена. Проверь Bybit."
+                )
                 return
             pos = positions[0]
 
@@ -298,6 +292,8 @@ class AutoTrader:
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_PB, AUTO_TRAIL_DISTANCE_PCT_PB
         elif tracked.get("signal_type") == "BB_SQUEEZE":
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB
+        elif tracked.get("signal_type") == "BB_LOWER":
+            trigger, trail_dist = AUTO_TP1_TRIGGER_PCT_BB_LOWER, AUTO_TRAIL_DISTANCE_PCT_BB_LOWER
         else:
             trigger, trail_dist = AUTO_TP1_TRIGGER_PCT, AUTO_TRAIL_DISTANCE_PCT
         if gain_pct < trigger:
