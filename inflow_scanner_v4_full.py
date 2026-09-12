@@ -830,7 +830,7 @@ async def scan_once(session) -> list[dict]:
     for s in scored:
         by_type[s["signal_type"]] += 1
     log.info(f"=== SCAN END: {len(scored)} alerts | "
-             f"STD:{by_type.get('STANDARD',0)} SURGE:{by_type.get('SURGE',0)} PB:{by_type.get('PULLBACK',0)} BB:{by_type.get('BB_SQUEEZE',0)} BBL:{by_type.get('BB_LOWER',0)} ===")
+             f"BB:{by_type.get('BB_SQUEEZE',0)} SHORT:{by_type.get('BB_SQUEEZE_SHORT',0)} ===")
     return scored
 
 
@@ -856,75 +856,135 @@ def make_tp1_keyboard(symbol: str):
 
 
 SIGNAL_HEADERS = {
-    "STANDARD": "🟢 <b>LONG</b> · STANDARD",
-    "SURGE":    "⚡ <b>LONG</b> · OI SURGE",
-    "PULLBACK": "↩️ <b>LONG</b> · PULLBACK",
     "BB_SQUEEZE": "📉 <b>LONG</b> · BB SQUEEZE",
-    "BB_LOWER": "📗 <b>LONG</b> · BB LOWER",
+    "BB_SQUEEZE_SHORT": "📈 <b>SHORT</b> · BB SQUEEZE",
 }
 
 SIGNAL_LOGIC = {
-    "STANDARD": "Цена↑ 4ч + OI↑ 4ч + объём = свежие деньги входят",
-    "SURGE":    "Цена↑ 1ч + OI↑ 1ч = очень ранний старт тренда",
-    "PULLBACK": "Тренд вверх + откат к EMA21 + OI растёт = вход на ретесте",
-    "BB_SQUEEZE": "Сужение Bollinger 15m → пробой upper → вход на небольшом откате",
-    "BB_LOWER": "24h long → dip under lower → reclaim 15m → OI/vol → TP mid/upper",
+    "BB_SQUEEZE": (
+        "KC-squeeze ≥6 · пробой upper · откат · vol/OI · "
+        "SL зона · TP soft/zone"
+    ),
+    "BB_SQUEEZE_SHORT": (
+        "KC-squeeze ≥6 · пробой lower · отскок · vol · "
+        "SL зона · TP soft"
+    ),
 }
 
 
 def format_alert(s: dict) -> str:
+    """Актуальная карточка только под BB_SQUEEZE / SHORT."""
     base = s["symbol"].replace("USDT", "")
-    star_emoji = "⭐" * s["stars"]
-    star_label = {1: "СЛАБЫЙ", 2: "ХОРОШИЙ", 3: "ПРЕМИУМ"}[s["stars"]]
-    price = s["price"]
-    tp1 = price * (1 + TP1_PCT / 100)
-    tp2 = price * (1 + TP2_PCT / 100)
-    hard_sl = price * (1 - HARD_SL_PCT / 100)
-    vol_m = s["vol_24h"] / 1e6
-    header = SIGNAL_HEADERS.get(s["signal_type"], "🟢 <b>LONG</b>")
-    logic = SIGNAL_LOGIC.get(s["signal_type"], "")
+    stars = int(s.get("stars") or 1)
+    star_emoji = "⭐" * max(1, min(stars, 3))
+    star_label = {1: "СЛАБЫЙ", 2: "ХОРОШИЙ", 3: "ПРЕМИУМ"}.get(stars, "СЛАБЫЙ")
+    price = float(s.get("price") or 0)
+    sig = s.get("signal_type") or "BB_SQUEEZE"
+    is_short = sig == "BB_SQUEEZE_SHORT"
+    header = SIGNAL_HEADERS.get(sig, "📉 <b>BB SQUEEZE</b>")
+    logic = SIGNAL_LOGIC.get(sig, "")
 
-    # Sparklines block
-    sparkline_block = ""
-    if s.get("price_sparkline_24h"):
-        sparkline_block += f"Цена 24ч: <code>{s['price_sparkline_24h']}</code>\n"
-    if s.get("oi_24h_sparkline"):
-        sparkline_block += f"OI 24ч:    <code>{s['oi_24h_sparkline']}</code>\n"
+    # Levels from signal (structure) or fallbacks
+    tp_pct = float(s.get("tp_pct") or 0) or None
+    sl_pct = float(s.get("sl_pct") or 0) or None
+    tp_abs = s.get("tp_price_abs")
+    sl_abs = s.get("sl_price_abs")
+    if tp_abs is None and tp_pct and price:
+        tp_abs = price * (1 - tp_pct / 100) if is_short else price * (1 + tp_pct / 100)
+    if sl_abs is None and sl_pct and price:
+        sl_abs = price * (1 + sl_pct / 100) if is_short else price * (1 - sl_pct / 100)
 
-    bb_line = ""
-    if s.get("signal_type") == "BB_SQUEEZE":
-        bb_line = (
-            f"📉 BB 15m: bw {s.get('bb_bandwidth', 0):.2f}% | "
-            f"откат {s.get('bb_pullback_pct', 0):.2f}% | "
-            f"vol×{s.get('vol_spike_15m', 0):.1f}"
-            f"{' | KC-squeeze' if s.get('kc_squeeze_now') or any((s.get('kc_squeeze_hist') or [False])[:3]) else ''}\n"
+    bw = s.get("bb_bandwidth")
+    pull = s.get("bb_pullback_pct")
+    vol15 = s.get("vol_spike_15m")
+    sq = s.get("squeeze_bars")
+    zone_r = s.get("zone_range_pct")
+    note = s.get("entry_note") or ""
+
+    oi24 = s.get("oi_change_24h")
+    oi4 = s.get("oi_change_4h")
+    pc24 = s.get("price_change_24h")
+    pc1 = s.get("price_change_1h")
+    btc1 = s.get("btc_1h")
+    btc24 = s.get("btc_24h")
+    fr = s.get("funding_rate")
+    rsi15 = s.get("rsi_15m")
+    vol_m = (s.get("vol_24h") or 0) / 1e6
+
+    lines = [
+        f"{header} {star_emoji} <b>{star_label}</b> — <b>{base}</b>",
+        "",
+        f"<i>{logic}</i>",
+        "",
+        f"💵 <b>Цена:</b> <code>${price:.6g}</code>",
+    ]
+    if tp_abs and sl_abs and tp_pct is not None and sl_pct is not None:
+        lines.append(
+            f"🎯 <b>TP</b> <code>${float(tp_abs):.6g}</code> ({tp_pct:+.2f}%) · "
+            f"<b>SL</b> <code>${float(sl_abs):.6g}</code> ({sl_pct:+.2f}%)"
         )
-    elif s.get("signal_type") == "BB_LOWER":
-        bb_line = (
-            f"📗 BB lower: прокол {s.get('bb_break_pct', 0):.2f}% | "
-            f"24h {s.get('price_change_24h', 0):+.1f}%\n"
-        )
-    
-    return (
-        f"{header} {star_emoji} <b>{star_label}</b> — <b>{base}</b>\n\n"
-        f"💵 Цена: <code>${price:.6g}</code>\n"
-        f"📈 Цена: 1ч <b>{s['price_change_1h']:+.2f}%</b> | 4ч <b>{s['price_change_4h']:+.2f}%</b>\n"
-        f"💰 OI: 1ч <b>{(s.get('oi_change_1h') or 0):+.1f}%</b> | "
-        f"4ч <b>{(s.get('oi_change_4h') or 0):+.1f}%</b> | "
-        f"24ч <b>{(s.get('oi_change_24h') or 0):+.1f}%</b>\n"
-        f"📊 Объём: 4ч ×{s['vol_spike_4h']:.1f} | 24ч ${vol_m:.0f}M\n"
-        f"📈 RSI: 1h {s['rsi_1h']:.0f} | 4h {s['rsi_4h']:.0f}\n"
-        f"{bb_line}"
-        f"₿ BTC 1ч: {s['btc_1h']:+.2f}%\n"
-        f"📅 Возраст: {s['age_days']}д\n\n"
-        f"{sparkline_block}\n"
-        f"<b>Логика:</b> {logic}\n\n"
-        f"🎯 <b>TP1 (+{TP1_PCT}%):</b> <code>${tp1:.6g}</code>  — закрой 50%\n"
-        f"🎯 <b>TP2 (+{TP2_PCT}%):</b> <code>${tp2:.6g}</code>  — закрой остаток\n"
-        f"🛑 <b>Hard SL (−{HARD_SL_PCT}%):</b> <code>${hard_sl:.6g}</code> <i>(аварийный)</i>\n"
-        f"⏱ Тайм-стоп: {POSITION_TIMEOUT_HOURS}ч\n\n"
-        f"<i>Стратегия: следим за OI. При падении OI бот предупредит — это сигнал выхода.</i>"
-    )
+    elif tp_pct is not None and sl_pct is not None:
+        lines.append(f"🎯 TP {tp_pct:+.2f}% · SL {sl_pct:+.2f}%")
+
+    lines.append("")
+    lines.append("<b>Squeeze</b>")
+    sq_bits = []
+    if sq is not None:
+        sq_bits.append(f"KC×{sq}")
+    if bw is not None:
+        sq_bits.append(f"BW {float(bw):.2f}%")
+    if pull is not None:
+        sq_bits.append(f"откат {float(pull):.2f}%")
+    if vol15 is not None:
+        sq_bits.append(f"vol×{float(vol15):.2f}")
+    if zone_r is not None:
+        sq_bits.append(f"zone {float(zone_r):.2f}%")
+    if sq_bits:
+        lines.append(" · ".join(sq_bits))
+    if note:
+        lines.append(f"<i>{note}</i>")
+
+    lines.append("")
+    lines.append("<b>Контекст</b>")
+    ctx = []
+    if pc1 is not None:
+        ctx.append(f"1ч {float(pc1):+.2f}%")
+    if pc24 is not None:
+        ctx.append(f"24ч {float(pc24):+.2f}%")
+    if oi4 is not None:
+        ctx.append(f"OI4ч {float(oi4):+.1f}%")
+    if oi24 is not None:
+        ctx.append(f"OI24ч {float(oi24):+.1f}%")
+    if ctx:
+        lines.append(" · ".join(ctx))
+    extra = []
+    if rsi15 is not None:
+        extra.append(f"RSI15 {float(rsi15):.0f}")
+    if fr is not None:
+        extra.append(f"fund {float(fr)*100:.3f}%")
+    if vol_m:
+        extra.append(f"оборот ${vol_m:.1f}M")
+    if extra:
+        lines.append(" · ".join(extra))
+    btc_bits = []
+    if btc1 is not None:
+        btc_bits.append(f"BTC1ч {float(btc1):+.2f}%")
+    if btc24 is not None:
+        btc_bits.append(f"BTC24ч {float(btc24):+.2f}%")
+    if btc_bits:
+        lines.append(" · ".join(btc_bits))
+
+    # Optional sparklines
+    if s.get("price_sparkline_24h") or s.get("oi_24h_sparkline"):
+        lines.append("")
+        if s.get("price_sparkline_24h"):
+            lines.append(f"Цена 24ч <code>{s['price_sparkline_24h']}</code>")
+        if s.get("oi_24h_sparkline"):
+            lines.append(f"OI 24ч <code>{s['oi_24h_sparkline']}</code>")
+
+    lines.append("")
+    lines.append("<i>Авто: только SL до TP1 → partial → trail · BE · momentum exit</i>")
+    return "\n".join(lines)
 
 
 async def scan_and_alert(bot: Bot):
@@ -1220,47 +1280,30 @@ async def cmd_scan(msg: types.Message):
 
 @dp.message(Command("settings"))
 async def cmd_settings(msg: types.Message):
-    await msg.answer(
-        f"<b>Сканер:</b>\n"
-        f"• Интервал скана: {SCAN_INTERVAL_MIN} мин\n"
-        f"• Кулдаун: {ALERT_COOLDOWN_HOURS}ч\n"
-        f"• Возраст: ≥{MIN_AGE_DAYS}д\n"
-        f"• Активные: оборот ≥${MIN_VOLUME_USD_24H/1e6:.0f}M, топ-{MAX_SCAN_SYMBOLS}\n"f"• 24h long ≥+{ACTIVE_MIN_24H_UP_PCT}% | спред ≤{MAX_SPREAD_PCT}%\n\n"
-        f"<b>🟢 STANDARD:</b>\n"
-        f"• Цена 4ч: +{PRICE_CHANGE_4H_MIN}…+{PRICE_CHANGE_4H_MAX}%\n"
-        f"• OI 4ч: ≥+{OI_CHANGE_4H_MIN}%\n"
-        f"• Объём 4ч: ≥×{VOLUME_SPIKE_MIN}\n"
-        f"• RSI 4ч: {RSI_4H_MIN}–{RSI_4H_MAX}\n"
-        f"• ⭐⭐: OI 24ч ≥+{OI_CHANGE_24H_2STAR}% И объём ×{VOLUME_SPIKE_2STAR}\n"
-        f"• ⭐⭐⭐: ⭐⭐ + пробой 24ч максимума + BTC 1ч ≥ 0%\n\n"
-        f"<b>⚡ SURGE:</b> {'ON' if ENABLE_OI_SURGE else 'OFF'}\n"
-        f"• Цена 1ч: +{SURGE_PRICE_1H_MIN}…+{SURGE_PRICE_1H_MAX}%\n"
-        f"• OI 1ч: ≥+{SURGE_OI_1H_MIN}%\n"
-        f"• OI 24ч: ≥+{SURGE_OI_24H_MIN}% (защита от short squeeze)\n"
-        f"• RSI 1ч: ≤{SURGE_RSI_1H_MAX}\n"
-        f"• ⭐⭐⭐: ⭐⭐ + объём 4ч ×1.5 + BTC 1ч ≥ 0%\n\n"
-        f"<b>↩️ PULLBACK:</b> {'ON' if ENABLE_PULLBACK else 'OFF'}\n"
-        f"• Цена &gt; EMA50, EMA21 &gt; EMA50\n"
-        f"• Расстояние до EMA21: ≤{PULLBACK_EMA_DISTANCE_PCT}%\n"
-        f"• RSI 1ч: {PULLBACK_RSI_1H_MIN}–{PULLBACK_RSI_1H_MAX}\n"
-        f"• OI 24ч: ≥+{PULLBACK_OI_24H_MIN}%\n"
-        f"• OI 1ч: ≥+{PULLBACK_OI_1H_MIN}% (не падает)\n"
-        f"• 2 зелёные свечи подряд на 1h\n"
-        f"• ⭐⭐⭐: ⭐⭐ + OI 1ч ≥+3% + объём 1ч ×1.5\n\n"
-        f"<b>📉 BB SQUEEZE:</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}\n"
-        f"• BB 20/2 + Keltner squeeze (BB inside KC)\n"
-        f"• BB Width 15m (≤{BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%)\n"
-        f"• Истинный пробой upper + расширение полос + объём ×{BB_BREAKOUT_VOL_MIN}\n"
-        f"• Отсев ложного пробоя (close обратно внутрь канала)\n"
-        f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}%, цена ≥ mid BB\n"
-        f"• OI 24ч ≥+{BB_OI_24H_MIN}% / 4ч ≥+{BB_OI_4H_MIN}%; RSI 15м ≤{BB_PULLBACK_RSI_MAX}\n"
-        f"• Авто: TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%\n\n"
-        f"<b>Ручная сделка (трекер):</b>\n"
-        f"• TP1: +{TP1_PCT}% / TP2: +{TP2_PCT}%\n"
-        f"• Hard SL: −{HARD_SL_PCT}%\n"
-        f"• Тайм-стоп: {POSITION_TIMEOUT_HOURS}ч\n\n"
-        f"<b>Авто-торговля:</b> /auto"
-    )
+    text = "\n".join([
+        "<b>⚙️ Настройки бота</b>",
+        "",
+        "<b>Сканер</b>",
+        f"• Интервал: {SCAN_INTERVAL_MIN} мин · кулдаун {ALERT_COOLDOWN_HOURS}ч",
+        f"• Оборот ≥ ${MIN_VOLUME_USD_24H/1e6:.0f}M · |Δ24h| ≥ {MIN_ABS_CHANGE_24H_PCT}%",
+        f"• Топ-{MAX_SCAN_SYMBOLS} · спред ≤ {MAX_SPREAD_PCT}% · возраст ≥ {MIN_AGE_DAYS}д",
+        f"• Bias: mid BB или EMA50 · vs BTC ≥ {REL_STRENGTH_MIN_PCT}%",
+        "",
+        f"<b>📉 BB SQUEEZE</b> {'ON' if ENABLE_BB_SQUEEZE else 'OFF'}",
+        f"• BB 20/2 + Keltner ATR{KC_ATR_PERIOD} · squeeze ≥ {BB_SQUEEZE_MIN_KC_BARS} бар",
+        f"• BW ≤ {BB_SQUEEZE_MAX_BW}% или нижние {BB_SQUEEZE_PERCENTILE:.0f}%",
+        f"• Пробой upper · bull close · RSI≥50 · vol ×{BB_BREAKOUT_VOL_MIN}",
+        f"• Откат 0.15…{BB_PULLBACK_MAX_PCT}% · OI24 ≥+{BB_OI_24H_MIN}% / OI4 ≥+{BB_OI_4H_MIN}%",
+        f"• SL зона (cap {AUTO_BB_SL_PCT}%) · TP max(2%, 1.5×BW, zone×1.5)",
+        "• Partial @ TP1 → trail · BE · momentum exit",
+        "",
+        f"<b>Авто</b> типы: <code>{AUTO_TRADE_SIGNAL_TYPES}</code>",
+        "• Risk sizing · daily limit · circuit breaker",
+        "• Таймфильтр UTC / funding filter",
+        "",
+        "Команды: /auto · /status · /backtest · /help",
+    ])
+    await msg.answer(text)
 
 
 @dp.message(Command("backtest"))
