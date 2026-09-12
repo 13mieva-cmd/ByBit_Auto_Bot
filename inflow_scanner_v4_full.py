@@ -26,6 +26,7 @@ from config import (
     MIN_AGE_DAYS, MIN_VOLUME_USD_24H,
     MIN_ABS_CHANGE_24H_PCT, ACTIVE_REQUIRE_24H_UP, ACTIVE_MIN_24H_UP_PCT,
     MAX_SPREAD_PCT, MAX_SCAN_SYMBOLS,
+    REL_STRENGTH_VS_BTC_ENABLED, REL_STRENGTH_MIN_PCT, LONG_BIAS_MID_OR_EMA,
     PRICE_CHANGE_4H_MIN, PRICE_CHANGE_4H_MAX,
     OI_CHANGE_4H_MIN, OI_CHANGE_24H_2STAR,
     VOLUME_SPIKE_MIN, VOLUME_SPIKE_2STAR,
@@ -227,7 +228,7 @@ async def get_btc_1h_change(session):
 
 # ---------- Analysis ----------
 
-async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) -> Optional[dict]:
+async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0, btc_24h: float = 0.0) -> Optional[dict]:
     """Try all three signal types. Returns best match or None."""
     symbol = c["symbol"]
 
@@ -414,6 +415,7 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) ->
         "rsi_4h": rsi_4h,
         "rsi_1h": rsi_1h,
         "btc_1h": btc_1h,
+        "btc_24h": btc_24h,
         "btc_15m": btc_15m,
         "age_days": c["age_days"],
         "ema50_1h": ema50,
@@ -441,7 +443,7 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0) ->
         opens_15 = [float(k[1]) for k in klines_15m] if klines_15m else []
         highs_15 = [float(k[2]) for k in klines_15m] if klines_15m else []
         lows_15 = [float(k[3]) for k in klines_15m] if klines_15m else []
-        bb_sig = try_bb_squeeze(base_data, closes_15m, opens_15, lows_15)
+        bb_sig = try_bb_squeeze(base_data, closes_15m, opens_15, lows_15, highs_15)
         if bb_sig:
             return bb_sig
         short_sig = try_bb_squeeze_short(base_data, closes_15m, opens_15, highs_15)
@@ -726,14 +728,22 @@ async def scan_once(session) -> list[dict]:
     log.info("=== SCAN START ===")
     btc_1h = await get_btc_1h_change(session)
     btc_15m = await get_btc_15m_change(session)
-    log.info(f"BTC 1h: {btc_1h:+.2f}% | 15m: {btc_15m:+.2f}%")
+    tickers_early = await get_tickers(session)
+    btc_24h = 0.0
+    try:
+        raw = (tickers_early.get("BTCUSDT") or {}).get("price24hPcnt")
+        if raw is not None:
+            btc_24h = float(raw) * 100
+    except (TypeError, ValueError):
+        btc_24h = 0.0
+    log.info(f"BTC 1h: {btc_1h:+.2f}% | 15m: {btc_15m:+.2f}% | 24h: {btc_24h:+.2f}%")
 
     if btc_1h < BTC_MIN_1H_CHANGE:
         log.info(f"BTC dropping hard ({btc_1h:.2f}% < {BTC_MIN_1H_CHANGE}%) — skip full scan.")
         return []
 
     instruments = await get_instruments(session)
-    tickers = await get_tickers(session)
+    tickers = tickers_early
     now_ms = int(time.time() * 1000)
     min_age_ms = MIN_AGE_DAYS * 86_400_000
     candidates = []
@@ -804,10 +814,10 @@ async def scan_once(session) -> list[dict]:
 
     log.info(
         f"Pre-filtered active: {len(prefiltered)}/{len(candidates)} "
-        f"(min turn ${MIN_VOLUME_USD_24H/1e6:.0f}M, 24h≥+{ACTIVE_MIN_24H_UP_PCT}%={ACTIVE_REQUIRE_24H_UP})"
+        f"(turn≥${MIN_VOLUME_USD_24H/1e6:.0f}M, |Δ24h|≥{MIN_ABS_CHANGE_24H_PCT}%, top{MAX_SCAN_SYMBOLS})"
     )
 
-    tasks = [analyze_coin(session, c, btc_1h, btc_15m) for c in prefiltered]
+    tasks = [analyze_coin(session, c, btc_1h, btc_15m, btc_24h) for c in prefiltered]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     scored = []
     for r in results:

@@ -25,6 +25,7 @@ def try_bb_squeeze(
     closes_15m: list[float],
     opens_15m: list[float] | None = None,
     lows_15m: list[float] | None = None,
+    highs_15m: list[float] | None = None,
 ) -> Optional[dict]:
     """
     BB_SQUEEZE ideal preset (Carter/TTM + pullback):
@@ -39,8 +40,13 @@ def try_bb_squeeze(
         return None
     if not closes_15m or len(closes_15m) < BB_PERIOD + 3:
         return None
-    if USE_EMA_FILTER and d.get("ema50_1h") is not None and d["price"] < d["ema50_1h"]:
-        return None
+    # Relative strength vs BTC (long): not much weaker than market
+    if REL_STRENGTH_VS_BTC_ENABLED:
+        pc24 = d.get("price_change_24h")
+        btc24 = d.get("btc_24h")
+        if pc24 is not None and btc24 is not None:
+            if (float(pc24) - float(btc24)) < REL_STRENGTH_MIN_PCT:
+                return None
 
     oi24 = d.get("oi_change_24h")
     oi4 = d.get("oi_change_4h")
@@ -48,6 +54,12 @@ def try_bb_squeeze(
         return None
     if oi4 is None or oi4 < BB_OI_4H_MIN:
         return None
+
+    if SQUEEZE_FUNDING_FILTER:
+        fr = d.get("funding_rate")
+        if fr is not None:
+            if fr > SQUEEZE_FUNDING_MAX or fr < SQUEEZE_FUNDING_MIN:
+                return None
 
     bw = d["bb_bandwidth"]
     hist = d.get("bb_history_bw") or []
@@ -154,7 +166,15 @@ def try_bb_squeeze(
     if pullback_pct > BB_PULLBACK_MAX_PCT:
         return None
 
-    if BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
+    # Long bias: price >= mid BB OR >= EMA50 1h (literature-style OR)
+    if LONG_BIAS_MID_OR_EMA:
+        mid_ok = mid is not None and d["price"] >= mid
+        ema_ok = d.get("ema50_1h") is not None and d["price"] >= d["ema50_1h"]
+        if not (mid_ok or ema_ok):
+            return None
+    elif BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
+        return None
+    elif USE_EMA_FILTER and d.get("ema50_1h") is not None and d["price"] < d["ema50_1h"]:
         return None
 
     rsi_15 = d.get("rsi_15m")
@@ -192,7 +212,27 @@ def try_bb_squeeze(
         sl_price = entry * (1 - 0.4 / 100)
 
     # Soft TP: max(fixed%, 1.5 × bandwidth at fire) — capture expansion
-    tp_pct = max(float(AUTO_BB_TP_PCT), float(bw) * float(BB_SQUEEZE_TP_BW_MULT))
+    # Zone range % for target projection (literature breakout target)
+    zone_highs = []
+    if hist_kc and highs_15m:
+        zi = 0
+        while zi < len(hist_kc) and not hist_kc[zi]:
+            zi += 1
+        while zi < len(hist_kc) and hist_kc[zi]:
+            if len(highs_15m) > zi:
+                zone_highs.append(highs_15m[-(zi + 1)])
+            zi += 1
+    if zone_highs and zone_lows:
+        z_hi = max(zone_highs)
+        z_lo = min(zone_lows)
+        zone_range_pct = (z_hi - z_lo) / entry * 100 if entry > 0 else 0.0
+    else:
+        zone_range_pct = float(bw)
+    tp_pct = max(
+        float(AUTO_BB_TP_PCT),
+        float(bw) * float(BB_SQUEEZE_TP_BW_MULT),
+        float(zone_range_pct) * float(ZONE_TP_MULT),
+    )
     tp_price = entry * (1 + tp_pct / 100)
     sl_pct = (entry - sl_price) / entry * 100 if entry > 0 else AUTO_BB_SL_PCT
 
@@ -225,8 +265,9 @@ def try_bb_squeeze(
         "sl_pct": round(sl_pct, 3),
         "entry_note": (
             f"KC×{max_run}→break→pullback | vol×{vol15:.2f} | "
-            f"SL zone {sl_pct:.2f}% | TP soft {tp_pct:.2f}%"
+            f"SL zone {sl_pct:.2f}% | TP zone {tp_pct:.2f}%"
         ),
+        "zone_range_pct": round(zone_range_pct, 3),
     }
 
 

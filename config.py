@@ -24,12 +24,18 @@ MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "5000000"))
 # Не брать совсем «стоячие» монеты: |изменение цены 24ч| минимум
 MIN_ABS_CHANGE_24H_PCT = float(os.getenv("MIN_ABS_CHANGE_24H_PCT", "1.0"))
 # Для long-стратегии: приоритет / фильтр только растущих за 24ч
-ACTIVE_REQUIRE_24H_UP = os.getenv("ACTIVE_REQUIRE_24H_UP", "true").lower() == "true"
+ACTIVE_REQUIRE_24H_UP = os.getenv("ACTIVE_REQUIRE_24H_UP", "false").lower() == "true"
 ACTIVE_MIN_24H_UP_PCT = float(os.getenv("ACTIVE_MIN_24H_UP_PCT", "2.0"))
 # Макс. спред bid/ask %, иначе неликвида
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 # Не сканировать весь рынок — только топ по обороту
 MAX_SCAN_SYMBOLS = int(os.getenv("MAX_SCAN_SYMBOLS", "100"))
+
+# Relative strength vs BTC 24h: alt_pc24 - btc_pc24 >= MIN (e.g. -3 = not much weaker)
+REL_STRENGTH_VS_BTC_ENABLED = os.getenv("REL_STRENGTH_VS_BTC_ENABLED", "true").lower() == "true"
+REL_STRENGTH_MIN_PCT = float(os.getenv("REL_STRENGTH_MIN_PCT", "-3.0"))
+# Long bias: require price >= mid BB OR >= EMA50 1h (OR, not both)
+LONG_BIAS_MID_OR_EMA = os.getenv("LONG_BIAS_MID_OR_EMA", "true").lower() == "true"
 
 # ---------- STANDARD signal (soft profile: earlier entries) ----------
 PRICE_CHANGE_4H_MIN = float(os.getenv("PRICE_CHANGE_4H_MIN", "2.0"))
@@ -234,7 +240,7 @@ AUTO_TRADE_SIGNAL_TYPES = os.getenv(
     "AUTO_TRADE_SIGNAL_TYPES", "BB_SQUEEZE"
 )
 # Авто только если монета в плюсе за 24ч (дубль-фильтр на всякий случай)
-AUTO_REQUIRE_24H_UPTREND = os.getenv("AUTO_REQUIRE_24H_UPTREND", "true").lower() == "true"
+AUTO_REQUIRE_24H_UPTREND = os.getenv("AUTO_REQUIRE_24H_UPTREND", "false").lower() == "true"
 AUTO_MIN_24H_CHANGE_PCT = float(os.getenv("AUTO_MIN_24H_CHANGE_PCT", "2.0"))
 
 # Reconciliation interval (sec)
@@ -275,3 +281,18 @@ BTC_FILTER_1H_VOLATILITY_MAX = float(os.getenv("BTC_FILTER_1H_VOLATILITY_MAX", "
 
 # Storage
 AUTO_STATE_FILE = os.getenv("AUTO_STATE_FILE", os.path.join(DATA_DIR, "auto_state.json"))
+
+
+# ---------- Session / funding / zone TP (literature pack) ----------
+# Skip auto entries in low-liquidity UTC hours (default Asia dead zone 00-04)
+TRADE_TIME_FILTER_ENABLED = os.getenv("TRADE_TIME_FILTER_ENABLED", "true").lower() == "true"
+TRADE_BLOCK_UTC_START = int(os.getenv("TRADE_BLOCK_UTC_START", "0"))   # inclusive hour
+TRADE_BLOCK_UTC_END = int(os.getenv("TRADE_BLOCK_UTC_END", "4"))       # exclusive hour
+
+# Long: skip if funding too positive (crowded longs). Rate is decimal e.g. 0.0003 = 0.03%
+SQUEEZE_FUNDING_MAX = float(os.getenv("SQUEEZE_FUNDING_MAX", "0.0005"))  # 0.05% per 8h
+SQUEEZE_FUNDING_MIN = float(os.getenv("SQUEEZE_FUNDING_MIN", "-0.001"))  # allow mild negative
+SQUEEZE_FUNDING_FILTER = os.getenv("SQUEEZE_FUNDING_FILTER", "true").lower() == "true"
+
+# TP from squeeze zone range: max(soft BW TP, ZONE_TP_MULT * zone_range%)
+ZONE_TP_MULT = float(os.getenv("ZONE_TP_MULT", "1.5"))

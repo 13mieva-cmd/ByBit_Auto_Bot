@@ -37,6 +37,7 @@ from config import (
     CIRCUIT_BREAKER_MIN_WR, CIRCUIT_BREAKER_LOOKBACK,
     METRICS_CSV,
     MOMENTUM_EXIT_ENABLED, MOMENTUM_EXIT_MIN_GAIN_PCT,
+    TRADE_TIME_FILTER_ENABLED, TRADE_BLOCK_UTC_START, TRADE_BLOCK_UTC_END,
 )
 from indicators import calculate_ema
 from trader import BybitTrader
