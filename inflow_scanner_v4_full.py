@@ -1,9 +1,5 @@
-"""
-Bybit OI LONG Scanner v2 — four signal types + smart hold + visuals.
-- STANDARD: Price↑ 4h + OI↑ 4h + Volume
-- SURGE: Price↑ 1h + OI↑ 1h (catches faster moves)
-- PULLBACK: pullback to EMA21 in existing uptrend
-- BB_SQUEEZE: Bollinger squeeze → breakout upper → small pullback entry
+"""Bybit BB SQUEEZE scanner + auto-trade (TTM-style 15m).
+Signal: BB_SQUEEZE long (optional BB_SQUEEZE_SHORT).
 """
 import asyncio
 import json
@@ -1198,6 +1194,8 @@ async def daily_report_loop(bot: Bot):
                 msg = (
                     f"📊 <b>Дневной отчёт</b>\n\n"
                     f"Алертов сегодня: <b>{stats.data['alerts_today']}</b>\n"
+                    f"BB_SQUEEZE: {by_type.get('BB_SQUEEZE', 0)} · "
+                    f"SHORT: {by_type.get('BB_SQUEEZE_SHORT', 0)}\n"
                     f"  ⭐ {by_star.get('1', 0)} | ⭐⭐ {by_star.get('2', 0)} | ⭐⭐⭐ {by_star.get('3', 0)}\n\n"
                     f"<b>Типы сигналов (всего):</b>\n"
                     f"  STANDARD: {by_type.get('STANDARD', 0)}\n"
@@ -1240,35 +1238,25 @@ async def _auth_gate(handler, event, data):
 
 @dp.message(Command("start", "help"))
 async def cmd_start(msg: types.Message):
-    await msg.answer(
-        "✅ <b>OI LONG Scanner v2</b>\n\n"
-        "<b>4 типа сигналов:</b>\n"
-        "🟢 STANDARD — цена↑ + OI↑ 4ч + объём\n"
-        "⚡ SURGE — цена↑ + OI↑ 1ч (ранний вход)\n"
-        "↩️ PULLBACK — откат к EMA21 в тренде\n📉 BB_SQUEEZE — squeeze BB 15m → пробой → откат\n\n"
-        "<b>Логика выхода:</b>\n"
-        "🎯 TP1 +2% (закрыть 50%)\n"
-        "🎯 TP2 +5% (закрыть остаток)\n"
-        f"🛑 Hard SL −{HARD_SL_PCT}% (аварийный)\n"
-        "⚠️ OI watchdog: при падении OI бот алертит — выходи руками\n"
-        "💚 Smart hold: при растущем OI бот скажет «держи»\n\n"
-        "<b>Команды:</b>\n"
-        "/scan — ручной скан\n"
-        "/backtest — бэктест BB_SQUEEZE\n"
-        "/settings /positions /stats\n"
-        "/top_oi /active /ignored /unignore SYM\n"
-        "/add SYM PRICE /remove SYM\n\n"
-        "<b>🤖 Авто-торговля:</b>\n"
-        "/auto — статус\n"
-        "/auto_on — включить\n"
-        "/auto_off — выключить\n"
-        "/sig_off TYPE — выключить тип (PULLBACK / SURGE / STANDARD)\n"
-        "/sig_on TYPE — включить тип\n"
-        "/cooldown — список монет в пост-сделочном блоке\n"
-        "/cooldown_clear SYM — снять блок с монеты\n"
-        "/panic — закрыть всё + блок\n"
-        "/resume — снять блок"
-    )
+    await msg.answer("\n".join([
+        "✅ <b>BB SQUEEZE Bot</b>",
+        "",
+        "<b>Сигнал:</b> BB SQUEEZE (15m TTM)",
+        "• Squeeze ≥6 KC · пробой · откат · vol/OI",
+        "• SL зона · TP soft/zone · partial → trail",
+        "• BE · momentum exit · circuit breaker",
+        "",
+        "<b>Команды</b>",
+        "/scan — скан сейчас",
+        "/settings — пороги",
+        "/positions · /stats · /status",
+        "/backtest SYMBOL|TOP [days]",
+        "/auto · /auto_on · /auto_off",
+        "/sig_on BB_SQUEEZE · /sig_off BB_SQUEEZE",
+        "/cooldown · /panic · /resume",
+        "/top_oi · /active",
+    ]))
+
 
 
 @dp.message(Command("scan"))
@@ -1663,17 +1651,10 @@ async def cmd_auto(msg: types.Message):
 
     # Per-signal-type status
     sig_status_lines = []
-    for sig_type in ["STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"]:
+    for sig_type in ["BB_SQUEEZE", "BB_SQUEEZE_SHORT"]:
         on = auto_state.get_signal_toggle(sig_type)
         emoji = "🟢" if on else "🔴"
-        if sig_type == "PULLBACK":
-            params = f"TP +{AUTO_PULLBACK_TP_PCT}% / SL −{AUTO_PULLBACK_SL_PCT}%"
-        elif sig_type == "BB_SQUEEZE":
-            params = f"TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%"
-        elif sig_type == "BB_LOWER":
-            params = f"TP +{AUTO_BB_LOWER_TP_PCT}% / SL −{AUTO_BB_LOWER_SL_PCT}%"
-        else:
-            params = f"TP +{AUTO_TP_PCT}% / SL −{AUTO_HARD_SL_PCT}%"
+        params = f"TP soft/zone · SL zone (cap {AUTO_BB_SL_PCT}%)"
         sig_status_lines.append(f"  {emoji} {sig_type}: {params}")
     sig_status_block = "\n".join(sig_status_lines)
 
@@ -1689,8 +1670,8 @@ async def cmd_auto(msg: types.Message):
             pos_lines.append(
                 f"• <b>{base}</b> {p['signal_type']} {'⭐'*p['stars']}\n"
                 f"  Вход <code>${p['entry_price']:.6g}</code> | "
-                f"TP <code>${p['tp_price']:.6g}</code> | "
-                f"SL <code>${p['sl_price']:.6g}</code>\n"
+                f"SL <code>{p.get('sl_price') or '—'}</code> | "
+                f"TP {('<code>$'+format(p['tp_price'], '.6g')+'</code>') if p.get('tp_price') else 'soft/trail'}\n"
                 f"  Плечо {p['leverage']:.0f}x | {age_min:.0f} мин"
             )
     pos_block = "\n".join(pos_lines) if pos_lines else "<i>Нет открытых авто-позиций</i>"
@@ -1709,8 +1690,8 @@ async def cmd_auto(msg: types.Message):
         f"<b>Команды:</b>\n"
         f"/auto_on — включить общий\n"
         f"/auto_off — выключить общий\n"
-        f"/sig_off TYPE — выключить тип (STANDARD/SURGE/PULLBACK/BB_SQUEEZE/BB_LOWER)\n"
-        f"/sig_on TYPE — включить тип\n"
+        f"/sig_off TYPE — выключить тип (BB_SQUEEZE, BB_SQUEEZE_SHORT)\n"
+        f"/sig_on TYPE — BB_SQUEEZE или BB_SQUEEZE_SHORT\n"
         f"/btc_filter — статус BTC-фильтра\n"
         f"/cooldown — список монет в кулдауне ({POST_TRADE_COOLDOWN_HOURS}ч)\n"
         f"/panic — закрыть всё + блок\n"
@@ -1802,27 +1783,19 @@ async def cmd_resume(msg: types.Message):
 async def cmd_sig_on(msg: types.Message):
     parts = (msg.text or "").split()
     if len(parts) != 2:
-        await msg.answer(
-            "Использование: <code>/sig_on TYPE</code>\n"
-            "TYPE: STANDARD, SURGE, PULLBACK, BB_SQUEEZE или BB_LOWER\n"
-            "Пример: <code>/sig_on PULLBACK</code>"
-        )
+        await msg.answer("\n".join([
+            "Использование: <code>/sig_on TYPE</code>",
+            "TYPE: <code>BB_SQUEEZE</code> или <code>BB_SQUEEZE_SHORT</code>",
+            "Пример: <code>/sig_on BB_SQUEEZE</code>",
+        ]))
         return
     sig_type = parts[1].upper()
-    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"):
-        await msg.answer("❌ TYPE должен быть STANDARD, SURGE, PULLBACK или BB_SQUEEZE.")
+    if sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
+        await msg.answer("❌ TYPE: BB_SQUEEZE или BB_SQUEEZE_SHORT")
         return
     auto_state.set_signal_toggle(sig_type, True)
-    if sig_type == "PULLBACK":
-        params = f"TP +{AUTO_PULLBACK_TP_PCT}% / SL −{AUTO_PULLBACK_SL_PCT}%"
-    elif sig_type == "BB_SQUEEZE":
-        params = f"TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}%"
-    else:
-        params = f"TP +{AUTO_TP_PCT}% / SL −{AUTO_HARD_SL_PCT}%"
     await msg.answer(
-        f"🟢 <b>{sig_type}</b> авто-торговля ВКЛЮЧЕНА\n"
-        f"Параметры: {params}\n\n"
-        f"Общий статус: /auto"
+        f"🟢 <b>{sig_type}</b> авто ВКЛ — SL зона · TP soft/zone · trail. /auto"
     )
 
 
@@ -1830,22 +1803,19 @@ async def cmd_sig_on(msg: types.Message):
 async def cmd_sig_off(msg: types.Message):
     parts = (msg.text or "").split()
     if len(parts) != 2:
-        await msg.answer(
-            "Использование: <code>/sig_off TYPE</code>\n"
-            "TYPE: STANDARD, SURGE, PULLBACK, BB_SQUEEZE или BB_LOWER\n"
-            "Пример: <code>/sig_off PULLBACK</code>"
-        )
+        await msg.answer("\n".join([
+            "Использование: <code>/sig_off TYPE</code>",
+            "TYPE: <code>BB_SQUEEZE</code> или <code>BB_SQUEEZE_SHORT</code>",
+            "Пример: <code>/sig_off BB_SQUEEZE</code>",
+        ]))
         return
     sig_type = parts[1].upper()
-    if sig_type not in ("STANDARD", "SURGE", "PULLBACK", "BB_SQUEEZE", "BB_LOWER"):
-        await msg.answer("❌ TYPE должен быть STANDARD, SURGE, PULLBACK или BB_SQUEEZE.")
+    if sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
+        await msg.answer("❌ TYPE: BB_SQUEEZE или BB_SQUEEZE_SHORT")
         return
     auto_state.set_signal_toggle(sig_type, False)
     await msg.answer(
-        f"🔴 <b>{sig_type}</b> авто-торговля ВЫКЛЮЧЕНА\n"
-        f"Сигналы продолжат приходить в Telegram, но бот не будет автоматически входить.\n"
-        f"Другие типы сигналов работают как обычно.\n\n"
-        f"Общий статус: /auto"
+        f"🔴 <b>{sig_type}</b> авто ВЫКЛ. Алерты могут идти, вход — нет. /auto"
     )
 
 

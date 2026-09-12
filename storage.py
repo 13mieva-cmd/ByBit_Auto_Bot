@@ -72,7 +72,7 @@ class PositionStore(JsonStore):
         s = symbol.upper()
         return s if s.endswith("USDT") else s + "USDT"
 
-    def add(self, symbol: str, entry_price: float, tp1: float, tp2: float, hard_sl: float, signal_type: str = "STANDARD") -> bool:
+    def add(self, symbol: str, entry_price: float, tp1: float, tp2: float, hard_sl: float, signal_type: str = "BB_SQUEEZE") -> bool:
         symbol = self._normalize(symbol)
         if symbol in self.data:
             return False
@@ -170,7 +170,7 @@ class StatsStore(JsonStore):
             "timeouts": 0,
             "last_reset_day": "",
             "alerts_by_star": {"1": 0, "2": 0, "3": 0},
-            "alerts_by_type": {"STANDARD": 0, "SURGE": 0, "PULLBACK": 0, "BB_SQUEEZE": 0, "BB_LOWER": 0},
+            "alerts_by_type": {"BB_SQUEEZE": 0, "BB_SQUEEZE_SHORT": 0},
         })
 
     def reset_daily_if_needed(self, today: str):
@@ -180,7 +180,7 @@ class StatsStore(JsonStore):
             self.data["last_reset_day"] = today
             self._save()
 
-    def incr_alert(self, stars: int, signal_type: str = "STANDARD"):
+    def incr_alert(self, stars: int, signal_type: str = "BB_SQUEEZE"):
         self.data["alerts_today"] += 1
         self.data["alerts_total"] += 1
         self.data["alerts_by_star"][str(stars)] = self.data["alerts_by_star"].get(str(stars), 0) + 1
@@ -206,11 +206,8 @@ class AutoStateStore(JsonStore):
             "blocked_reason": "",
             "active_positions": {},
             "signal_toggles": {
-                "STANDARD": False,
-                "SURGE": False,
-                "PULLBACK": False,
                 "BB_SQUEEZE": True,
-                "BB_LOWER": False,
+                "BB_SQUEEZE_SHORT": False,
             },
             "post_trade_cooldown": {},  # symbol -> expiration timestamp
             "btc_filter_enabled": True,
