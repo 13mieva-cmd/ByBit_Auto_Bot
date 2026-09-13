@@ -465,6 +465,39 @@ def format_result(r: BacktestResult) -> str:
     return "\n".join(lines)
 
 
+
+async def top_symbols(session, top_n: int = 15) -> list:
+    """Top linear USDT symbols by 24h turnover (for /backtest TOP)."""
+    base = BYBIT_BASE_URL.rstrip("/")
+    try:
+        async with session.get(
+            f"{base}/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning(f"top_symbols: {e}")
+        return []
+    tickers = data.get("result", {}).get("list", []) if isinstance(data, dict) else []
+    scored = []
+    for t in tickers:
+        sym = t.get("symbol") or ""
+        if not sym.endswith("USDT"):
+            continue
+        if sym.replace("USDT", "") in BLACKLIST:
+            continue
+        try:
+            turn = float(t.get("turnover24h") or 0)
+        except (TypeError, ValueError):
+            turn = 0.0
+        if turn < MIN_VOLUME_USD_24H:
+            continue
+        scored.append((turn, sym))
+    scored.sort(reverse=True)
+    return [s for _, s in scored[:top_n]]
+
+
 def format_summary(results):
     all_tr = []
     for r in results:
