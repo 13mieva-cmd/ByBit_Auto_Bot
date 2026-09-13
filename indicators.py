@@ -1,4 +1,4 @@
-"""Indicators: RSI, EMA, Bollinger, Keltner, ATR, sparkline."""
+"""Indicators: RSI, EMA, Bollinger Bands, Keltner, sparkline."""
 import math
 from typing import Optional
 
@@ -33,7 +33,6 @@ def calculate_ema(values: list[float], period: int) -> Optional[float]:
 def calculate_bollinger(
     closes: list[float], period: int = 20, mult: float = 2.0
 ) -> Optional[dict]:
-    """Bollinger Bands on the last candle: upper, middle, lower, bandwidth (%)."""
     if len(closes) < period:
         return None
     window = closes[-period:]
@@ -51,30 +50,20 @@ def calculate_bollinger(
     }
 
 
+def _true_range(high: float, low: float, prev_close: float) -> float:
+    return max(high - low, abs(high - prev_close), abs(low - prev_close))
+
+
 def calculate_atr(
-    highs: list[float],
-    lows: list[float],
-    closes: list[float],
-    period: int = 10,
+    highs: list[float], lows: list[float], closes: list[float], period: int = 20
 ) -> Optional[float]:
-    """Wilder ATR on the last bar."""
     n = len(closes)
-    if n < period + 1 or len(highs) != n or len(lows) != n:
+    if n < period + 1 or len(highs) < n or len(lows) < n:
         return None
-    trs = []
-    for i in range(1, n):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        trs.append(tr)
+    trs = [_true_range(highs[i], lows[i], closes[i - 1]) for i in range(1, n)]
     if len(trs) < period:
         return None
-    atr = sum(trs[:period]) / period
-    for tr in trs[period:]:
-        atr = (atr * (period - 1) + tr) / period
-    return atr
+    return sum(trs[-period:]) / period
 
 
 def calculate_keltner(
@@ -82,11 +71,12 @@ def calculate_keltner(
     lows: list[float],
     closes: list[float],
     ema_period: int = 20,
-    atr_period: int = 10,
+    atr_period: int = 20,
     atr_mult: float = 1.5,
 ) -> Optional[dict]:
-    """Keltner Channels: EMA ± ATR * mult."""
     if len(closes) < max(ema_period, atr_period) + 1:
+        return None
+    if len(highs) != len(closes) or len(lows) != len(closes):
         return None
     mid = calculate_ema(closes, ema_period)
     atr = calculate_atr(highs, lows, closes, atr_period)
@@ -100,15 +90,16 @@ def calculate_keltner(
     }
 
 
-def bb_inside_keltner(bb: dict, kc: dict) -> bool:
-    """TTM-style squeeze: entire Bollinger band inside Keltner channel."""
+def bb_inside_keltner(bb: Optional[dict], kc: Optional[dict]) -> bool:
     if not bb or not kc:
         return False
-    return bb["upper"] <= kc["upper"] and bb["lower"] >= kc["lower"]
+    try:
+        return float(bb["upper"]) <= float(kc["upper"]) and float(bb["lower"]) >= float(kc["lower"])
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def sparkline(values: list[float], width: int = 10) -> str:
-    """ASCII sparkline of N most recent values."""
     if not values or len(values) < 2:
         return "─" * width
     blocks = "▁▂▃▄▅▆▇█"
@@ -124,10 +115,8 @@ def sparkline(values: list[float], width: int = 10) -> str:
 
 
 def progress_bar(value: float, low: float, high: float, width: int = 12) -> str:
-    """Visual progress bar. Position of `value` between `low` and `high`."""
     if high <= low:
         return "─" * width
-    pct = (value - low) / (high - low)
-    pct = max(0, min(1, pct))
+    pct = max(0, min(1, (value - low) / (high - low)))
     filled = int(pct * width)
     return "█" * filled + "░" * (width - filled)

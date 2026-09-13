@@ -1,12 +1,19 @@
 """
-Backtest for BB_SQUEEZE (15m) and optional multi-symbol scan.
+Backtest BB_SQUEEZE (parity with live scanner.try_bb_squeeze).
+
+Entry mirrors live:
+  - BW squeeze (percentile OR cap)
+  - >= MIN consecutive bars BB inside Keltner
+  - expansion, close > upper, bullish candle, close > mid
+  - RSI at breakout >= 50 (approx)
+  - pullback, hold mid, vol >= 1.2x
+  - SL = min(lows of squeeze zone) - buffer, cap AUTO_BB_SL_PCT
+  - Soft TP = max(AUTO_BB_TP_PCT, BW * mult)
+  - BE @ +0.6%, partial concept via trail after TP1 trigger, structure exit
 
 Usage:
-  python backtest.py --symbol PRLUSDT --days 30
+  python backtest.py --symbol BTCUSDT --days 20
   python backtest.py --top 15 --days 14
-  python backtest.py --symbol ARBUSDT --days 21 --no-oi
-
-Telegram: /backtest [SYMBOL|TOP] [days]
 """
 from __future__ import annotations
 
@@ -26,20 +33,29 @@ from config import (
     BB_PERIOD, BB_MULT,
     BB_SQUEEZE_LOOKBACK, BB_SQUEEZE_PERCENTILE, BB_SQUEEZE_MAX_BW,
     BB_SQUEEZE_FRESH_BARS, BB_BREAKOUT_VOL_MIN,
-    BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX, BB_OI_24H_MIN,
-    BB_OI_4H_MIN, BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
-    USE_EMA_FILTER, EMA_PERIOD,
+    BB_PULLBACK_MAX_PCT, BB_PULLBACK_RSI_MAX,
+    BB_PARABOLIC_MAX_PCT, BB_REQUIRE_ABOVE_MID,
+    BB_REQUIRE_EXPANSION, BB_REJECT_FALSE_BREAKOUT,
+    BB_REQUIRE_KC_SQUEEZE, BB_SQUEEZE_MIN_KC_BARS,
+    BB_SQUEEZE_SL_BUFFER_PCT, BB_SQUEEZE_REQUIRE_BULL_CLOSE,
+    BB_SQUEEZE_RSI_MOMENTUM_MIN, BB_SQUEEZE_TP_BW_MULT,
+    KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT,
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
     POSITION_SIZE_USD, MIN_VOLUME_USD_24H, BLACKLIST,
+    EMA_PERIOD, USE_EMA_FILTER,
+    AUTO_BE_ENABLED, AUTO_BE_TRIGGER_PCT, AUTO_BE_BUFFER_PCT,
+    STRUCTURE_EXIT_ENABLED, STRUCTURE_EXIT_EMA_1H,
+    AUTO_TRAIL_ENABLED, AUTO_TP1_TRIGGER_PCT_BB, AUTO_TRAIL_DISTANCE_PCT_BB,
 )
-from indicators import calculate_rsi, calculate_ema, calculate_bollinger
+from indicators import (
+    calculate_bollinger, calculate_ema, calculate_rsi,
+    calculate_keltner, bb_inside_keltner,
+)
 
 log = logging.getLogger("backtest")
 
-# Fees (Bybit taker ~0.055% each side) — optional drag on results
-FEE_PCT = 0.055
-# Max hold after entry (15m bars). 48 = 12h
-MAX_HOLD_BARS = 48
+FEE_PCT = 0.055  # one side
+MAX_HOLD_BARS = 64  # ~16h on 15m — closer to 8-10 bar fire + extension
 
 
 @dataclass
@@ -56,7 +72,7 @@ class Trade:
     pnl_usd: float = 0.0
     bars_held: int = 0
     bw: float = 0.0
-    pullback: float = 0.0
+    squeeze_bars: int = 0
     vol_spike: float = 0.0
 
 
@@ -66,10 +82,7 @@ class BacktestResult:
     days: int
     bars: int
     signals: int = 0
-    trades: list[Trade] = field(default_factory=list)
-    skipped_oi: int = 0
-    skipped_ema: int = 0
-    use_oi: bool = True
+    trades: list = field(default_factory=list)
 
     @property
     def wins(self) -> int:
@@ -102,245 +115,125 @@ class BacktestResult:
         return gp / gl
 
 
-async def _fetch_klines(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    interval: str,
-    start_ms: int,
-    end_ms: int,
-) -> list[list]:
-    """Paginate Bybit klines (oldest → newest). Candle: [ts, o, h, l, c, vol, turnover]."""
-    out: list[list] = []
-    cursor_end = end_ms
+async def fetch_klines(session, symbol: str, interval: str, limit: int = 1000):
     base = BYBIT_BASE_URL.rstrip("/")
-    while cursor_end > start_ms and len(out) < 20000:
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "interval": interval,
-            "end": cursor_end,
-            "limit": 1000,
-        }
-        async with session.get(f"{base}/v5/market/kline", params=params, timeout=30) as r:
+    url = f"{base}/v5/market/kline"
+    # +1 so after dropping forming bar we still have ~limit closed bars
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": min(limit + 1, 1000)}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
             data = await r.json(content_type=None)
         if not isinstance(data, dict) or data.get("retCode") != 0:
-            break
-        batch = data.get("result", {}).get("list", [])
-        if not batch:
-            break
-        # API returns newest first
-        batch = list(reversed(batch))
-        out = batch + out
-        oldest = int(batch[0][0])
-        if oldest <= start_ms:
-            break
-        cursor_end = oldest - 1
-        await asyncio.sleep(0.05)
-    # Filter to window and dedupe by ts
-    seen = set()
-    cleaned = []
-    for k in out:
-        ts = int(k[0])
-        if ts < start_ms or ts > end_ms:
-            continue
-        if ts in seen:
-            continue
-        seen.add(ts)
-        cleaned.append(k)
-    cleaned.sort(key=lambda x: int(x[0]))
-    return cleaned
-
-
-async def _fetch_oi_1h(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    start_ms: int,
-    end_ms: int,
-) -> list[tuple[int, float]]:
-    """Return list of (ts_ms, oi) oldest→newest. Best-effort; may be short history."""
-    base = BYBIT_BASE_URL.rstrip("/")
-    out: list[tuple[int, float]] = []
-    cursor_end = end_ms
-    for _ in range(30):
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "intervalTime": "1h",
-            "endTime": cursor_end,
-            "limit": 200,
-        }
-        try:
-            async with session.get(
-                f"{base}/v5/market/open-interest", params=params, timeout=20
-            ) as r:
-                data = await r.json(content_type=None)
-        except Exception as e:
-            log.warning(f"OI fetch {symbol}: {e}")
-            break
-        if not isinstance(data, dict) or data.get("retCode") != 0:
-            break
-        batch = data.get("result", {}).get("list", [])
-        if not batch:
-            break
-        for item in batch:
-            try:
-                ts = int(item.get("timestamp") or item.get("ts") or 0)
-                oi = float(item["openInterest"])
-                if start_ms <= ts <= end_ms:
-                    out.append((ts, oi))
-            except (KeyError, TypeError, ValueError):
-                continue
-        oldest = min(int(x.get("timestamp") or x.get("ts") or cursor_end) for x in batch)
-        if oldest <= start_ms:
-            break
-        cursor_end = oldest - 1
-        await asyncio.sleep(0.05)
-    # dedupe
-    by_ts = {ts: oi for ts, oi in out}
-    return sorted(by_ts.items(), key=lambda x: x[0])
-
-
-
-def _oi_change_hours_at(oi_series: list[tuple[int, float]], ts_ms: int, hours: int) -> Optional[float]:
-    """OI change vs ~hours earlier at or before ts_ms."""
-    if len(oi_series) < 2:
-        return None
-    cur = None
-    for i in range(len(oi_series) - 1, -1, -1):
-        if oi_series[i][0] <= ts_ms:
-            cur = i
-            break
-    if cur is None:
-        return None
-    target = ts_ms - hours * 3600 * 1000
-    prev = None
-    for i in range(cur, -1, -1):
-        if oi_series[i][0] <= target:
-            prev = i
-            break
-    if prev is None:
-        # approximate by bar count (1h series)
-        step = max(1, hours)
-        if cur >= step:
-            prev = cur - step
-        else:
-            return None
-    oi_now = oi_series[cur][1]
-    oi_old = oi_series[prev][1]
-    if oi_old <= 0:
-        return None
-    return (oi_now - oi_old) / oi_old * 100
-
-
-def _oi_change_24h_at(oi_series: list[tuple[int, float]], ts_ms: int) -> Optional[float]:
-    """Approx OI change vs ~24h earlier at or before ts_ms."""
-    if len(oi_series) < 2:
-        return None
-    # find latest point <= ts
-    cur = None
-    for i in range(len(oi_series) - 1, -1, -1):
-        if oi_series[i][0] <= ts_ms:
-            cur = i
-            break
-    if cur is None:
-        return None
-    target = ts_ms - 24 * 3600 * 1000
-    prev = None
-    for i in range(cur, -1, -1):
-        if oi_series[i][0] <= target:
-            prev = i
-            break
-    if prev is None:
-        # fall back to oldest available if within 36h
-        if cur >= 20:
-            prev = cur - 24 if cur >= 24 else 0
-        else:
-            return None
-    oi_now = oi_series[cur][1]
-    oi_old = oi_series[prev][1]
-    if oi_old <= 0:
-        return None
-    return (oi_now - oi_old) / oi_old * 100
+            return []
+        rows = data.get("result", {}).get("list", [])
+        # Bybit: newest first → reverse to oldest first; drop forming last bar
+        rows = list(reversed(rows))
+        if len(rows) > 1:
+            rows = rows[:-1]
+        return rows
+    except Exception as e:
+        log.warning(f"klines {symbol}: {e}")
+        return []
 
 
 def _simulate_exit(
-    highs: list[float],
-    lows: list[float],
-    closes: list[float],
-    entry_i: int,
-    tp: float,
-    sl: float,
-) -> tuple[int, float, str]:
-    """Intrabar: SL before TP if both touched (conservative)."""
+    highs, lows, closes,
+    entry_i, tp, sl, entry_price,
+    closes_1h_aligned=None,
+):
+    """SL first; BE; trail after TP1; optional structure; soft TP."""
     end = min(entry_i + MAX_HOLD_BARS, len(closes) - 1)
+    be_active = False
+    trail_active = False
+    cur_sl = sl
+    peak = entry_price
     for j in range(entry_i + 1, end + 1):
-        lo, hi = lows[j], highs[j]
-        hit_sl = lo <= sl
-        hit_tp = hi >= tp
+        lo, hi, cl = lows[j], highs[j], closes[j]
+        if hi > peak:
+            peak = hi
+        gain = (cl - entry_price) / entry_price * 100 if entry_price > 0 else 0
+
+        if AUTO_BE_ENABLED and not be_active and gain >= AUTO_BE_TRIGGER_PCT:
+            be_active = True
+            cur_sl = max(cur_sl, entry_price * (1 + AUTO_BE_BUFFER_PCT / 100))
+
+        if AUTO_TRAIL_ENABLED and not trail_active and gain >= AUTO_TP1_TRIGGER_PCT_BB:
+            trail_active = True
+        if trail_active:
+            trail_sl = peak * (1 - AUTO_TRAIL_DISTANCE_PCT_BB / 100)
+            cur_sl = max(cur_sl, trail_sl)
+
+        if STRUCTURE_EXIT_ENABLED and STRUCTURE_EXIT_EMA_1H and closes_1h_aligned is not None:
+            if len(closes_1h_aligned) >= EMA_PERIOD:
+                ema = calculate_ema(closes_1h_aligned, EMA_PERIOD)
+                if ema is not None and cl < ema and gain < 0:
+                    return j, cl, "STRUCTURE"
+
+        hit_sl = lo <= cur_sl
+        # Soft TP only if not trailing yet (once trail on, TP cancelled like live)
+        hit_tp = (not trail_active) and hi >= tp
         if hit_sl and hit_tp:
-            return j, sl, "SL"
+            return j, cur_sl, "BE" if be_active else "SL"
         if hit_sl:
-            return j, sl, "SL"
+            if trail_active:
+                return j, cur_sl, "TRAILING"
+            if be_active and abs(cur_sl - entry_price) / max(entry_price, 1e-12) < 0.005:
+                return j, cur_sl, "BE"
+            return j, cur_sl, "SL"
         if hit_tp:
             return j, tp, "TP"
     return end, closes[end], "TIMEOUT"
 
 
-def _signal_at(
-    i: int,
-    closes_15: list[float],
-    vols_15: list[float],
-    closes_1h: list[float],
-    ts_15: list[int],
-    oi_series: Optional[list[tuple[int, float]]],
-    use_oi: bool,
-) -> Optional[dict]:
-    """Evaluate BB_SQUEEZE at bar i using only data available up to i (no look-ahead)."""
-    need = BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5
-    if i < need or i < 3:
+def signal_at(i, opens, highs, lows, closes, volumes):
+    """Return signal dict or None at bar i (index in oldest-first arrays)."""
+    if i < BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5:
+        return None
+    if i >= len(closes) - 1:
         return None
 
-    window = closes_15[: i + 1]
-    price = window[-1]
+    # Need history up to i inclusive
+    c = closes[: i + 1]
+    h = highs[: i + 1]
+    l = lows[: i + 1]
+    o = opens[: i + 1]
+    v = volumes[: i + 1]
 
-    # EMA50 on 1h — map 15m ts to latest 1h close
-    if USE_EMA_FILTER:
-        if len(closes_1h) < EMA_PERIOD:
-            return None
-        ema50 = calculate_ema(closes_1h, EMA_PERIOD)
-        if ema50 is None or price < ema50:
-            return None
-    else:
-        ema50 = None
-
-    # OI filter: 24h + 4h (устойчивый приток)
-    oi_chg = None
-    oi_4h = None
-    if use_oi and oi_series:
-        oi_chg = _oi_change_hours_at(oi_series, ts_15[i], 24)
-        oi_4h = _oi_change_hours_at(oi_series, ts_15[i], 4)
-        if oi_chg is None or oi_chg < BB_OI_24H_MIN:
-            return None
-        if oi_4h is None or oi_4h < BB_OI_4H_MIN:
-            return None
-    elif use_oi:
-        return None  # requested OI but no data
-
-    bb = calculate_bollinger(window, BB_PERIOD, BB_MULT)
+    bb = calculate_bollinger(c, BB_PERIOD, BB_MULT)
     if not bb:
         return None
+    kc = calculate_keltner(h, l, c, KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT)
+    if not kc:
+        return None
 
-    # bandwidth history (newest first, same as live bot)
-    hist = []
-    for k in range(BB_SQUEEZE_LOOKBACK):
-        end = len(window) - k
-        if end < BB_PERIOD:
+    # Build bw hist + kc hist newest-first relative to i
+    bb_history_bw = []
+    kc_squeeze_hist = []
+    atr_need = max(KC_EMA_PERIOD, KC_ATR_PERIOD) + 1
+    for back in range(BB_SQUEEZE_LOOKBACK):
+        end = len(c) - back
+        if end < max(BB_PERIOD, atr_need):
             break
-        b = calculate_bollinger(window[:end], BB_PERIOD, BB_MULT)
+        b = calculate_bollinger(c[:end], BB_PERIOD, BB_MULT)
+        k = calculate_keltner(h[:end], l[:end], c[:end], KC_EMA_PERIOD, KC_ATR_PERIOD, KC_ATR_MULT)
         if b:
-            hist.append(b["bandwidth"])
+            bb_history_bw.append(b["bandwidth"])
+        if b and k:
+            kc_squeeze_hist.append(bb_inside_keltner(b, k))
+
+    max_run = 0
+    cur = 0
+    for flag in kc_squeeze_hist:
+        if flag:
+            cur += 1
+            max_run = max(max_run, cur)
+        else:
+            cur = 0
+    if BB_REQUIRE_KC_SQUEEZE and max_run < BB_SQUEEZE_MIN_KC_BARS:
+        return None
 
     bw = bb["bandwidth"]
+    hist = bb_history_bw
     fresh_n = max(2, min(BB_SQUEEZE_FRESH_BARS, len(hist) if hist else 1))
     recent = hist[:fresh_n] if hist else [bw]
     min_recent = min(recent)
@@ -354,232 +247,269 @@ def _signal_at(
     if not (percentile_ok or cap_ok):
         return None
 
-    if min_recent > 0 and bw > min_recent * 1.8 and bw > BB_SQUEEZE_MAX_BW * 1.5:
-        return None
+    if BB_REQUIRE_EXPANSION and len(hist) >= 3:
+        if bw < min_recent * 1.02 and bw <= (hist[1] if len(hist) > 1 else bw):
+            return None
 
-    # breakout
+    upper = bb["upper"]
+    mid = bb.get("middle")
+
+    # breakout in last 1-3 bars ending at i
     broke = False
-    breakout_high = price
-    look = min(3, len(window))
-    for off in range(1, look + 1):
-        c = window[-off]
-        if c > bb["upper"]:
+    breakout_high = c[-1]
+    broke_idx = None  # 1 = current bar relative to end
+    look = min(3, len(c))
+    for bi in range(1, look + 1):
+        if c[-bi] > upper:
             broke = True
-            breakout_high = max(breakout_high, c)
-    if not broke:
+            if c[-bi] >= breakout_high:
+                breakout_high = c[-bi]
+                broke_idx = bi
+    if not broke or broke_idx is None:
         return None
 
-    # volume spike 15m
-    if i < 20:
-        return None
-    avg_v = sum(vols_15[i - 20 : i]) / 20
-    vol_spike = (vols_15[i] / avg_v) if avg_v > 0 else 0.0
-    if vol_spike < BB_BREAKOUT_VOL_MIN:
+    if BB_SQUEEZE_REQUIRE_BULL_CLOSE and o[-broke_idx] >= c[-broke_idx]:
         return None
 
-    # Anti-parabolic spike over last ~30m
-    if len(window) >= 3:
-        local_low = min(window[-3], window[-2], window[-1])
+    if mid is not None and c[-broke_idx] <= mid:
+        return None
+
+    end_bo = len(c) - broke_idx + 1
+    if end_bo >= 15:
+        rsi_bo = calculate_rsi(c[:end_bo], 14)
+        if rsi_bo is not None and rsi_bo < BB_SQUEEZE_RSI_MOMENTUM_MIN:
+            return None
+
+    if BB_REJECT_FALSE_BREAKOUT and mid is not None:
+        n = len(c)
+        for ii in range(max(0, n - 5), n):
+            if c[ii] > upper:
+                for jj in range(ii + 1, n):
+                    if c[jj] < mid:
+                        return None
+                break
+
+    # volume spike on last bar
+    if len(v) < 21:
+        return None
+    avg_v = sum(v[-21:-1]) / 20
+    if avg_v <= 0:
+        return None
+    vol15 = v[-1] / avg_v
+    if vol15 < BB_BREAKOUT_VOL_MIN:
+        return None
+
+    if len(c) >= 3:
+        local_low = min(c[-3], c[-2], c[-1])
         if local_low > 0:
-            spike_pct = (window[-1] - local_low) / local_low * 100
+            spike_pct = (c[-1] - local_low) / local_low * 100
             if spike_pct > BB_PARABOLIC_MAX_PCT:
                 return None
 
+    price = c[-1]
     pullback_pct = (breakout_high - price) / breakout_high * 100 if breakout_high > 0 else 0
-    if pullback_pct < 0.15 or pullback_pct > BB_PULLBACK_MAX_PCT:
+    if pullback_pct > BB_PULLBACK_MAX_PCT:
         return None
 
-    if BB_REQUIRE_ABOVE_MID and price < bb["middle"]:
+    if BB_REQUIRE_ABOVE_MID and mid is not None and price < mid:
         return None
 
-    rsi_15 = calculate_rsi(window, 14)
+    rsi_15 = calculate_rsi(c, 14)
     if rsi_15 is not None and rsi_15 > BB_PULLBACK_RSI_MAX:
         return None
 
-    if window[-1] <= window[-3]:
+    if len(c) < 3 or c[-1] <= c[-3]:
         return None
 
+    # Zone SL
+    zone_lows = []
+    if kc_squeeze_hist:
+        zi = 0
+        while zi < len(kc_squeeze_hist) and not kc_squeeze_hist[zi]:
+            zi += 1
+        while zi < len(kc_squeeze_hist) and kc_squeeze_hist[zi]:
+            if len(l) > zi:
+                zone_lows.append(l[-(zi + 1)])
+            zi += 1
+    if not zone_lows:
+        zone_lows = [l[-broke_idx]]
+    sl_raw = min(zone_lows)
+    if mid is not None:
+        sl_raw = min(sl_raw, mid)
+    sl_price = sl_raw * (1 - BB_SQUEEZE_SL_BUFFER_PCT / 100)
+    max_sl = price * (1 - AUTO_BB_SL_PCT / 100)
+    if sl_price < max_sl:
+        sl_price = max_sl
+    if sl_price >= price:
+        sl_price = price * (1 - 0.4 / 100)
+
+    tp_pct = max(float(AUTO_BB_TP_PCT), float(bw) * float(BB_SQUEEZE_TP_BW_MULT))
+    tp_price = price * (1 + tp_pct / 100)
+
     return {
-        "price": price,
+        "entry": price,
+        "tp": tp_price,
+        "sl": sl_price,
         "bw": bw,
-        "pullback": pullback_pct,
-        "vol_spike": vol_spike,
-        "oi_chg": oi_chg,
-        "ema50": ema50,
+        "squeeze_bars": max_run,
+        "vol_spike": vol15,
+        "tp_pct": tp_pct,
+        "sl_pct": (price - sl_price) / price * 100,
     }
 
 
-async def backtest_symbol(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    days: int = 30,
-    use_oi: bool = True,
-) -> BacktestResult:
-    end_ms = int(time.time() * 1000)
-    start_ms = end_ms - days * 86400 * 1000
-    # warm-up for indicators
-    warm_ms = start_ms - (BB_PERIOD + BB_SQUEEZE_LOOKBACK + 50) * 15 * 60 * 1000
+async def backtest_symbol(session, symbol: str, days: int) -> BacktestResult:
+    limit = min(1000, days * 96 + 100)
+    rows = await fetch_klines(session, symbol, "15", limit)
+    if len(rows) < BB_PERIOD + 50:
+        return BacktestResult(symbol=symbol, days=days, bars=len(rows))
 
-    kl_15 = await _fetch_klines(session, symbol, "15", warm_ms, end_ms)
-    kl_1h = await _fetch_klines(session, symbol, "60", warm_ms, end_ms)
+    opens = [float(r[1]) for r in rows]
+    highs = [float(r[2]) for r in rows]
+    lows = [float(r[3]) for r in rows]
+    closes = [float(r[4]) for r in rows]
+    volumes = [float(r[5]) for r in rows]
+    ts = [int(r[0]) for r in rows]
 
-    result = BacktestResult(symbol=symbol, days=days, bars=len(kl_15), use_oi=use_oi)
-    if len(kl_15) < BB_PERIOD + BB_SQUEEZE_LOOKBACK + 10:
-        log.warning(f"{symbol}: not enough 15m bars ({len(kl_15)})")
-        return result
+    # 1h for structure / EMA filter
+    rows_1h = await fetch_klines(session, symbol, "60", min(500, days * 24 + 50))
+    closes_1h = [float(r[4]) for r in rows_1h] if rows_1h else []
+    ts_1h = [int(r[0]) for r in rows_1h] if rows_1h else []
 
-    ts_15 = [int(k[0]) for k in kl_15]
-    opens = [float(k[1]) for k in kl_15]
-    highs = [float(k[2]) for k in kl_15]
-    lows = [float(k[3]) for k in kl_15]
-    closes = [float(k[4]) for k in kl_15]
-    vols = [float(k[5]) for k in kl_15]
-    closes_1h_all = [float(k[4]) for k in kl_1h]
-    ts_1h = [int(k[0]) for k in kl_1h]
+    result = BacktestResult(symbol=symbol, days=days, bars=len(closes))
+    cooldown_until = 0
 
-    oi_series = None
-    if use_oi:
-        oi_series = await _fetch_oi_1h(session, symbol, warm_ms, end_ms)
-        if len(oi_series) < 10:
-            log.warning(f"{symbol}: OI history thin ({len(oi_series)}), OI filter may block all")
-
-    # Prebuild 1h close series available at each 15m bar (no look-ahead)
-    def closes_1h_at(ts: int) -> list[float]:
-        out = []
-        for t, c in zip(ts_1h, closes_1h_all):
-            if t <= ts:
-                out.append(c)
-            else:
-                break
-        return out
-
-    cooldown_until = -1
-    start_i = 0
-    while start_i < len(ts_15) and ts_15[start_i] < start_ms:
-        start_i += 1
-
-    i = max(start_i, BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5)
-    while i < len(closes) - 2:
-        if i <= cooldown_until:
-            i += 1
+    for i in range(BB_PERIOD + BB_SQUEEZE_LOOKBACK + 5, len(closes) - 2):
+        if ts[i] < cooldown_until:
             continue
 
-        c1h = closes_1h_at(ts_15[i])
-        sig = _signal_at(i, closes, vols, c1h, ts_15, oi_series, use_oi)
+        # medium: no hard 24h uptrend requirement (was blocking all trades)
+
+        if USE_EMA_FILTER and closes_1h:
+            # last 1h bar at or before this 15m ts
+            ema = calculate_ema(closes_1h, EMA_PERIOD)
+            if ema is not None and closes[i] < ema:
+                continue
+
+        sig = signal_at(i, opens, highs, lows, closes, volumes)
         if not sig:
-            i += 1
             continue
 
         result.signals += 1
-        entry = sig["price"]
-        tp = entry * (1 + AUTO_BB_TP_PCT / 100)
-        sl = entry * (1 - AUTO_BB_SL_PCT / 100)
-        exit_i, exit_px, reason = _simulate_exit(highs, lows, closes, i, tp, sl)
+        entry = sig["entry"]
+        tp = sig["tp"]
+        sl = sig["sl"]
 
-        # fees both sides
+        # align 1h closes available at this time for structure
+        closes_1h_now = [closes_1h[j] for j, t in enumerate(ts_1h) if t <= ts[i]]
+
+        exit_i, exit_px, reason = _simulate_exit(
+            highs, lows, closes, i, tp, sl, entry, closes_1h_now
+        )
+
         pnl_pct = (exit_px - entry) / entry * 100 - 2 * FEE_PCT
         pnl_usd = POSITION_SIZE_USD * pnl_pct / 100
-
-        result.trades.append(
-            Trade(
-                symbol=symbol,
-                entry_ts=ts_15[i],
-                entry_price=entry,
-                tp=tp,
-                sl=sl,
-                exit_ts=ts_15[exit_i],
-                exit_price=exit_px,
-                reason=reason,
-                pnl_pct=pnl_pct,
-                pnl_usd=pnl_usd,
-                bars_held=exit_i - i,
-                bw=sig["bw"],
-                pullback=sig["pullback"],
-                vol_spike=sig["vol_spike"],
-            )
+        tr = Trade(
+            symbol=symbol,
+            entry_ts=ts[i],
+            entry_price=entry,
+            tp=tp,
+            sl=sl,
+            exit_ts=ts[exit_i],
+            exit_price=exit_px,
+            reason=reason,
+            pnl_pct=pnl_pct,
+            pnl_usd=pnl_usd,
+            bars_held=exit_i - i,
+            bw=sig["bw"],
+            squeeze_bars=sig["squeeze_bars"],
+            vol_spike=sig["vol_spike"],
         )
-        # no overlapping trades; small cooldown 6 bars after exit
-        cooldown_until = exit_i + 6
-        i = exit_i + 1
+        result.trades.append(tr)
+        # cooldown 48h in bars ~ 192
+        cooldown_until = ts[exit_i] + 48 * 3600 * 1000
 
     return result
-
-
-async def top_symbols(session: aiohttp.ClientSession, n: int = 15) -> list[str]:
-    base = BYBIT_BASE_URL.rstrip("/")
-    async with session.get(
-        f"{base}/v5/market/tickers",
-        params={"category": "linear"},
-        timeout=30,
-    ) as r:
-        data = await r.json(content_type=None)
-    rows = []
-    for t in data.get("result", {}).get("list", []):
-        sym = t.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
-        base_coin = sym.replace("USDT", "")
-        if base_coin in BLACKLIST:
-            continue
-        try:
-            turn = float(t.get("turnover24h") or 0)
-        except (TypeError, ValueError):
-            continue
-        if turn < MIN_VOLUME_USD_24H:
-            continue
-        rows.append((turn, sym))
-    rows.sort(reverse=True)
-    return [s for _, s in rows[:n]]
 
 
 def format_result(r: BacktestResult) -> str:
     lines = [
         f"📊 <b>Backtest BB_SQUEEZE</b> — <code>{r.symbol}</code>",
         f"Период: {r.days}д | баров 15m: {r.bars}",
-        f"OI-фильтр: {'вкл' if r.use_oi else 'выкл'}",
         f"Сигналов: <b>{r.signals}</b> | сделок: <b>{len(r.trades)}</b>",
+        f"Правила: KC≥{BB_SQUEEZE_MIN_KC_BARS} | vol≥{BB_BREAKOUT_VOL_MIN}× | zone SL cap {AUTO_BB_SL_PCT}%",
+        f"Soft TP max({AUTO_BB_TP_PCT}%, {BB_SQUEEZE_TP_BW_MULT}×BW) | BE+trail",
     ]
     if not r.trades:
-        lines.append("\n<i>Сделок нет — условия слишком строгие или мало данных.</i>")
+        lines.append("\n<i>Сделок нет.</i>")
         return "\n".join(lines)
 
-    tp_n = sum(1 for t in r.trades if t.reason == "TP")
-    sl_n = sum(1 for t in r.trades if t.reason == "SL")
-    to_n = sum(1 for t in r.trades if t.reason == "TIMEOUT")
+    reasons = {}
+    for t in r.trades:
+        reasons[t.reason] = reasons.get(t.reason, 0) + 1
     pf = r.profit_factor
     pf_s = "∞" if math.isinf(pf) else f"{pf:.2f}"
-
     lines += [
         f"Winrate: <b>{r.winrate:.1f}%</b> ({r.wins}W / {r.losses}L)",
-        f"TP/SL/Timeout: {tp_n}/{sl_n}/{to_n}",
-        f"Σ PnL: <b>${r.total_pnl_usd:+.2f}</b> (поз. ${POSITION_SIZE_USD})",
+        f"Reasons: {reasons}",
+        f"Σ PnL: <b>${r.total_pnl_usd:+.2f}</b> (size ${POSITION_SIZE_USD})",
         f"Avg: {r.avg_pnl_pct:+.2f}% | PF: {pf_s}",
-        f"TP +{AUTO_BB_TP_PCT}% / SL −{AUTO_BB_SL_PCT}% | fee {FEE_PCT}%×2",
         "",
         "<b>Последние сделки:</b>",
     ]
-    for t in r.trades[-8:]:
+    for t in r.trades[-10:]:
         dt = datetime.fromtimestamp(t.entry_ts / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
-        emoji = "✅" if t.pnl_usd > 0 else "🛑" if t.reason == "SL" else "⏱"
+        emoji = "✅" if t.pnl_usd > 0 else "🛑"
         lines.append(
             f"{emoji} {dt} {t.reason} {t.pnl_pct:+.2f}% "
-            f"(bw={t.bw:.2f} vol×{t.vol_spike:.1f})"
+            f"(KC×{t.squeeze_bars} BW{t.bw:.1f} vol×{t.vol_spike:.1f})"
         )
     return "\n".join(lines)
 
 
-def format_summary(results: list[BacktestResult]) -> str:
-    all_tr: list[Trade] = []
+async def top_symbols(session, top_n: int = 15) -> list[str]:
+    base = BYBIT_BASE_URL.rstrip("/")
+    try:
+        async with session.get(
+            f"{base}/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning(f"top_symbols: {e}")
+        return []
+    tickers = data.get("result", {}).get("list", []) if isinstance(data, dict) else []
+    scored = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        base_sym = sym.replace("USDT", "")
+        if base_sym in BLACKLIST:
+            continue
+        try:
+            turn = float(t.get("turnover24h") or 0)
+        except Exception:
+            turn = 0
+        if turn < MIN_VOLUME_USD_24H:
+            continue
+        scored.append((turn, sym))
+    scored.sort(reverse=True)
+    return [s for _, s in scored[:top_n]]
+
+
+def format_summary(results):
+    all_tr = []
     for r in results:
         all_tr.extend(r.trades)
     lines = [
-        f"📊 <b>Backtest BB_SQUEEZE — TOP{len(results)}</b>",
-        f"Монет с данными: {len(results)} | сделок: {len(all_tr)}",
+        f"📊 <b>Backtest BB_SQUEEZE — {len(results)} symbols</b>",
+        f"Сделок: {len(all_tr)}",
     ]
     if not all_tr:
         lines.append("<i>Сделок нет.</i>")
         return "\n".join(lines)
-
     wins = sum(1 for t in all_tr if t.pnl_usd > 0)
     total = sum(t.pnl_usd for t in all_tr)
     wr = wins / len(all_tr) * 100
@@ -587,51 +517,66 @@ def format_summary(results: list[BacktestResult]) -> str:
     gl = abs(sum(t.pnl_usd for t in all_tr if t.pnl_usd < 0))
     pf = (gp / gl) if gl > 1e-9 else (float("inf") if gp > 0 else 0.0)
     pf_s = "∞" if math.isinf(pf) else f"{pf:.2f}"
-
     lines += [
         f"Winrate: <b>{wr:.1f}%</b> ({wins}W / {len(all_tr) - wins}L)",
         f"Σ PnL: <b>${total:+.2f}</b> | PF: {pf_s}",
         "",
         "<b>По монетам:</b>",
     ]
-    ranked = sorted(results, key=lambda x: x.total_pnl_usd, reverse=True)
-    for r in ranked[:12]:
-        if not r.trades:
-            continue
+    for r in sorted(results, key=lambda x: x.total_pnl_usd, reverse=True)[:15]:
         lines.append(
-            f"• {r.symbol.replace('USDT','')}: {len(r.trades)} сд. "
-            f"WR {r.winrate:.0f}% PnL ${r.total_pnl_usd:+.2f}"
+            f"{r.symbol}: {len(r.trades)}tr WR{r.winrate:.0f}% ${r.total_pnl_usd:+.2f}"
         )
     return "\n".join(lines)
 
 
-async def run_backtest_cli(symbol: Optional[str], days: int, top: int, no_oi: bool):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+async def main_async(args):
+    logging.basicConfig(level=logging.INFO)
     async with aiohttp.ClientSession() as session:
-        if top > 0:
-            syms = await top_symbols(session, top)
-            log.info(f"Top symbols: {syms}")
-            results = []
-            for s in syms:
-                log.info(f"Backtesting {s}...")
-                results.append(await backtest_symbol(session, s, days, use_oi=not no_oi))
-            print(format_summary(results).replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", ""))
-        else:
-            sym = symbol or "BTCUSDT"
-            if not sym.endswith("USDT"):
-                sym += "USDT"
-            r = await backtest_symbol(session, sym, days, use_oi=not no_oi)
+        if args.symbol:
+            r = await backtest_symbol(session, args.symbol.upper().replace("USDT", "") + "USDT"
+                                      if not args.symbol.upper().endswith("USDT")
+                                      else args.symbol.upper(), args.days)
             print(format_result(r).replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", ""))
+        else:
+            # top by turnover from tickers
+            base = BYBIT_BASE_URL.rstrip("/")
+            async with session.get(f"{base}/v5/market/tickers", params={"category": "linear"}) as resp:
+                data = await resp.json(content_type=None)
+            tickers = data.get("result", {}).get("list", []) if isinstance(data, dict) else []
+            scored = []
+            for t in tickers:
+                sym = t.get("symbol", "")
+                if not sym.endswith("USDT"):
+                    continue
+                base_sym = sym.replace("USDT", "")
+                if base_sym in BLACKLIST:
+                    continue
+                try:
+                    turn = float(t.get("turnover24h") or 0)
+                except Exception:
+                    turn = 0
+                if turn < MIN_VOLUME_USD_24H:
+                    continue
+                scored.append((turn, sym))
+            scored.sort(reverse=True)
+            symbols = [s for _, s in scored[: args.top]]
+            results = []
+            for sym in symbols:
+                r = await backtest_symbol(session, sym, args.days)
+                results.append(r)
+                log.info(f"{sym}: {len(r.trades)} trades, WR {r.winrate:.0f}%")
+                await asyncio.sleep(0.15)
+            print(format_summary(results).replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="BB_SQUEEZE backtest")
-    ap.add_argument("--symbol", "-s", default=None)
-    ap.add_argument("--days", "-d", type=int, default=30)
-    ap.add_argument("--top", type=int, default=0, help="Backtest top N by turnover")
-    ap.add_argument("--no-oi", action="store_true", help="Disable OI filter")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbol", type=str, default="")
+    ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--days", type=int, default=14)
     args = ap.parse_args()
-    asyncio.run(run_backtest_cli(args.symbol, args.days, args.top, args.no_oi))
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":

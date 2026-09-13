@@ -20,19 +20,19 @@ MIN_STARS_TO_ALERT = int(os.getenv("MIN_STARS_TO_ALERT", "1"))
 # ---------- Pre-filter: только АКТИВНЫЕ монеты ----------
 MIN_AGE_DAYS = int(os.getenv("MIN_AGE_DAYS", "30"))
 # Мин. оборот 24ч (USDT) — отсекает мёртвые пары
-MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "5000000"))
+MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "3000000"))
 # Не брать совсем «стоячие» монеты: |изменение цены 24ч| минимум
 MIN_ABS_CHANGE_24H_PCT = float(os.getenv("MIN_ABS_CHANGE_24H_PCT", "1.0"))
 # Для long-стратегии: приоритет / фильтр только растущих за 24ч
 ACTIVE_REQUIRE_24H_UP = os.getenv("ACTIVE_REQUIRE_24H_UP", "false").lower() == "true"
 ACTIVE_MIN_24H_UP_PCT = float(os.getenv("ACTIVE_MIN_24H_UP_PCT", "2.0"))
 # Макс. спред bid/ask %, иначе неликвида
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.40"))
 # Не сканировать весь рынок — только топ по обороту
 MAX_SCAN_SYMBOLS = int(os.getenv("MAX_SCAN_SYMBOLS", "100"))
 
 # Relative strength vs BTC 24h: alt_pc24 - btc_pc24 >= MIN (e.g. -3 = not much weaker)
-REL_STRENGTH_VS_BTC_ENABLED = os.getenv("REL_STRENGTH_VS_BTC_ENABLED", "true").lower() == "true"
+REL_STRENGTH_VS_BTC_ENABLED = os.getenv("REL_STRENGTH_VS_BTC_ENABLED", "false").lower() == "true"
 REL_STRENGTH_MIN_PCT = float(os.getenv("REL_STRENGTH_MIN_PCT", "-3.0"))
 # Long bias: require price >= mid BB OR >= EMA50 1h (OR, not both)
 LONG_BIAS_MID_OR_EMA = os.getenv("LONG_BIAS_MID_OR_EMA", "true").lower() == "true"
@@ -75,17 +75,19 @@ BB_REJECT_FALSE_BREAKOUT = os.getenv("BB_REJECT_FALSE_BREAKOUT", "true").lower()
 # Squeeze on 15m: bandwidth in lower percentile of lookback OR below absolute max
 BB_SQUEEZE_LOOKBACK = int(os.getenv("BB_SQUEEZE_LOOKBACK", "48"))  # 48×15m ≈ 12h
 BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "25"))  # bottom 20%
-BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "5.5"))  # % hard cap
+BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "7.0"))  # % hard cap
 # Squeeze must have been present in the last N bars (fresh, not stale)
 BB_SQUEEZE_FRESH_BARS = int(os.getenv("BB_SQUEEZE_FRESH_BARS", "8"))  # 6×15m ≈ 1.5h
 # Breakout volume: current 15m vol vs avg of prior 20 bars
-BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.2"))
+BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.4"))
 # After squeeze: close above upper band on 15m, then small pullback entry
-BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "2.2"))
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "3.0"))
+BB_REQUIRE_PULLBACK = os.getenv("BB_REQUIRE_PULLBACK", "false").lower() == "true"
+BB_PULLBACK_MIN_PCT = float(os.getenv("BB_PULLBACK_MIN_PCT", "0.0"))
 BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "70"))  # RSI 15m
-BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "2.0"))
+BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "0.0"))  # medium: OI optional
 # Доп. подтверждение притока (не только 24h-всплеск / short cover)
-BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "0.5"))
+BB_OI_4H_MIN = float(os.getenv("BB_OI_4H_MIN", "0.0"))
 # Анти-параболика: макс. рост цены за последние 2×15m от локального low
 BB_PARABOLIC_MAX_PCT = float(os.getenv("BB_PARABOLIC_MAX_PCT", "8.0"))
 # Откат должен удерживаться выше mid BB (поддержка после пробоя)
@@ -99,7 +101,7 @@ BB_REQUIRE_KC_SQUEEZE = os.getenv("BB_REQUIRE_KC_SQUEEZE", "true").lower() == "t
 # Lookback bars for "was inside KC" (fresh squeeze)
 BB_KC_SQUEEZE_BARS = int(os.getenv("BB_KC_SQUEEZE_BARS", "10"))
 # Min consecutive bars BB inside KC (Carter: 5–8+ red dots)
-BB_SQUEEZE_MIN_KC_BARS = int(os.getenv("BB_SQUEEZE_MIN_KC_BARS", "6"))
+BB_SQUEEZE_MIN_KC_BARS = int(os.getenv("BB_SQUEEZE_MIN_KC_BARS", "5"))
 # Momentum proxy on breakout bar: RSI >= this
 BB_SQUEEZE_RSI_MOMENTUM_MIN = float(os.getenv("BB_SQUEEZE_RSI_MOMENTUM_MIN", "50"))
 # Soft TP = max(AUTO_BB_TP_PCT, BW * multiplier) for asymmetry
@@ -172,9 +174,10 @@ DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "20"))
 
 # ---------- Blacklist ----------
 BLACKLIST = {
-    "BTC", "ETH", "XRP", "SOL", "BNB", "ADA", "DOGE", "TRX",
-    "AVAX", "DOT", "LINK", "MATIC", "LTC", "BCH", "TON",
-    "USDC", "USDT", "DAI", "TUSD", "FDUSD", "FOLKS"
+    # Только majors с отдельной динамикой + стейблы.
+    # SOL/LINK/AVAX/XRP/DOGE/LTC и др. — рабочие для BB_SQUEEZE.
+    "BTC", "ETH", "BNB",
+    "USDC", "USDT", "DAI", "TUSD", "FDUSD", "FOLKS",
 }
 
 # ============================================================
@@ -237,7 +240,7 @@ CIRCUIT_BREAKER_LOOKBACK = int(os.getenv("CIRCUIT_BREAKER_LOOKBACK", "12"))
 
 # Which signal types are eligible for auto-trade
 AUTO_TRADE_SIGNAL_TYPES = os.getenv(
-    "AUTO_TRADE_SIGNAL_TYPES", "BB_SQUEEZE"
+    "AUTO_TRADE_SIGNAL_TYPES", "BB_SQUEEZE,BB_SQUEEZE_SHORT"
 )
 # Авто только если монета в плюсе за 24ч (дубль-фильтр на всякий случай)
 AUTO_REQUIRE_24H_UPTREND = os.getenv("AUTO_REQUIRE_24H_UPTREND", "false").lower() == "true"
@@ -277,7 +280,7 @@ STRUCTURE_EXIT_EMA_15M = os.getenv("STRUCTURE_EXIT_EMA_15M", "false").lower() ==
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
 BTC_FILTER_15M_DROP_MAX = float(os.getenv("BTC_FILTER_15M_DROP_MAX", "0.8"))
 BTC_FILTER_15M_PUMP_MAX = float(os.getenv("BTC_FILTER_15M_PUMP_MAX", "1.5"))
-BTC_FILTER_1H_VOLATILITY_MAX = float(os.getenv("BTC_FILTER_1H_VOLATILITY_MAX", "1.2"))
+BTC_FILTER_1H_VOLATILITY_MAX = float(os.getenv("BTC_FILTER_1H_VOLATILITY_MAX", "2.5"))
 
 # Storage
 AUTO_STATE_FILE = os.getenv("AUTO_STATE_FILE", os.path.join(DATA_DIR, "auto_state.json"))
@@ -292,7 +295,7 @@ TRADE_BLOCK_UTC_END = int(os.getenv("TRADE_BLOCK_UTC_END", "4"))       # exclusi
 # Long: skip if funding too positive (crowded longs). Rate is decimal e.g. 0.0003 = 0.03%
 SQUEEZE_FUNDING_MAX = float(os.getenv("SQUEEZE_FUNDING_MAX", "0.0005"))  # 0.05% per 8h
 SQUEEZE_FUNDING_MIN = float(os.getenv("SQUEEZE_FUNDING_MIN", "-0.001"))  # allow mild negative
-SQUEEZE_FUNDING_FILTER = os.getenv("SQUEEZE_FUNDING_FILTER", "true").lower() == "true"
+SQUEEZE_FUNDING_FILTER = os.getenv("SQUEEZE_FUNDING_FILTER", "false").lower() == "true"
 
 # TP from squeeze zone range: max(soft BW TP, ZONE_TP_MULT * zone_range%)
 ZONE_TP_MULT = float(os.getenv("ZONE_TP_MULT", "1.5"))
