@@ -177,16 +177,6 @@ class AutoTrader:
             # Post-trade cooldown check
             if self.state.is_in_post_trade_cooldown(signal['symbol']):
                 log.info(f"{signal['symbol']} in post-trade cooldown, skip auto-entry")
-                base = signal["symbol"].replace("USDT", "")
-                stars = int(signal.get("stars") or 1)
-                st = signal.get("signal_type") or ""
-                msg = (
-                    f"⏸ <b>{base}</b> — авто-вход пропущен\n"
-                    f"Причина: <b>пост-сделочный кулдаун</b> ({POST_TRADE_COOLDOWN_HOURS}ч).\n"
-                    f"Сигнал: {st} {'⭐' * stars}\n"
-                    f"<i>/cooldown_clear {base} — снять вручную</i>"
-                )
-                await self.notify(msg)
                 return
 
             # BTC market filter check
@@ -209,21 +199,9 @@ class AutoTrader:
 
             if self.state.is_blocked():
                 log.info(f"Auto blocked ({self.state.blocked_reason}), skip {signal['symbol']}")
-                base = signal["symbol"].replace("USDT", "")
-                await self.notify(
-                    f"🚫 <b>{base}</b> — авто-вход пропущен\n"
-                    f"Причина: <b>авто заблокировано</b> ({self.state.blocked_reason}).\n"
-                    f"<i>/resume — снять блок</i>"
-                )
                 return
             if len(self.state.active_positions) >= MAX_AUTO_POSITIONS:
                 log.info(f"Max {MAX_AUTO_POSITIONS} positions, skip {signal['symbol']}")
-                base = signal["symbol"].replace("USDT", "")
-                await self.notify(
-                    f"⏸ <b>{base}</b> — авто-вход пропущен\n"
-                    f"Причина: <b>лимит позиций</b> {MAX_AUTO_POSITIONS}/{MAX_AUTO_POSITIONS}.\n"
-                    f"Сигнал: {signal.get('signal_type')} — алерт есть, вход нет."
-                )
                 return
             symbol = signal["symbol"]
             if symbol in self.state.active_positions:
