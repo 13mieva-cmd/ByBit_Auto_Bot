@@ -49,6 +49,7 @@ BYBIT_PUBLIC = BYBIT_BASE_URL
 
 
 async def check_btc_health() -> dict:
+    """BTC filter: closed 15m; vol = high-low range % over ~1h."""
     result = {"is_ok": True, "reason": "", "change_15m": 0.0, "volatility_1h": 0.0}
     try:
         async with aiohttp.ClientSession() as session:
@@ -62,26 +63,31 @@ async def check_btc_health() -> dict:
             closed = kl[1:] if len(kl) > 1 else []
             if len(closed) < 2:
                 return result
-            op_15m = float(closed[0][1]); cl_15m = float(closed[0][4])
-            change_15m = (cl_15m - op_15m) / op_15m * 100 if op_15m > 0 else 0.0
-            result["change_15m"] = change_15m
+            op_15m = float(closed[0][1])
+            cl_15m = float(closed[0][4])
+            ch = (cl_15m - op_15m) / op_15m * 100 if op_15m > 0 else 0.0
+            result["change_15m"] = ch
             window = closed[:4]
-            highs = [float(k[2]) for k in window]; lows = [float(k[3]) for k in window]
+            highs = [float(k[2]) for k in window]
+            lows = [float(k[3]) for k in window]
             max_h, min_l = max(highs), min(lows)
-            vol_pct = (max_h - min_l) / min_l * 100 if min_l > 0 else 0.0
-            result["volatility_1h"] = vol_pct
+            vol = (max_h - min_l) / min_l * 100 if min_l > 0 else 0.0
+            result["volatility_1h"] = vol
     except Exception as e:
         log.warning(f"check_btc_health: {e}")
         return result
-    if result["change_15m"] <= -BTC_FILTER_15M_DROP_MAX:
+
+    ch = result["change_15m"]
+    vol = result["volatility_1h"]
+    if ch <= -BTC_FILTER_15M_DROP_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC падает быстро ({result["change_15m"]:+.2f}% за 15м)"
-    elif result["change_15m"] >= BTC_FILTER_15M_PUMP_MAX:
+        result["reason"] = f"BTC падает быстро ({ch:+.2f}% за 15м)"
+    elif ch >= BTC_FILTER_15M_PUMP_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC резко растёт ({result["change_15m"]:+.2f}% за 15м) — FOMO ралли"
-    elif result["volatility_1h"] >= BTC_FILTER_1H_VOLATILITY_MAX:
+        result["reason"] = f"BTC резко растёт ({ch:+.2f}% за 15м) — FOMO ралли"
+    elif vol >= BTC_FILTER_1H_VOLATILITY_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC волатилен ({result["volatility_1h"]:.2f}% диапазон за 1ч)"
+        result["reason"] = f"BTC волатилен ({vol:.2f}% диапазон за 1ч)"
     return result
 
 
@@ -131,14 +137,6 @@ class AutoTrader:
             if not self.state.get_signal_toggle(sig_type):
                 log.info(f"Signal type {sig_type} disabled, skip {signal['symbol']}")
                 return
-
-            if TRADE_TIME_FILTER_ENABLED:
-                hour = datetime.now(timezone.utc).hour
-                start, end = TRADE_BLOCK_UTC_START, TRADE_BLOCK_UTC_END
-                in_block = (start <= hour < end) if start < end else (hour >= start or hour < end)
-                if in_block:
-                    log.info(f"{signal["symbol"]}: UTC hour {hour} blocked — skip")
-                    return
 
             # 24h тренд: long требует up; short — не требуем сильный up
             if AUTO_REQUIRE_24H_UPTREND and sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
