@@ -79,7 +79,7 @@ BB_SQUEEZE_MAX_BW = float(os.getenv("BB_SQUEEZE_MAX_BW", "7.0"))  # % hard cap
 # Squeeze must have been present in the last N bars (fresh, not stale)
 BB_SQUEEZE_FRESH_BARS = int(os.getenv("BB_SQUEEZE_FRESH_BARS", "8"))  # 6×15m ≈ 1.5h
 # Breakout volume: current 15m vol vs avg of prior 20 bars
-BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.15"))
+BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.0"))
 # After squeeze: close above upper band on 15m, then small pullback entry
 BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "3.0"))
 BB_REQUIRE_PULLBACK = os.getenv("BB_REQUIRE_PULLBACK", "false").lower() == "true"
@@ -95,7 +95,7 @@ BB_REQUIRE_ABOVE_MID = os.getenv("BB_REQUIRE_ABOVE_MID", "true").lower() == "tru
 # Keltner Channels (TTM-style squeeze filter for BB)
 KC_EMA_PERIOD = int(os.getenv("KC_EMA_PERIOD", "20"))
 KC_ATR_PERIOD = int(os.getenv("KC_ATR_PERIOD", "20"))  # classic Carter TTM = ATR20
-KC_ATR_MULT = float(os.getenv("KC_ATR_MULT", "1.65"))
+KC_ATR_MULT = float(os.getenv("KC_ATR_MULT", "1.5"))
 # BB inside KC recently = confirmed squeeze
 BB_REQUIRE_KC_SQUEEZE = os.getenv("BB_REQUIRE_KC_SQUEEZE", "true").lower() == "true"
 # Lookback bars for "was inside KC" (fresh squeeze)
@@ -279,7 +279,7 @@ STRUCTURE_EXIT_EMA_15M = os.getenv("STRUCTURE_EXIT_EMA_15M", "false").lower() ==
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
 BTC_FILTER_15M_DROP_MAX = float(os.getenv("BTC_FILTER_15M_DROP_MAX", "0.8"))
 BTC_FILTER_15M_PUMP_MAX = float(os.getenv("BTC_FILTER_15M_PUMP_MAX", "1.5"))
-BTC_FILTER_1H_VOLATILITY_MAX = float(os.getenv("BTC_FILTER_1H_VOLATILITY_MAX", "1.5"))
+BTC_FILTER_1H_VOLATILITY_MAX = float(os.getenv("BTC_FILTER_1H_VOLATILITY_MAX", "1.2"))
 
 # Storage
 AUTO_STATE_FILE = os.getenv("AUTO_STATE_FILE", os.path.join(DATA_DIR, "auto_state.json"))

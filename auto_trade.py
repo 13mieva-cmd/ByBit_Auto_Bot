@@ -49,47 +49,65 @@ BYBIT_PUBLIC = BYBIT_BASE_URL
 
 
 async def check_btc_health() -> dict:
-    """BTC filter: closed 15m; vol = high-low range % over ~1h."""
-    result = {"is_ok": True, "reason": "", "change_15m": 0.0, "volatility_1h": 0.0}
+    """
+    Returns dict with BTC stats and is_ok flag.
+    Fetches 15m and 1h klines for BTC.
+    """
+    result = {
+        "is_ok": True,
+        "reason": "",
+        "change_15m": 0.0,
+        "volatility_1h": 0.0,
+    }
     try:
         async with aiohttp.ClientSession() as session:
+            # Last 15m candle change
             async with session.get(
                 f"{BYBIT_PUBLIC}/v5/market/kline",
-                params={"category": "linear", "symbol": "BTCUSDT", "interval": "15", "limit": 6},
-                timeout=10,
+                params={"category": "linear", "symbol": "BTCUSDT", "interval": "15", "limit": 1},
+                timeout=10
             ) as r:
                 data = await r.json()
             kl = data.get("result", {}).get("list", [])
-            closed = kl[1:] if len(kl) > 1 else []
-            if len(closed) < 2:
+            if not kl:
                 return result
-            op_15m = float(closed[0][1])
-            cl_15m = float(closed[0][4])
-            ch = (cl_15m - op_15m) / op_15m * 100 if op_15m > 0 else 0.0
-            result["change_15m"] = ch
-            window = closed[:4]
-            highs = [float(k[2]) for k in window]
-            lows = [float(k[3]) for k in window]
-            max_h, min_l = max(highs), min(lows)
-            vol = (max_h - min_l) / min_l * 100 if min_l > 0 else 0.0
-            result["volatility_1h"] = vol
+            op_15m = float(kl[0][1])
+            cl_15m = float(kl[0][4])
+            change_15m = (cl_15m - op_15m) / op_15m * 100 if op_15m > 0 else 0
+            result["change_15m"] = change_15m
+
+            # Last 1h candles for volatility (std dev of closes over 4×15m candles)
+            async with session.get(
+                f"{BYBIT_PUBLIC}/v5/market/kline",
+                params={"category": "linear", "symbol": "BTCUSDT", "interval": "15", "limit": 4},
+                timeout=10
+            ) as r:
+                data1h = await r.json()
+            kl1h = data1h.get("result", {}).get("list", [])
+            if len(kl1h) >= 4:
+                closes = [float(k[4]) for k in kl1h]
+                mean = sum(closes) / len(closes)
+                if mean > 0:
+                    variance = sum((c - mean) ** 2 for c in closes) / len(closes)
+                    std_dev = math.sqrt(variance)
+                    vol_pct = (std_dev / mean) * 100
+                    result["volatility_1h"] = vol_pct
     except Exception as e:
         log.warning(f"check_btc_health: {e}")
         return result
 
-    ch = result["change_15m"]
-    vol = result["volatility_1h"]
-    if ch <= -BTC_FILTER_15M_DROP_MAX:
+    # Apply thresholds
+    if change_15m <= -BTC_FILTER_15M_DROP_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC падает быстро ({ch:+.2f}% за 15м)"
-    elif ch >= BTC_FILTER_15M_PUMP_MAX:
+        result["reason"] = f"BTC падает быстро ({change_15m:+.2f}% за 15м)"
+    elif change_15m >= BTC_FILTER_15M_PUMP_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC резко растёт ({ch:+.2f}% за 15м) — FOMO ралли"
-    elif vol >= BTC_FILTER_1H_VOLATILITY_MAX:
+        result["reason"] = f"BTC резко растёт ({change_15m:+.2f}% за 15м) — FOMO ралли"
+    elif result["volatility_1h"] >= BTC_FILTER_1H_VOLATILITY_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC волатилен ({vol:.2f}% диапазон за 1ч)"
-    return result
+        result["reason"] = f"BTC волатилен ({result['volatility_1h']:.2f}% std за 1ч)"
 
+    return result
 
 
 def calc_position_size_usd(sl_pct: float) -> float:
@@ -139,7 +157,7 @@ class AutoTrader:
                 return
 
             # 24h тренд: long требует up; short — не требуем сильный up
-            if AUTO_REQUIRE_24H_UPTREND and sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
+            if AUTO_REQUIRE_24H_UPTREND and sig_type != "BB_SQUEEZE_SHORT":
                 pc24 = signal.get("price_change_24h")
                 if pc24 is None:
                     log.info(f"{signal['symbol']}: no 24h change data, skip auto")
@@ -159,6 +177,16 @@ class AutoTrader:
             # Post-trade cooldown check
             if self.state.is_in_post_trade_cooldown(signal['symbol']):
                 log.info(f"{signal['symbol']} in post-trade cooldown, skip auto-entry")
+                base = signal["symbol"].replace("USDT", "")
+                stars = int(signal.get("stars") or 1)
+                st = signal.get("signal_type") or ""
+                msg = (
+                    f"⏸ <b>{base}</b> — авто-вход пропущен\n"
+                    f"Причина: <b>пост-сделочный кулдаун</b> ({POST_TRADE_COOLDOWN_HOURS}ч).\n"
+                    f"Сигнал: {st} {'⭐' * stars}\n"
+                    f"<i>/cooldown_clear {base} — снять вручную</i>"
+                )
+                await self.notify(msg)
                 return
 
             # BTC market filter check
@@ -181,9 +209,21 @@ class AutoTrader:
 
             if self.state.is_blocked():
                 log.info(f"Auto blocked ({self.state.blocked_reason}), skip {signal['symbol']}")
+                base = signal["symbol"].replace("USDT", "")
+                await self.notify(
+                    f"🚫 <b>{base}</b> — авто-вход пропущен\n"
+                    f"Причина: <b>авто заблокировано</b> ({self.state.blocked_reason}).\n"
+                    f"<i>/resume — снять блок</i>"
+                )
                 return
             if len(self.state.active_positions) >= MAX_AUTO_POSITIONS:
                 log.info(f"Max {MAX_AUTO_POSITIONS} positions, skip {signal['symbol']}")
+                base = signal["symbol"].replace("USDT", "")
+                await self.notify(
+                    f"⏸ <b>{base}</b> — авто-вход пропущен\n"
+                    f"Причина: <b>лимит позиций</b> {MAX_AUTO_POSITIONS}/{MAX_AUTO_POSITIONS}.\n"
+                    f"Сигнал: {signal.get('signal_type')} — алерт есть, вход нет."
+                )
                 return
             symbol = signal["symbol"]
             if symbol in self.state.active_positions:
