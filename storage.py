@@ -286,7 +286,6 @@ class AutoStateStore(JsonStore):
         return wins / n * 100.0, n
 
     def block_circuit(self, wr: float, n: int):
-        """Pause auto-trading when recent winrate is too low."""
         self.data["auto_enabled"] = False
         self.data["blocked_until"] = time.time() + 365 * 86400
         self.data["blocked_reason"] = f"circuit_breaker WR {wr:.1f}% on {n} trades"

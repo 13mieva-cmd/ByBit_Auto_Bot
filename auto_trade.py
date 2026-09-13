@@ -49,17 +49,7 @@ BYBIT_PUBLIC = BYBIT_BASE_URL
 
 
 async def check_btc_health() -> dict:
-    """
-    BTC filter for auto-entry.
-    Uses CLOSED 15m bars only (skip forming).
-    Volatility = (max high - min low) / min low over last 4 closed 15m bars.
-    """
-    result = {
-        "is_ok": True,
-        "reason": "",
-        "change_15m": 0.0,
-        "volatility_1h": 0.0,
-    }
+    result = {"is_ok": True, "reason": "", "change_15m": 0.0, "volatility_1h": 0.0}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -69,39 +59,31 @@ async def check_btc_health() -> dict:
             ) as r:
                 data = await r.json()
             kl = data.get("result", {}).get("list", [])
-            # Bybit: newest first. Skip index 0 (forming), use closed bars.
             closed = kl[1:] if len(kl) > 1 else []
             if len(closed) < 2:
                 return result
-
-            # Last closed 15m bar change
-            op_15m = float(closed[0][1])
-            cl_15m = float(closed[0][4])
+            op_15m = float(closed[0][1]); cl_15m = float(closed[0][4])
             change_15m = (cl_15m - op_15m) / op_15m * 100 if op_15m > 0 else 0.0
             result["change_15m"] = change_15m
-
-            # Range volatility over up to 4 closed 15m bars (~1h)
             window = closed[:4]
-            highs = [float(k[2]) for k in window]
-            lows = [float(k[3]) for k in window]
+            highs = [float(k[2]) for k in window]; lows = [float(k[3]) for k in window]
             max_h, min_l = max(highs), min(lows)
             vol_pct = (max_h - min_l) / min_l * 100 if min_l > 0 else 0.0
             result["volatility_1h"] = vol_pct
     except Exception as e:
         log.warning(f"check_btc_health: {e}")
         return result
-
     if result["change_15m"] <= -BTC_FILTER_15M_DROP_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC падает быстро ({result['change_15m']:+.2f}% за 15м)"
+        result["reason"] = f"BTC падает быстро ({result["change_15m"]:+.2f}% за 15м)"
     elif result["change_15m"] >= BTC_FILTER_15M_PUMP_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC резко растёт ({result['change_15m']:+.2f}% за 15м) — FOMO ралли"
+        result["reason"] = f"BTC резко растёт ({result["change_15m"]:+.2f}% за 15м) — FOMO ралли"
     elif result["volatility_1h"] >= BTC_FILTER_1H_VOLATILITY_MAX:
         result["is_ok"] = False
-        result["reason"] = f"BTC волатилен ({result['volatility_1h']:.2f}% диапазон за 1ч)"
-
+        result["reason"] = f"BTC волатилен ({result["volatility_1h"]:.2f}% диапазон за 1ч)"
     return result
+
 
 
 def calc_position_size_usd(sl_pct: float) -> float:
@@ -150,24 +132,16 @@ class AutoTrader:
                 log.info(f"Signal type {sig_type} disabled, skip {signal['symbol']}")
                 return
 
-            # UTC time filter (dead zone, default 00–04 UTC)
             if TRADE_TIME_FILTER_ENABLED:
                 hour = datetime.now(timezone.utc).hour
                 start, end = TRADE_BLOCK_UTC_START, TRADE_BLOCK_UTC_END
                 in_block = (start <= hour < end) if start < end else (hour >= start or hour < end)
                 if in_block:
-                    log.info(
-                        f"{signal['symbol']}: UTC hour {hour} in block "
-                        f"[{start}, {end}) — skip auto-entry"
-                    )
+                    log.info(f"{signal["symbol"]}: UTC hour {hour} blocked — skip")
                     return
 
-            # 24h uptrend filter: skip for BB_SQUEEZE* — squeeze lives in low-volatility flat.
-            # Only apply to non-squeeze types if enabled.
-            if (
-                AUTO_REQUIRE_24H_UPTREND
-                and sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT")
-            ):
+            # 24h тренд: long требует up; short — не требуем сильный up
+            if AUTO_REQUIRE_24H_UPTREND and sig_type not in ("BB_SQUEEZE", "BB_SQUEEZE_SHORT"):
                 pc24 = signal.get("price_change_24h")
                 if pc24 is None:
                     log.info(f"{signal['symbol']}: no 24h change data, skip auto")

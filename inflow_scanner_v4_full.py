@@ -147,19 +147,13 @@ async def get_tickers(session):
 
 
 async def get_klines(session, symbol, interval, limit):
-    """Closed bars only (anti-repaint). Drop the forming candle."""
+    """Closed bars only (anti-repaint)."""
     try:
         data = await fetch_json(
             session, f"{BYBIT_BASE}/v5/market/kline",
-            {
-                "category": "linear",
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit + 1,  # +1 so after drop we still have `limit`
-            },
+            {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit + 1},
         )
         rows = list(reversed(data.get("result", {}).get("list", [])))
-        # Bybit returns newest first; after reverse, last bar is the forming one.
         if len(rows) > 1:
             rows = rows[:-1]
         return rows

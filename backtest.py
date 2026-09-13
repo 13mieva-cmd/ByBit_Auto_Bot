@@ -117,16 +117,16 @@ class BacktestResult:
 
 async def fetch_klines(session, symbol: str, interval: str, limit: int = 1000):
     base = BYBIT_BASE_URL.rstrip("/")
+    # public market works on same host for demo/main often
     url = f"{base}/v5/market/kline"
-    # +1 so after dropping forming bar we still have ~limit closed bars
-    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": min(limit + 1, 1000)}
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
             data = await r.json(content_type=None)
         if not isinstance(data, dict) or data.get("retCode") != 0:
             return []
         rows = data.get("result", {}).get("list", [])
-        # Bybit: newest first → reverse to oldest first; drop forming last bar
+        # Bybit: newest first → reverse to oldest first
         rows = list(reversed(rows))
         if len(rows) > 1:
             rows = rows[:-1]
@@ -467,37 +467,25 @@ def format_result(r: BacktestResult) -> str:
     return "\n".join(lines)
 
 
-async def top_symbols(session, top_n: int = 15) -> list[str]:
+async def top_symbols(session, top_n: int = 15):
     base = BYBIT_BASE_URL.rstrip("/")
     try:
-        async with session.get(
-            f"{base}/v5/market/tickers",
-            params={"category": "linear"},
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
+        async with session.get(f"{base}/v5/market/tickers", params={"category": "linear"},
+                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
             data = await resp.json(content_type=None)
     except Exception as e:
-        log.warning(f"top_symbols: {e}")
-        return []
+        log.warning(f"top_symbols: {e}"); return []
     tickers = data.get("result", {}).get("list", []) if isinstance(data, dict) else []
     scored = []
-    for t in tickers:
-        sym = t.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
-        base_sym = sym.replace("USDT", "")
-        if base_sym in BLACKLIST:
-            continue
-        try:
-            turn = float(t.get("turnover24h") or 0)
-        except Exception:
-            turn = 0
-        if turn < MIN_VOLUME_USD_24H:
-            continue
+    for x in tickers:
+        sym = x.get("symbol", "")
+        if not sym.endswith("USDT") or sym.replace("USDT","") in BLACKLIST: continue
+        try: turn = float(x.get("turnover24h") or 0)
+        except Exception: turn = 0
+        if turn < MIN_VOLUME_USD_24H: continue
         scored.append((turn, sym))
     scored.sort(reverse=True)
     return [s for _, s in scored[:top_n]]
-
 
 def format_summary(results):
     all_tr = []
