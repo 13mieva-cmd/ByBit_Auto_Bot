@@ -15,7 +15,7 @@ TELEGRAM_ALLOWED_IDS = os.getenv("TELEGRAM_ALLOWED_IDS", "").strip()
 SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "1"))  # 1 мин ≈ почти непрерывно
 ALERT_COOLDOWN_HOURS = int(os.getenv("ALERT_COOLDOWN_HOURS", "6"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "6"))
-MIN_STARS_TO_ALERT = int(os.getenv("MIN_STARS_TO_ALERT", "1"))
+MIN_STARS_TO_ALERT = int(os.getenv("MIN_STARS_TO_ALERT", "2"))
 
 # ---------- Pre-filter: только АКТИВНЫЕ монеты ----------
 MIN_AGE_DAYS = int(os.getenv("MIN_AGE_DAYS", "30"))
@@ -24,7 +24,7 @@ MIN_VOLUME_USD_24H = float(os.getenv("MIN_VOLUME_USD_24H", "5000000"))
 # Не брать совсем «стоячие» монеты: |изменение цены 24ч| минимум
 MIN_ABS_CHANGE_24H_PCT = float(os.getenv("MIN_ABS_CHANGE_24H_PCT", "1.0"))
 # Для long-стратегии: приоритет / фильтр только растущих за 24ч
-ACTIVE_REQUIRE_24H_UP = os.getenv("ACTIVE_REQUIRE_24H_UP", "false").lower() == "true"
+ACTIVE_REQUIRE_24H_UP = os.getenv("ACTIVE_REQUIRE_24H_UP", "true").lower() == "true"
 ACTIVE_MIN_24H_UP_PCT = float(os.getenv("ACTIVE_MIN_24H_UP_PCT", "2.0"))
 # Макс. спред bid/ask %, иначе неликвида
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
@@ -32,10 +32,32 @@ MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 MAX_SCAN_SYMBOLS = int(os.getenv("MAX_SCAN_SYMBOLS", "100"))
 
 # Relative strength vs BTC 24h: alt_pc24 - btc_pc24 >= MIN (e.g. -3 = not much weaker)
-REL_STRENGTH_VS_BTC_ENABLED = os.getenv("REL_STRENGTH_VS_BTC_ENABLED", "false").lower() == "true"
+REL_STRENGTH_VS_BTC_ENABLED = os.getenv("REL_STRENGTH_VS_BTC_ENABLED", "true").lower() == "true"
 REL_STRENGTH_MIN_PCT = float(os.getenv("REL_STRENGTH_MIN_PCT", "-3.0"))
-# Long bias: require price >= mid BB OR >= EMA50 1h (OR, not both)
-LONG_BIAS_MID_OR_EMA = os.getenv("LONG_BIAS_MID_OR_EMA", "true").lower() == "true"
+# Long bias STRICT: требуется price >= mid BB И price >= EMA50(1h) И восходящий наклон EMA50 (AND, не OR)
+LONG_BIAS_STRICT_TREND = os.getenv("LONG_BIAS_STRICT_TREND", "true").lower() == "true"
+# Мин. наклон EMA50(1h) за последние EMA_SLOPE_LOOKBACK баров, % — фильтр "плоского" рынка (не тренд)
+EMA_SLOPE_MIN_PCT = float(os.getenv("EMA_SLOPE_MIN_PCT", "0.15"))
+EMA_SLOPE_LOOKBACK = int(os.getenv("EMA_SLOPE_LOOKBACK", "5"))
+# Шорты допускаются только при подтверждённом медвежьем HTF-тренде (зеркало LONG_BIAS_STRICT_TREND)
+SHORT_REQUIRE_BEAR_TREND = os.getenv("SHORT_REQUIRE_BEAR_TREND", "true").lower() == "true"
+
+# ---------- ADX regime filter (сила тренда, не только направление) ----------
+ADX_FILTER_ENABLED = os.getenv("ADX_FILTER_ENABLED", "true").lower() == "true"
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
+# Стандарт Wilder: ADX < 20 = слабый/боковой рынок, не входить в trend-following сделки
+ADX_MIN_THRESHOLD = float(os.getenv("ADX_MIN_THRESHOLD", "20.0"))
+
+# ---------- Multi-timeframe alignment (4h подтверждение сверх 1h) ----------
+HTF_ALIGNMENT_ENABLED = os.getenv("HTF_ALIGNMENT_ENABLED", "true").lower() == "true"
+EMA_4H_PERIOD = int(os.getenv("EMA_4H_PERIOD", "50"))
+
+# ---------- ATR-based stop-loss (волатильность вместо чисто структурного SL) ----------
+ATR_SL_ENABLED = os.getenv("ATR_SL_ENABLED", "true").lower() == "true"
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.8"))
+
+# ---------- Portfolio heat: лимит коррелированных (same-side) позиций одновременно ----------
+MAX_SAME_SIDE_POSITIONS = int(os.getenv("MAX_SAME_SIDE_POSITIONS", "1"))
 
 # ---------- STANDARD signal (soft profile: earlier entries) ----------
 PRICE_CHANGE_4H_MIN = float(os.getenv("PRICE_CHANGE_4H_MIN", "2.0"))
@@ -107,7 +129,7 @@ BB_SQUEEZE_RSI_MOMENTUM_MIN = float(os.getenv("BB_SQUEEZE_RSI_MOMENTUM_MIN", "50
 # Soft TP = max(AUTO_BB_TP_PCT, BW * multiplier) for asymmetry
 BB_SQUEEZE_TP_BW_MULT = float(os.getenv("BB_SQUEEZE_TP_BW_MULT", "1.5"))
 # Optional: breakout should clear Keltner upper too
-BB_REQUIRE_KC_BREAKOUT = os.getenv("BB_REQUIRE_KC_BREAKOUT", "false").lower() == "true"
+BB_REQUIRE_KC_BREAKOUT = os.getenv("BB_REQUIRE_KC_BREAKOUT", "true").lower() == "true"
 
 # ---------- BB LOWER: лонг от нижней полосы в 24h-аптренде ----------
 ENABLE_BB_LOWER = os.getenv("ENABLE_BB_LOWER", "false").lower() == "true"
@@ -242,7 +264,7 @@ AUTO_TRADE_SIGNAL_TYPES = os.getenv(
     "AUTO_TRADE_SIGNAL_TYPES", "BB_SQUEEZE"
 )
 # Авто только если монета в плюсе за 24ч (дубль-фильтр на всякий случай)
-AUTO_REQUIRE_24H_UPTREND = os.getenv("AUTO_REQUIRE_24H_UPTREND", "false").lower() == "true"
+AUTO_REQUIRE_24H_UPTREND = os.getenv("AUTO_REQUIRE_24H_UPTREND", "true").lower() == "true"
 AUTO_MIN_24H_CHANGE_PCT = float(os.getenv("AUTO_MIN_24H_CHANGE_PCT", "2.0"))
 
 # Reconciliation interval (sec)
@@ -273,7 +295,7 @@ STRUCTURE_EXIT_ENABLED = os.getenv("STRUCTURE_EXIT_ENABLED", "true").lower() == 
 MOMENTUM_EXIT_ENABLED = os.getenv("MOMENTUM_EXIT_ENABLED", "true").lower() == "true"
 MOMENTUM_EXIT_MIN_GAIN_PCT = float(os.getenv("MOMENTUM_EXIT_MIN_GAIN_PCT", "0.8"))
 STRUCTURE_EXIT_EMA_1H = os.getenv("STRUCTURE_EXIT_EMA_1H", "true").lower() == "true"
-STRUCTURE_EXIT_EMA_15M = os.getenv("STRUCTURE_EXIT_EMA_15M", "false").lower() == "true"  # false: BB_LOWER entry near lower often < EMA50 15m
+STRUCTURE_EXIT_EMA_15M = os.getenv("STRUCTURE_EXIT_EMA_15M", "true").lower() == "true"  # true: быстрее закрываем при сломе локальной структуры
 
 # BTC trend filter for auto-entry
 BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
@@ -294,7 +316,7 @@ TRADE_BLOCK_UTC_END = int(os.getenv("TRADE_BLOCK_UTC_END", "4"))       # exclusi
 # Long: skip if funding too positive (crowded longs). Rate is decimal e.g. 0.0003 = 0.03%
 SQUEEZE_FUNDING_MAX = float(os.getenv("SQUEEZE_FUNDING_MAX", "0.0005"))  # 0.05% per 8h
 SQUEEZE_FUNDING_MIN = float(os.getenv("SQUEEZE_FUNDING_MIN", "-0.001"))  # allow mild negative
-SQUEEZE_FUNDING_FILTER = os.getenv("SQUEEZE_FUNDING_FILTER", "false").lower() == "true"
+SQUEEZE_FUNDING_FILTER = os.getenv("SQUEEZE_FUNDING_FILTER", "true").lower() == "true"
 
 # TP from squeeze zone range: max(soft BW TP, ZONE_TP_MULT * zone_range%)
 ZONE_TP_MULT = float(os.getenv("ZONE_TP_MULT", "1.5"))

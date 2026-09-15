@@ -16,11 +16,13 @@ from config import (
     AUTO_BB_TP_PCT, AUTO_BB_SL_PCT,
     USE_EMA_FILTER,
     ENABLE_BB_SQUEEZE_SHORT,
-    REL_STRENGTH_VS_BTC_ENABLED, REL_STRENGTH_MIN_PCT, LONG_BIAS_MID_OR_EMA,
+    REL_STRENGTH_VS_BTC_ENABLED, REL_STRENGTH_MIN_PCT, LONG_BIAS_STRICT_TREND,
+    EMA_SLOPE_MIN_PCT, EMA_SLOPE_LOOKBACK, SHORT_REQUIRE_BEAR_TREND,
+    ADX_FILTER_ENABLED, ADX_MIN_THRESHOLD, HTF_ALIGNMENT_ENABLED, ATR_SL_ENABLED, ATR_SL_MULT,
     SQUEEZE_FUNDING_FILTER, SQUEEZE_FUNDING_MAX, SQUEEZE_FUNDING_MIN,
     ZONE_TP_MULT,
 )
-from indicators import calculate_rsi
+from indicators import calculate_rsi, calculate_ema_slope_pct, calculate_adx
 
 
 def try_bb_squeeze(
@@ -160,15 +162,34 @@ def try_bb_squeeze(
     if pullback_pct > BB_PULLBACK_MAX_PCT:
         return None
 
-    if LONG_BIAS_MID_OR_EMA:
-        mid_ok = mid is not None and d["price"] >= mid
-        ema_ok = d.get("ema50_1h") is not None and d["price"] >= d["ema50_1h"]
-        if not (mid_ok or ema_ok):
+    if LONG_BIAS_STRICT_TREND:
+        ema50 = d.get("ema50_1h")
+        above_mid = mid is not None and d["price"] >= mid
+        above_ema = ema50 is not None and d["price"] >= ema50
+        ema_slope = d.get("ema50_1h_slope_pct")
+        slope_ok = ema_slope is None or ema_slope >= EMA_SLOPE_MIN_PCT
+        # AND: обе проверки + подтверждённый восходящий наклон EMA (реальный тренд, не флэт)
+        if not (above_mid and above_ema and slope_ok):
             return None
     elif BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
         return None
     elif USE_EMA_FILTER and d.get("ema50_1h") is not None and d["price"] < d["ema50_1h"]:
         return None
+
+    # ADX regime filter: сила тренда, не только направление (Wilder < 20 = боковик)
+    if ADX_FILTER_ENABLED:
+        adx = d.get("adx_1h")
+        if adx is not None and adx < ADX_MIN_THRESHOLD:
+            return None
+
+    # Multi-timeframe alignment: 4h EMA50 должен подтверждать тот же аптренд, что и 1h
+    if HTF_ALIGNMENT_ENABLED:
+        ema50_4h = d.get("ema50_4h")
+        if ema50_4h is not None and d["price"] < ema50_4h:
+            return None
+        slope_4h = d.get("ema50_4h_slope_pct")
+        if slope_4h is not None and slope_4h < 0:
+            return None
 
     rsi_15 = d.get("rsi_15m")
     if rsi_15 is not None and rsi_15 > BB_PULLBACK_RSI_MAX:
@@ -197,6 +218,15 @@ def try_bb_squeeze(
     if mid is not None:
         sl_raw = min(sl_raw, mid)
     sl_price = sl_raw * (1 - BB_SQUEEZE_SL_BUFFER_PCT / 100)
+
+    # ATR-based SL: волатильность вместо чисто структурного стопа (стандарт литературы)
+    if ATR_SL_ENABLED:
+        atr = d.get("kc_atr")
+        if atr is not None and atr > 0:
+            atr_sl_price = entry - atr * ATR_SL_MULT
+            # берём БЛИЖНИЙ (более консервативный, туже) из структурного и ATR-стопа
+            sl_price = max(sl_price, atr_sl_price)
+
     max_sl = entry * (1 - AUTO_BB_SL_PCT / 100)
     if sl_price < max_sl:
         sl_price = max_sl
@@ -330,6 +360,29 @@ def try_bb_squeeze_short(
     if mid is not None and price > mid:
         return None
 
+    if SHORT_REQUIRE_BEAR_TREND:
+        ema50 = d.get("ema50_1h")
+        below_mid = mid is not None and price <= mid
+        below_ema = ema50 is not None and price <= ema50
+        ema_slope = d.get("ema50_1h_slope_pct")
+        # Для шорта нужен подтверждённый ПАДАЮЩИЙ наклон EMA (зеркало long-фильтра)
+        slope_ok = ema_slope is None or ema_slope <= -EMA_SLOPE_MIN_PCT
+        if not (below_mid and below_ema and slope_ok):
+            return None
+
+    if ADX_FILTER_ENABLED:
+        adx = d.get("adx_1h")
+        if adx is not None and adx < ADX_MIN_THRESHOLD:
+            return None
+
+    if HTF_ALIGNMENT_ENABLED:
+        ema50_4h = d.get("ema50_4h")
+        if ema50_4h is not None and price > ema50_4h:
+            return None
+        slope_4h = d.get("ema50_4h_slope_pct")
+        if slope_4h is not None and slope_4h > 0:
+            return None
+
     entry = float(price)
     zone_highs = []
     if hist_kc and highs_15m:
@@ -348,6 +401,13 @@ def try_bb_squeeze_short(
     if mid is not None:
         sl_raw = max(sl_raw, mid)
     sl_price = sl_raw * (1 + BB_SQUEEZE_SL_BUFFER_PCT / 100)
+
+    if ATR_SL_ENABLED:
+        atr = d.get("kc_atr")
+        if atr is not None and atr > 0:
+            atr_sl_price = entry + atr * ATR_SL_MULT
+            sl_price = min(sl_price, atr_sl_price)
+
     max_sl = entry * (1 + AUTO_BB_SL_PCT / 100)
     if sl_price > max_sl:
         sl_price = max_sl

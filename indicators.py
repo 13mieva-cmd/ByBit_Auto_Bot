@@ -30,6 +30,63 @@ def calculate_ema(values: list[float], period: int) -> Optional[float]:
     return ema
 
 
+def calculate_ema_slope_pct(values: list[float], period: int, lookback: int = 5) -> Optional[float]:
+    """% изменение EMA(period) за последние lookback баров — прокси наклона тренда.
+    >0 = растущий тренд, <0 = падающий, ~0 = флэт (без направленного тренда)."""
+    if len(values) < period + lookback:
+        return None
+    ema_now = calculate_ema(values, period)
+    ema_prev = calculate_ema(values[:-lookback], period)
+    if ema_now is None or ema_prev is None or ema_prev == 0:
+        return None
+    return (ema_now - ema_prev) / ema_prev * 100
+
+
+def calculate_adx(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> Optional[float]:
+    """Wilder's ADX — сила тренда (не направление). ADX < 20 = слабый/боковой рынок,
+    классический regime-фильтр перед trend-following входом."""
+    n = len(closes)
+    if n < period * 2 + 1 or len(highs) < n or len(lows) < n:
+        return None
+
+    plus_dm = []
+    minus_dm = []
+    trs = []
+    for i in range(1, n):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
+        trs.append(_true_range(highs[i], lows[i], closes[i - 1]))
+
+    if len(trs) < period * 2:
+        return None
+
+    def _wilder_smooth(vals: list[float], period: int) -> list[float]:
+        smoothed = [sum(vals[:period])]
+        for v in vals[period:]:
+            smoothed.append(smoothed[-1] - smoothed[-1] / period + v)
+        return smoothed
+
+    atr_s = _wilder_smooth(trs, period)
+    plus_s = _wilder_smooth(plus_dm, period)
+    minus_s = _wilder_smooth(minus_dm, period)
+
+    dx_values = []
+    for a, p, m in zip(atr_s, plus_s, minus_s):
+        if a == 0:
+            continue
+        plus_di = 100 * p / a
+        minus_di = 100 * m / a
+        denom = plus_di + minus_di
+        dx = 100 * abs(plus_di - minus_di) / denom if denom > 0 else 0.0
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return None
+    return sum(dx_values[-period:]) / period
+
+
 def calculate_bollinger(closes: list[float], period: int = 20, mult: float = 2.0) -> Optional[dict]:
     if len(closes) < period:
         return None

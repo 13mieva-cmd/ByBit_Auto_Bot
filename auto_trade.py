@@ -38,6 +38,7 @@ from config import (
     METRICS_CSV,
     MOMENTUM_EXIT_ENABLED, MOMENTUM_EXIT_MIN_GAIN_PCT,
     TRADE_TIME_FILTER_ENABLED, TRADE_BLOCK_UTC_START, TRADE_BLOCK_UTC_END,
+    ADX_FILTER_ENABLED, ADX_MIN_THRESHOLD, HTF_ALIGNMENT_ENABLED, MAX_SAME_SIDE_POSITIONS,
 )
 from indicators import calculate_ema
 from trader import BybitTrader
@@ -119,6 +120,58 @@ def calc_position_size_usd(sl_pct: float) -> float:
     return round(size, 2)
 
 
+def trend_alignment_ok(signal: dict) -> tuple[bool, str]:
+    """Единая проверка тренда перед авто-входом. Обязательна для ВСЕХ типов сигналов.
+    Лонг — только в подтверждённом аптренде, шорт — только в подтверждённом даунтренде.
+    Проверяет: 24h направление, EMA50(1h), ADX regime-фильтр (сила тренда), EMA50(4h) HTF-подтверждение."""
+    sig_type = signal.get("signal_type")
+    is_short = sig_type == "BB_SQUEEZE_SHORT"
+    pc24 = signal.get("price_change_24h")
+    price = signal.get("price")
+    ema50 = signal.get("ema50_1h")
+    ema_slope = signal.get("ema50_1h_slope_pct")
+    adx = signal.get("adx_1h")
+    ema50_4h = signal.get("ema50_4h")
+    ema50_4h_slope = signal.get("ema50_4h_slope_pct")
+
+    if not AUTO_REQUIRE_24H_UPTREND:
+        return True, "trend check disabled"
+
+    if pc24 is None:
+        return False, "нет данных 24h тренда"
+
+    # ADX regime filter: не входим в trend-following сделку на слабом/боковом рынке
+    if ADX_FILTER_ENABLED and adx is not None and adx < ADX_MIN_THRESHOLD:
+        return False, f"ADX {adx:.1f} < {ADX_MIN_THRESHOLD} — слабый/боковой рынок"
+
+    if not is_short:
+        if pc24 < AUTO_MIN_24H_CHANGE_PCT:
+            return False, f"24h {pc24:+.2f}% < {AUTO_MIN_24H_CHANGE_PCT}% — не аптренд"
+        if price is not None and ema50 is not None and price < ema50:
+            return False, "цена ниже EMA50(1h) — не в тренде"
+        if ema_slope is not None and ema_slope < 0:
+            return False, f"EMA50(1h) наклон {ema_slope:+.2f}% — не растёт"
+        if HTF_ALIGNMENT_ENABLED:
+            if price is not None and ema50_4h is not None and price < ema50_4h:
+                return False, "цена ниже EMA50(4h) — 4h тренд не подтверждает"
+            if ema50_4h_slope is not None and ema50_4h_slope < 0:
+                return False, f"EMA50(4h) наклон {ema50_4h_slope:+.2f}% — 4h тренд падает"
+    else:
+        if pc24 > -AUTO_MIN_24H_CHANGE_PCT:
+            return False, f"24h {pc24:+.2f}% — не даунтренд"
+        if price is not None and ema50 is not None and price > ema50:
+            return False, "цена выше EMA50(1h) — не в даунтренде"
+        if ema_slope is not None and ema_slope > 0:
+            return False, f"EMA50(1h) наклон {ema_slope:+.2f}% — не падает"
+        if HTF_ALIGNMENT_ENABLED:
+            if price is not None and ema50_4h is not None and price > ema50_4h:
+                return False, "цена выше EMA50(4h) — 4h тренд не подтверждает"
+            if ema50_4h_slope is not None and ema50_4h_slope > 0:
+                return False, f"EMA50(4h) наклон {ema50_4h_slope:+.2f}% — 4h тренд растёт"
+
+    return True, "ok"
+
+
 class AutoTrader:
 
     def __init__(self, bot: Bot, trader: BybitTrader, state_store):
@@ -156,17 +209,25 @@ class AutoTrader:
                 log.info(f"Signal type {sig_type} disabled, skip {signal['symbol']}")
                 return
 
-            # 24h тренд: long требует up; short — не требуем сильный up
-            if AUTO_REQUIRE_24H_UPTREND and sig_type != "BB_SQUEEZE_SHORT":
-                pc24 = signal.get("price_change_24h")
-                if pc24 is None:
-                    log.info(f"{signal['symbol']}: no 24h change data, skip auto")
-                    return
-                if pc24 < AUTO_MIN_24H_CHANGE_PCT:
-                    log.info(
-                        f"{signal['symbol']}: 24h {pc24:+.2f}% < {AUTO_MIN_24H_CHANGE_PCT}% — not uptrend, skip"
-                    )
-                    return
+            # Единая обязательная проверка тренда для ВСЕХ типов сигналов (long и short):
+            # 24h направление + EMA50(1h) + ADX regime-фильтр + мультитаймфрейм 4h.
+            trend_ok, trend_reason = trend_alignment_ok(signal)
+            if not trend_ok:
+                log.info(f"{signal['symbol']}: trend filter blocked ({trend_reason}), skip auto")
+                return
+
+            # Portfolio heat: лимит одновременных позиций в одну сторону (проксирует корреляцию с BTC)
+            side_for_signal = "Sell" if sig_type == "BB_SQUEEZE_SHORT" else "Buy"
+            same_side = sum(
+                1 for p in self.state.active_positions.values()
+                if p.get("side", "Buy") == side_for_signal
+            )
+            if same_side >= MAX_SAME_SIDE_POSITIONS:
+                log.info(
+                    f"{signal['symbol']}: {same_side} same-side ({side_for_signal}) positions "
+                    f">= MAX_SAME_SIDE_POSITIONS ({MAX_SAME_SIDE_POSITIONS}), skip (portfolio heat)"
+                )
+                return
 
             # BB_LOWER: сигнал валиден (reclaim / close-ok флаг из сканера)
             if sig_type == "BB_LOWER":

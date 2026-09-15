@@ -49,7 +49,8 @@ from config import (
     BB_LOWER_BTC_15M_MIN, BB_LOWER_MAX_CHOP_PIERCES,
     BB_LOWER_SL_BUFFER_PCT, BB_LOWER_MIN_TP_PCT, BB_LOWER_FALLBACK_TP_PCT,
     AUTO_BB_LOWER_TP_PCT, AUTO_BB_LOWER_SL_PCT,
-    USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD,
+    USE_EMA_FILTER, EMA_PERIOD, EMA_PULLBACK_PERIOD, EMA_SLOPE_LOOKBACK,
+    ADX_PERIOD, EMA_4H_PERIOD,
     BTC_MIN_1H_CHANGE,
     TP1_PCT, TP2_PCT, HARD_SL_PCT, OI_DROP_WARNING_PCT,
     POSITION_TIMEOUT_HOURS, POSITION_CHECK_INTERVAL_MIN,
@@ -72,8 +73,8 @@ from trader import BybitTrader
 from auto_trade import AutoTrader, check_btc_health
 from signals_bb import try_bb_squeeze, try_bb_squeeze_short
 from indicators import (
-    calculate_rsi, calculate_ema, calculate_bollinger,
-    calculate_keltner, bb_inside_keltner,
+    calculate_rsi, calculate_ema, calculate_ema_slope_pct, calculate_adx,
+    calculate_bollinger, calculate_keltner, bb_inside_keltner,
 )
 from backtest import backtest_symbol, top_symbols, format_result, format_summary
 from visuals import progress_bar, sparkline, position_progress
@@ -230,7 +231,7 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0, bt
 
     async with SEM:
         # Fetch 4h klines (used by STANDARD and pullback context)
-        klines_4h = await get_klines(session, symbol, "240", 30)
+        klines_4h = await get_klines(session, symbol, "240", max(EMA_4H_PERIOD + EMA_SLOPE_LOOKBACK + 5, 60))
         if len(klines_4h) < 20:
             return None
         closes_4h = [float(k[4]) for k in klines_4h]
@@ -251,9 +252,15 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0, bt
         )
         closes_15m = [float(k[4]) for k in klines_15m] if klines_15m else []
 
-        # EMA50 on 1h
+        # EMA50 on 1h + наклон (подтверждение реального тренда, не флэта)
         ema50 = calculate_ema(closes_1h, EMA_PERIOD)
         ema21 = calculate_ema(closes_1h, EMA_PULLBACK_PERIOD)
+        ema50_slope_pct = calculate_ema_slope_pct(closes_1h, EMA_PERIOD, EMA_SLOPE_LOOKBACK)
+        highs_1h = [float(k[2]) for k in klines_1h]
+        lows_1h = [float(k[3]) for k in klines_1h]
+        adx_1h = calculate_adx(highs_1h, lows_1h, closes_1h, ADX_PERIOD)
+        ema50_4h = calculate_ema(closes_4h, EMA_4H_PERIOD)
+        ema50_4h_slope_pct = calculate_ema_slope_pct(closes_4h, EMA_4H_PERIOD, EMA_SLOPE_LOOKBACK)
 
         # OI history 4h and 1h
         oi_4h_history = await get_oi_history(session, symbol, "4h", 12)
@@ -415,6 +422,10 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0, bt
         "btc_15m": btc_15m,
         "age_days": c["age_days"],
         "ema50_1h": ema50,
+        "ema50_1h_slope_pct": ema50_slope_pct,
+        "adx_1h": adx_1h,
+        "ema50_4h": ema50_4h,
+        "ema50_4h_slope_pct": ema50_4h_slope_pct,
         "ema21_1h": ema21,
         "local_high_24h": local_high_24h,
         "price_sparkline_24h": price_sparkline_24h,
@@ -427,6 +438,7 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0, bt
         "kc_upper": kc["upper"] if kc else None,
         "kc_middle": kc["middle"] if kc else None,
         "kc_lower": kc["lower"] if kc else None,
+        "kc_atr": kc["atr"] if kc else None,
         "kc_squeeze_now": bb_inside_keltner(bb, kc) if (bb and kc) else False,
         "kc_squeeze_hist": kc_squeeze_hist,
         "rsi_15m": rsi_15m,
