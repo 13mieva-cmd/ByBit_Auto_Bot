@@ -168,7 +168,6 @@ def try_bb_squeeze(
         above_ema = ema50 is not None and d["price"] >= ema50
         ema_slope = d.get("ema50_1h_slope_pct")
         slope_ok = ema_slope is None or ema_slope >= EMA_SLOPE_MIN_PCT
-        # AND: обе проверки + подтверждённый восходящий наклон EMA (реальный тренд, не флэт)
         if not (above_mid and above_ema and slope_ok):
             return None
     elif BB_REQUIRE_ABOVE_MID and mid is not None and d["price"] < mid:
@@ -176,13 +175,11 @@ def try_bb_squeeze(
     elif USE_EMA_FILTER and d.get("ema50_1h") is not None and d["price"] < d["ema50_1h"]:
         return None
 
-    # ADX regime filter: сила тренда, не только направление (Wilder < 20 = боковик)
     if ADX_FILTER_ENABLED:
         adx = d.get("adx_1h")
         if adx is not None and adx < ADX_MIN_THRESHOLD:
             return None
 
-    # Multi-timeframe alignment: 4h EMA50 должен подтверждать тот же аптренд, что и 1h
     if HTF_ALIGNMENT_ENABLED:
         ema50_4h = d.get("ema50_4h")
         if ema50_4h is not None and d["price"] < ema50_4h:
@@ -219,12 +216,10 @@ def try_bb_squeeze(
         sl_raw = min(sl_raw, mid)
     sl_price = sl_raw * (1 - BB_SQUEEZE_SL_BUFFER_PCT / 100)
 
-    # ATR-based SL: волатильность вместо чисто структурного стопа (стандарт литературы)
     if ATR_SL_ENABLED:
         atr = d.get("kc_atr")
         if atr is not None and atr > 0:
             atr_sl_price = entry - atr * ATR_SL_MULT
-            # берём БЛИЖНИЙ (более консервативный, туже) из структурного и ATR-стопа
             sl_price = max(sl_price, atr_sl_price)
 
     max_sl = entry * (1 - AUTO_BB_SL_PCT / 100)
@@ -365,7 +360,6 @@ def try_bb_squeeze_short(
         below_mid = mid is not None and price <= mid
         below_ema = ema50 is not None and price <= ema50
         ema_slope = d.get("ema50_1h_slope_pct")
-        # Для шорта нужен подтверждённый ПАДАЮЩИЙ наклон EMA (зеркало long-фильтра)
         slope_ok = ema_slope is None or ema_slope <= -EMA_SLOPE_MIN_PCT
         if not (below_mid and below_ema and slope_ok):
             return None

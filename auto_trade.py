@@ -121,9 +121,7 @@ def calc_position_size_usd(sl_pct: float) -> float:
 
 
 def trend_alignment_ok(signal: dict) -> tuple[bool, str]:
-    """Единая проверка тренда перед авто-входом. Обязательна для ВСЕХ типов сигналов.
-    Лонг — только в подтверждённом аптренде, шорт — только в подтверждённом даунтренде.
-    Проверяет: 24h направление, EMA50(1h), ADX regime-фильтр (сила тренда), EMA50(4h) HTF-подтверждение."""
+    """Единая проверка тренда перед авто-входом. Обязательна для ВСЕХ типов сигналов."""
     sig_type = signal.get("signal_type")
     is_short = sig_type == "BB_SQUEEZE_SHORT"
     pc24 = signal.get("price_change_24h")
@@ -140,7 +138,6 @@ def trend_alignment_ok(signal: dict) -> tuple[bool, str]:
     if pc24 is None:
         return False, "нет данных 24h тренда"
 
-    # ADX regime filter: не входим в trend-following сделку на слабом/боковом рынке
     if ADX_FILTER_ENABLED and adx is not None and adx < ADX_MIN_THRESHOLD:
         return False, f"ADX {adx:.1f} < {ADX_MIN_THRESHOLD} — слабый/боковой рынок"
 
