@@ -31,8 +31,7 @@ def calculate_ema(values: list[float], period: int) -> Optional[float]:
 
 
 def calculate_ema_slope_pct(values: list[float], period: int, lookback: int = 5) -> Optional[float]:
-    """% изменение EMA(period) за последние lookback баров — прокси наклона тренда.
-    >0 = растущий тренд, <0 = падающий, ~0 = флэт (без направленного тренда)."""
+    """% изменение EMA(period) за последние lookback баров — прокси наклона тренда."""
     if len(values) < period + lookback:
         return None
     ema_now = calculate_ema(values, period)
@@ -43,8 +42,7 @@ def calculate_ema_slope_pct(values: list[float], period: int, lookback: int = 5)
 
 
 def calculate_adx(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> Optional[float]:
-    """Wilder's ADX — сила тренда (не направление). ADX < 20 = слабый/боковой рынок,
-    классический regime-фильтр перед trend-following входом."""
+    """Wilder's ADX — сила тренда (не направление)."""
     n = len(closes)
     if n < period * 2 + 1 or len(highs) < n or len(lows) < n:
         return None

@@ -121,7 +121,6 @@ def calc_position_size_usd(sl_pct: float) -> float:
 
 
 def trend_alignment_ok(signal: dict) -> tuple[bool, str]:
-    """Единая проверка тренда перед авто-входом. Обязательна для ВСЕХ типов сигналов."""
     sig_type = signal.get("signal_type")
     is_short = sig_type == "BB_SQUEEZE_SHORT"
     pc24 = signal.get("price_change_24h")
@@ -134,10 +133,8 @@ def trend_alignment_ok(signal: dict) -> tuple[bool, str]:
 
     if not AUTO_REQUIRE_24H_UPTREND:
         return True, "trend check disabled"
-
     if pc24 is None:
         return False, "нет данных 24h тренда"
-
     if ADX_FILTER_ENABLED and adx is not None and adx < ADX_MIN_THRESHOLD:
         return False, f"ADX {adx:.1f} < {ADX_MIN_THRESHOLD} — слабый/боковой рынок"
 
@@ -206,14 +203,11 @@ class AutoTrader:
                 log.info(f"Signal type {sig_type} disabled, skip {signal['symbol']}")
                 return
 
-            # Единая обязательная проверка тренда для ВСЕХ типов сигналов (long и short):
-            # 24h направление + EMA50(1h) + ADX regime-фильтр + мультитаймфрейм 4h.
             trend_ok, trend_reason = trend_alignment_ok(signal)
             if not trend_ok:
                 log.info(f"{signal['symbol']}: trend filter blocked ({trend_reason}), skip auto")
                 return
 
-            # Portfolio heat: лимит одновременных позиций в одну сторону (проксирует корреляцию с BTC)
             side_for_signal = "Sell" if sig_type == "BB_SQUEEZE_SHORT" else "Buy"
             same_side = sum(
                 1 for p in self.state.active_positions.values()

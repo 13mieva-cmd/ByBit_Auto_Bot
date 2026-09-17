@@ -103,9 +103,15 @@ BB_SQUEEZE_FRESH_BARS = int(os.getenv("BB_SQUEEZE_FRESH_BARS", "8"))  # 6×15m �
 # Breakout volume: current 15m vol vs avg of prior 20 bars
 BB_BREAKOUT_VOL_MIN = float(os.getenv("BB_BREAKOUT_VOL_MIN", "1.0"))
 # After squeeze: close above upper band on 15m, then small pullback entry
-BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "3.0"))
-BB_REQUIRE_PULLBACK = os.getenv("BB_REQUIRE_PULLBACK", "false").lower() == "true"
-BB_PULLBACK_MIN_PCT = float(os.getenv("BB_PULLBACK_MIN_PCT", "0.0"))
+# Break-and-retest: не входить на самом пробое, а ждать отката к пробитому уровню (литература: buy the retest)
+BB_PULLBACK_MAX_PCT = float(os.getenv("BB_PULLBACK_MAX_PCT", "2.5"))
+BB_REQUIRE_PULLBACK = os.getenv("BB_REQUIRE_PULLBACK", "true").lower() == "true"
+# Мин. реальный откат от хая пробоя, % — не входить прямо на свече пробоя
+BB_PULLBACK_MIN_PCT = float(os.getenv("BB_PULLBACK_MIN_PCT", "0.3"))
+# Требовать свечу-подтверждение отката: последняя свеча закрылась выше предыдущей (импульс возобновился)
+BB_PULLBACK_REQUIRE_REJECTION = os.getenv("BB_PULLBACK_REQUIRE_REJECTION", "true").lower() == "true"
+# Зеркало для шорта: мин. отскок от лоя пробоя перед входом (не шортить на самом дне)
+BB_BOUNCE_MIN_PCT = float(os.getenv("BB_BOUNCE_MIN_PCT", "0.3"))
 BB_PULLBACK_RSI_MAX = float(os.getenv("BB_PULLBACK_RSI_MAX", "70"))  # RSI 15m
 BB_OI_24H_MIN = float(os.getenv("BB_OI_24H_MIN", "0.0"))  # medium: OI optional
 # Доп. подтверждение притока (не только 24h-всплеск / short cover)

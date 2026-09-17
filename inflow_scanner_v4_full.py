@@ -252,7 +252,7 @@ async def analyze_coin(session, c: dict, btc_1h: float, btc_15m: float = 0.0, bt
         )
         closes_15m = [float(k[4]) for k in klines_15m] if klines_15m else []
 
-        # EMA50 on 1h + наклон (подтверждение реального тренда, не флэта)
+        # EMA50 on 1h + наклон
         ema50 = calculate_ema(closes_1h, EMA_PERIOD)
         ema21 = calculate_ema(closes_1h, EMA_PULLBACK_PERIOD)
         ema50_slope_pct = calculate_ema_slope_pct(closes_1h, EMA_PERIOD, EMA_SLOPE_LOOKBACK)
