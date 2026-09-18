@@ -19,7 +19,6 @@ from config import (
     REL_STRENGTH_VS_BTC_ENABLED, REL_STRENGTH_MIN_PCT, LONG_BIAS_STRICT_TREND,
     EMA_SLOPE_MIN_PCT, EMA_SLOPE_LOOKBACK, SHORT_REQUIRE_BEAR_TREND,
     ADX_FILTER_ENABLED, ADX_MIN_THRESHOLD, HTF_ALIGNMENT_ENABLED, ATR_SL_ENABLED, ATR_SL_MULT,
-    BB_PULLBACK_REQUIRE_REJECTION, BB_BOUNCE_MIN_PCT,
     SQUEEZE_FUNDING_FILTER, SQUEEZE_FUNDING_MAX, SQUEEZE_FUNDING_MIN,
     ZONE_TP_MULT,
 )
@@ -154,7 +153,6 @@ def try_bb_squeeze(
             if spike_pct > BB_PARABOLIC_MAX_PCT:
                 return None
 
-    # Break-and-retest: не входим прямо на свече пробоя, ждём откат к пробитому уровню
     pullback_pct = (breakout_high - d["price"]) / breakout_high * 100 if breakout_high > 0 else 0
     if BB_REQUIRE_PULLBACK:
         if pullback_pct < max(0.05, BB_PULLBACK_MIN_PCT):
@@ -163,16 +161,6 @@ def try_bb_squeeze(
         return None
     if pullback_pct > BB_PULLBACK_MAX_PCT:
         return None
-
-    # Подтверждающая свеча отката: последняя закрылась выше предыдущей и выше своего открытия —
-    # импульс уже развернулся вверх, не входим в момент падения к уровню, а после отбоя
-    if BB_PULLBACK_REQUIRE_REJECTION and len(closes_15m) >= 2:
-        last_close = closes_15m[-1]
-        prev_close = closes_15m[-2]
-        last_open = opens_15m[-1] if opens_15m and len(opens_15m) >= 1 else None
-        bullish_close = last_open is None or last_close >= last_open
-        if not (last_close > prev_close and bullish_close):
-            return None
 
     if LONG_BIAS_STRICT_TREND:
         ema50 = d.get("ema50_1h")
@@ -364,18 +352,8 @@ def try_bb_squeeze_short(
     bounce = (price - breakout_low) / breakout_low * 100 if breakout_low > 0 else 0
     if bounce > BB_PULLBACK_MAX_PCT:
         return None
-    if bounce < BB_BOUNCE_MIN_PCT:
-        return None
     if mid is not None and price > mid:
         return None
-
-    if BB_PULLBACK_REQUIRE_REJECTION and len(closes_15m) >= 2:
-        last_close = closes_15m[-1]
-        prev_close = closes_15m[-2]
-        last_open = opens_15m[-1] if opens_15m and len(opens_15m) >= 1 else None
-        bearish_close = last_open is None or last_close <= last_open
-        if not (last_close < prev_close and bearish_close):
-            return None
 
     if SHORT_REQUIRE_BEAR_TREND:
         ema50 = d.get("ema50_1h")
